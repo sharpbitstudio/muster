@@ -119,7 +119,9 @@ jobs:
       # has an archive extension, or matches a rule that fires on the path
       # alone (such as *.p12). gitleaks reads each name in full, so the scan
       # costs four reads of the stream but no extra disk, and a finding of
-      # any other rule shows up to four times.
+      # any other rule shows up to four times. gitleaks can skip a file it
+      # cannot read without logging an error, so the scan must report exactly
+      # four times the stream size.
       - name: gitleaks dir (every object, one stream)
         run: |
           set -o pipefail
@@ -230,8 +232,9 @@ jobs:
             echo "::error::gitleaks logged an error"
             exit 1
           fi
-          if ! grep -Eq '^[^ ]+ INF scanned ~[1-9][0-9]* bytes' <<< "$plain"; then
-            echo "::error::gitleaks did not report any scanned bytes"
+          expected=$((4 * $(wc -c < "$objects/objects.yaml")))
+          if ! grep -Eq "^[^ ]+ INF scanned ~$expected bytes " <<< "$plain"; then
+            echo "::error::gitleaks did not scan the whole stream under all 4 names"
             exit 1
           fi
           exit "$rc"
