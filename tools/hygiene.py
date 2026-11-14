@@ -10,9 +10,12 @@ header lines, the message and every file the commit adds or changes.
 Checks:
 
 - absolute local paths (any Windows drive path, Linux and macOS home
-  folders, the root home folder, WSL drive mounts);
-- email addresses other than GitHub noreply addresses, quoted local parts
-  included;
+  folders, the root home folder, WSL drive mounts, and in text also Git Bash
+  and Cygwin drive paths); a home folder counts only at the start of a path,
+  not inside a URL or a relative path;
+- email addresses other than GitHub noreply addresses and GitHub's SSH user,
+  quoted local parts included; an address glued to an allowed one is found
+  too;
 - non-ASCII characters outside ``NON_ASCII_ALLOW``;
 - binary files, CR bytes in text files, and other control characters (C0
   except TAB and LF, and DEL) in text files and commit messages;
@@ -23,7 +26,8 @@ Checks:
   straight from disk, tracked or not, and must exist;
 - path names: the text checks above plus control characters; the local
   path checks see the path with a leading slash, so a top-level ``home/...``
-  is found;
+  is found, and skip the Git Bash and Cygwin forms, so a top-level folder
+  with a one-letter name is no finding;
 - in the range: author and committer emails must be GitHub noreply
   addresses; every raw header line, signatures included, gets the local
   path, email and suppression marker checks (not the non-ASCII check, names
@@ -38,10 +42,16 @@ means the whole file. Matched text is never printed, so a public CI log does
 not repeat what it reports. When the path name itself has a finding, the
 path is shown only as ``path-sha256:`` and the first 12 hex digits of its
 SHA-256. Header lines of a commit are reported as
-``commit/<id>/header:<line>``.
+``commit/<id>/header:<line>``. A line gets at most one finding per
+category: the first column, and ``(+N more)`` when there are more.
+
+Findings go to stdout. Every run writes ``hygiene: checked N files`` to
+stderr, with ``, N commits`` added when ``--range`` is given, and then the
+number of findings or the error.
 
 Exit codes: 0 clean, 1 findings, 2 usage or git error, or any unexpected
-error (only the exception type is printed).
+error (only the exception type is printed). The findings collected before
+an error are printed first.
 """
 
 from __future__ import annotations
@@ -75,18 +85,30 @@ PINNED = {
 NON_ASCII_ALLOW: frozenset[str] = frozenset()
 
 # The patterns are phrased so that this file does not match them itself.
-LOCAL_PATH_RES = (
+# Checked in text and in path names.
+PATH_NAME_RES = (
     # Any drive path. The drive letter may follow an escape such as \n, but
     # not a letter or digit of a word, so "https://" and "s3://" are no drive.
     re.compile(r"(?:(?<![A-Za-z0-9])|(?<=\\[A-Za-z]))[A-Za-z]:[\\/]"),
-    re.compile(r"/(?:home|Users)/[^\s/'\"<>]+"),
+    # Only at the start of a path: not after a word, a dot or a dash, so a
+    # URL path or a relative path is no home folder.
+    re.compile(r"(?<![\w.-])/(?:home|Users)/[^\s/'\"<>]+"),
     re.compile(r"(?<![\w.-])/" + "root/"),
     re.compile(r"/mnt/[A-Za-z]/"),
 )
-# No lookaround at either end: an address glued to another one, or followed
-# by "_" or "-", is still found. The match is the complete address, and only
-# a complete address can be exempt. A quoted local part does not start or end
-# with a space, so code that joins two strings before an at sign is not one.
+# Checked in text only: a path name may well start with a one-letter folder.
+LOCAL_PATH_RES = PATH_NAME_RES + (
+    re.compile(r"/cygdrive/[A-Za-z]/"),
+    # A Git Bash drive path: a one-letter root folder and at least one more
+    # folder. Other text of that shape is found too.
+    re.compile(r"(?<![\w./-])/[A-Za-z]/(?=[\w.-]++/)"),
+)
+# No lookbehind: an address glued after another one is still found (see
+# bad_email_columns). After the top-level domain only a letter or digit ends
+# the match, so "pkg@1.0.rc1" is no address but an address followed by "_"
+# or "-" is. The match is the complete address, and only a complete address
+# can be exempt. A quoted local part does not start or end with a space, so
+# code that joins two strings before an at sign is not one.
 # An unquoted local part takes the dot and every RFC 5322 atext character.
 # The local part (at most 64 characters, as in RFC 5321) and each domain label
 # (at most 63) are bounded and taken possessively, so a long line costs
@@ -95,7 +117,7 @@ EMAIL_RE = re.compile(
     r'(?:"(?:[^"\\\s]|\\.)(?:[^"\\\r\n]|\\.){0,62}+(?<!\s)"|'
     r"[\w.!#$%&'*+/=?^`{|}~-]{1,64}+)"
     r"@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,63}"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,63}(?![A-Za-z0-9])"
 )
 MARKER_RE = re.compile(re.escape("gitleaks" + ":allow"), re.IGNORECASE)
 TRAILER_RE = re.compile(
@@ -117,6 +139,9 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 NOREPLY_SUFFIX = "@users.noreply.github.com"
 NOREPLY_RE = re.compile(r"[^@\s]+" + re.escape(NOREPLY_SUFFIX), re.IGNORECASE)
 GITHUB_NOREPLY = "noreply" + "@github.com"
+# GitHub's SSH user, as in clone URLs; not a person. Exempt in text, never as
+# a commit identity.
+GITHUB_SSH_USER = "git" + "@github.com"
 
 # Dependabot adds this exact line to every commit; its address is exempt
 # from the email check in commit messages, on this line only.
@@ -168,8 +193,29 @@ def safe(text: str) -> str:
     return "".join(out)
 
 
-def email_allowed(addr: str) -> bool:
+def identity_allowed(addr: str) -> bool:
     return addr.lower() == GITHUB_NOREPLY or NOREPLY_RE.fullmatch(addr) is not None
+
+
+def email_allowed(addr: str) -> bool:
+    return identity_allowed(addr) or addr.lower() == GITHUB_SSH_USER
+
+
+def bad_email_columns(text: str) -> list[int]:
+    """Columns of the addresses in text that are not allowed. After an
+    allowed address the search resumes right after its last at sign, since
+    its domain may be the local part of a glued address; after any other
+    address it resumes at its end. Allowed addresses are short, so going
+    back into one keeps the scan linear."""
+    cols = []
+    pos = 0
+    while m := EMAIL_RE.search(text, pos):
+        if email_allowed(m.group(0)):
+            pos = m.start() + m.group(0).rindex("@") + 1
+        else:
+            cols.append(m.start() + 1)
+            pos = m.end()
+    return cols
 
 
 def path_location(path: str, suffix: str) -> str:
@@ -180,35 +226,37 @@ def path_location(path: str, suffix: str) -> str:
 class Report:
     def __init__(self) -> None:
         self.lines: list[str] = []
+        self.files = 0
+        self.commits = 0
 
     def add(self, where: str, line: int, category: str, detail: str) -> None:
         self.lines.append(f"hygiene: {safe(where)}:{line}: [{category}] {detail}")
 
+    def columns(self, where: str, line: int, category: str, detail: str, cols: list[int]) -> None:
+        """One finding for all hits of a category on a line: the first column,
+        and how many more there are."""
+        if cols:
+            more = f" (+{len(cols) - 1} more)" if len(cols) > 1 else ""
+            self.add(where, line, category, f"{detail} at column {min(cols)}{more}")
+
     def leaks(self, line: str, where: str, n: int, *, emails: bool = True) -> None:
         """Local path, email and suppression marker checks on one line."""
-        for rx in LOCAL_PATH_RES:
-            for m in rx.finditer(line):
-                self.add(where, n, "abs-path", f"absolute local path at column {m.start() + 1}")
+        cols = [m.start() + 1 for rx in LOCAL_PATH_RES for m in rx.finditer(line)]
+        self.columns(where, n, "abs-path", "absolute local path", cols)
         if emails and "@" in line:
-            for m in EMAIL_RE.finditer(line):
-                if not email_allowed(m.group(0)):
-                    self.add(where, n, "email", f"email address not allowed at column {m.start() + 1}")
-        for m in MARKER_RE.finditer(line):
-            self.add(where, n, "suppression-marker", f"inline gitleaks suppression marker at column {m.start() + 1}")
+            self.columns(where, n, "email", "email address not allowed", bad_email_columns(line))
+        cols = [m.start() + 1 for m in MARKER_RE.finditer(line)]
+        self.columns(where, n, "suppression-marker", "inline gitleaks suppression marker", cols)
 
     def text(self, text: str, where: str, *, message: bool = False) -> None:
         """Line checks on decoded text: file content or a commit message."""
         lines = MESSAGE_LINE_RE.split(text) if message else text.split("\n")
         for n, line in enumerate(lines, 1):
             self.leaks(line, where, n, emails=not (message and line == DEPENDABOT_SIGNOFF))
-            bad = [col for col, ch in enumerate(line, 1) if ord(ch) > 127 and ch not in NON_ASCII_ALLOW]
-            if bad:
-                more = f" (+{len(bad) - 1} more)" if len(bad) > 1 else ""
-                self.add(where, n, "non-ascii", f"non-ASCII character at column {bad[0]}{more}")
-            bad = [m.start() + 1 for m in CONTROL_RE.finditer(line)]
-            if bad:
-                more = f" (+{len(bad) - 1} more)" if len(bad) > 1 else ""
-                self.add(where, n, "control", f"control character at column {bad[0]}{more}")
+            cols = [col for col, ch in enumerate(line, 1) if ord(ch) > 127 and ch not in NON_ASCII_ALLOW]
+            self.columns(where, n, "non-ascii", "non-ASCII character", cols)
+            cols = [m.start() + 1 for m in CONTROL_RE.finditer(line)]
+            self.columns(where, n, "control", "control character", cols)
             if message:
                 m = CI_SKIP_RE.search(line)
                 if m:
@@ -226,9 +274,9 @@ class Report:
         """Checks on the path name itself. Returns the location to report the
         file under: the path, or its hash when the path name has a finding."""
         hits = []
-        if any(rx.search("/" + path) for rx in LOCAL_PATH_RES):
+        if any(rx.search("/" + path) for rx in PATH_NAME_RES):
             hits.append(("abs-path", "absolute local path in the path"))
-        if any(not email_allowed(m.group(0)) for m in EMAIL_RE.finditer(path)):
+        if bad_email_columns(path):
             hits.append(("email", "email address not allowed in the path"))
         if MARKER_RE.search(path):
             hits.append(("suppression-marker", "inline gitleaks suppression marker in the path"))
@@ -266,7 +314,7 @@ class Report:
             if m:
                 emails.setdefault(m.group(1).decode(), m.group(2).decode("utf-8", "surrogateescape"))
         for role in ("author", "committer"):
-            if not email_allowed(emails.get(role, "")):
+            if not identity_allowed(emails.get(role, "")):
                 self.add(where, 0, "identity-email", f"{role} email is not a GitHub noreply address")
 
     def header(self, raw: bytes, where: str) -> None:
@@ -310,6 +358,7 @@ def scan_tree(top: str, rep: Report) -> None:
                 data = f.read()
         else:
             continue  # deleted from the working tree, or a submodule folder
+        rep.files += 1
         rep.blob(path, data, where, pin=path not in PINNED)
 
 
@@ -333,6 +382,7 @@ def scan_range(top: str, spec: str, rep: Report) -> None:
         sha, *parents = row.split()
         short = sha[:12]
         raw = git(top, "cat-file", "commit", sha)
+        rep.commits += 1
         rep.identity(raw, f"commit/{short}")
         rep.header(raw, f"commit/{short}/header")
         message = raw.partition(b"\n\n")[2]
@@ -359,23 +409,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--range", metavar="BASE..HEAD", help="also check the commits of this range")
     args = ap.parse_args(argv)
     rep = Report()
+    error = None
     try:
         top = git(None, "rev-parse", "--show-toplevel").decode("utf-8", "surrogateescape").strip()
         scan_tree(top, rep)
         if args.range is not None:
             scan_range(top, args.range, rep)
-    except UsageError as e:
-        print(f"hygiene.py: {safe(str(e))}", file=sys.stderr)
-        return 2
-    except GitError as e:
-        print(f"hygiene.py: {safe(str(e))}", file=sys.stderr)
-        return 2
+    except (UsageError, GitError) as e:
+        error = safe(str(e))
     except Exception as e:
         # The message of an unexpected error may carry a path or file content.
-        print(f"hygiene.py: unexpected {type(e).__name__}", file=sys.stderr)
-        return 2
+        error = f"unexpected {type(e).__name__}"
     for line in rep.lines:
         print(line)
+    sys.stdout.flush()
+    commits = f", {rep.commits} commits" if args.range is not None else ""
+    print(f"hygiene: checked {rep.files} files{commits}", file=sys.stderr)
+    if error is not None:
+        print(f"hygiene.py: {error}", file=sys.stderr)
+        return 2
     if rep.lines:
         print(f"hygiene: {len(rep.lines)} finding(s)", file=sys.stderr)
         return 1
