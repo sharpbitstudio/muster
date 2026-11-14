@@ -12,7 +12,8 @@ Checks:
 - absolute local paths (any Windows drive path, Linux and macOS home
   folders, the root home folder, WSL drive mounts, and in text also Git Bash
   and Cygwin drive paths); a home folder counts only at the start of a path,
-  not inside a URL or a relative path;
+  also after an escape sequence or a one-letter flag, not inside a URL or a
+  relative path;
 - email addresses other than GitHub noreply addresses and GitHub's SSH user,
   quoted local parts included; an address glued to an allowed one is found
   too;
@@ -84,24 +85,35 @@ PINNED = {
 # commit message.
 NON_ASCII_ALLOW: frozenset[str] = frozenset()
 
+
+def path_start(word: str) -> str:
+    """Lookbehind for the start of a path: not after a character in word, but
+    after an escape such as \\n (as in JSON), or after a one-letter flag such
+    as -I or -L that itself starts a word."""
+    return rf"(?:(?<![{word}])|(?<=\\[A-Za-z])|(?<=(?<![{word}])-[A-Za-z]))"
+
+
 # The patterns are phrased so that this file does not match them itself.
 # Checked in text and in path names.
 PATH_NAME_RES = (
     # Any drive path. The drive letter may follow an escape such as \n, but
     # not a letter or digit of a word, so "https://" and "s3://" are no drive.
     re.compile(r"(?:(?<![A-Za-z0-9])|(?<=\\[A-Za-z]))[A-Za-z]:[\\/]"),
-    # Only at the start of a path: not after a word, a dot or a dash, so a
-    # URL path or a relative path is no home folder.
-    re.compile(r"(?<![\w.-])/(?:home|Users)/[^\s/'\"<>]+"),
-    re.compile(r"(?<![\w.-])/" + "root/"),
+    # Only at the start of a path (see path_start): not after a word, a dot
+    # or a dash, so a URL path or a relative path is no home folder.
+    re.compile(path_start(r"\w.-") + r"/(?:home|Users)/[^\s/'\"<>]+"),
+    re.compile(path_start(r"\w.-") + "/" + "root/"),
     re.compile(r"/mnt/[A-Za-z]/"),
 )
 # Checked in text only: a path name may well start with a one-letter folder.
 LOCAL_PATH_RES = PATH_NAME_RES + (
     re.compile(r"/cygdrive/[A-Za-z]/"),
     # A Git Bash drive path: a one-letter root folder and at least one more
-    # folder. Other text of that shape is found too.
-    re.compile(r"(?<![\w./-])/[A-Za-z]/(?=[\w.-]++/)"),
+    # folder, whose name may hold spaces after its first character but does
+    # not end in one. Bounded (a name has at most 255 characters) and
+    # possessive, so the search stays linear. Other text of that shape is
+    # found too.
+    re.compile(path_start(r"\w./-") + r"/[A-Za-z]/(?=[\w.-][\w .-]{0,254}+(?<! )/)"),
 )
 # No lookbehind: an address glued after another one is still found (see
 # bad_email_columns). After the top-level domain only a letter or digit ends
@@ -110,9 +122,10 @@ LOCAL_PATH_RES = PATH_NAME_RES + (
 # can be exempt. A quoted local part does not start or end with a space, so
 # code that joins two strings before an at sign is not one.
 # An unquoted local part takes the dot and every RFC 5322 atext character.
-# The local part (at most 64 characters, as in RFC 5321) and each domain label
-# (at most 63) are bounded and taken possessively, so a long line costs
-# linear time; a longer local part is still found by its last 64 characters.
+# The local part, quoted or not, is bounded (at most 64 characters, as in
+# RFC 5321) and taken possessively, and each domain label is bounded (at most
+# 63), so a long line costs linear time; a longer local part is still found by
+# its last 64 characters.
 EMAIL_RE = re.compile(
     r'(?:"(?:[^"\\\s]|\\.)(?:[^"\\\r\n]|\\.){0,62}+(?<!\s)"|'
     r"[\w.!#$%&'*+/=?^`{|}~-]{1,64}+)"

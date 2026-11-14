@@ -70,19 +70,35 @@ jobs:
       # The default config skips some paths (for example *.svg, a file named
       # gitleaks.toml at any depth, or anything under node_modules/) and never
       # reads commit, tag or tree objects. Every object reachable from any ref
-      # is therefore written into one stream, each after a separator: blobs,
-      # commits (headers and message) and annotated tags raw, trees as the
-      # names of their entries. The stream ends with the output of
+      # is therefore written into one stream as a record, after a separator:
+      # blobs, commits (headers and message) and annotated tags raw, trees as
+      # the names of their entries, and last the output of
       # "git rev-list --objects --all": object ids with path names.
       #
-      # gitleaks skips a file whose first read (up to 100000 bytes) looks like
-      # an application/* type, and some of those signatures are plain ASCII
-      # text. It checks only until it has read a newline, so the stream starts
-      # with 100000 newlines and nothing after them is checked.
+      # gitleaks 8.30.1 reads a file in chunks of 100000 bytes; when a chunk
+      # does not end in two newlines, it reads on to the next blank line, at
+      # most 25000 bytes (sources/file.go and sources/common.go). Each chunk
+      # is matched on its own and chunks do not overlap, so a secret across a
+      # chunk end is not found. The stream is therefore laid out in blocks of
+      # exactly 100000 bytes, each ending in at least two newlines: every read
+      # ends at a block end without reading on, and each block is one chunk.
+      # A record that does not fit in what is left of a block starts the next
+      # block; the rest is filled with newlines. A record longer than 64000
+      # bytes is split into slices of 64000 bytes that start every 32000
+      # bytes, the last one ending at the end of the record; each slice is a
+      # record of its own, its header naming the object and the offset of the
+      # slice. A match of up to 32000 bytes (more than twice a 16384-bit RSA
+      # private key block) thus lies whole in one slice, and a slice with its
+      # separator always fits in a block.
       #
-      # A match may start in one object and run into the next; when a rule's
+      # gitleaks skips a file whose first chunk looks like an application/*
+      # type, and some of those signatures are plain ASCII text. It checks
+      # only until it has read a newline, so the stream starts with a block of
+      # 100000 newlines and nothing after it is checked.
+      #
+      # A match may start in one record and run into the next; when a rule's
       # allowlist then drops it (the Kubernetes rule drops any match that
-      # holds "\n---\n"), the next object's own match is never tried. So 1024
+      # holds "\n---\n"), the next record's own match is never tried. So 1024
       # newlines come before every separator. A bounded window of the default
       # rules spans at most 300 newlines (the Kubernetes rule). Where an
       # unbounded \s* or \s+ can take the newlines, the rule next needs text
@@ -93,7 +109,8 @@ jobs:
       # space. So a barrier line "'KEY----- follows the newlines: its quotes
       # are followed by no space and it holds the marker, so both matches end
       # inside the separator. After any bump of the gitleaks image, re-check
-      # the rules for windows that can cross the separator.
+      # the rules for windows that can cross the separator or exceed 32000
+      # bytes, and the chunk size and the read-on limit.
       #
       # Four rules of the default config fire only on a path ending in .yaml
       # or .yml (Kubernetes Secret), .tf or .hcl (Terraform password), .php
@@ -108,7 +125,6 @@ jobs:
           set -o pipefail
           objects="$RUNNER_TEMP/objects"
           list="$RUNNER_TEMP/object-list"
-          stream="$objects/objects.yaml"
           mkdir "$objects"
           git rev-list --objects --all --no-object-names \
             | git cat-file --batch-check='%(objecttype) %(objectname)' > "$list"
@@ -116,23 +132,91 @@ jobs:
             echo "::error::unexpected line in the object list"
             exit 1
           fi
-          printf -v pad '%1024s' ''
-          pad="${pad// /$'\n'}"$'"\'KEY-----\n'
-          {
-            head -c 100000 /dev/zero | tr '\0' '\n'
-            grep -v '^tree ' "$list" | cut -d ' ' -f 2 \
-              | git cat-file --batch="$pad"$'---\n%(objecttype) %(objectname)'
-            grep '^tree ' "$list" | cut -d ' ' -f 2 | while read -r id; do
-              printf '%s---\ntree %s\n' "$pad" "$id"
-              git ls-tree -z --name-only "$id" | tr '\0' '\n'
-            done
-            printf '%s---\nnames\n' "$pad"
-            git rev-list --objects --all
-          } > "$stream"
-          for name in objects.tf objects.php nuget.config; do
-            ln "$stream" "$objects/$name"
-          done
-          echo "objects: $(wc -l < "$list"), stream: $(wc -c < "$stream") bytes, under 4 names"
+          python3 -I - "$list" "$objects" <<'PY'
+          import os, subprocess, sys
+
+          BLOCK = 100000  # the read size of gitleaks, see above
+          SLICE = 64000
+          STEP = SLICE // 2
+          SEP = b"\n" * 1024 + b"\"'KEY-----\n---\n"
+
+
+          def fail(msg):
+              print("::error::" + msg)
+              sys.exit(1)
+
+
+          def put(header, data):
+              """Writes data as one record, or as overlapping slices."""
+              global blocks, used
+              off = 0
+              while True:
+                  head = header if len(data) <= SLICE else b"%s offset %d" % (header, off)
+                  rec = SEP + head + b"\n" + data[off:off + SLICE] + b"\n"
+                  if len(rec) > BLOCK - 2:
+                      fail("record longer than a block")
+                  if used + len(rec) > BLOCK - 2:
+                      out.write(b"\n" * (BLOCK - used))
+                      blocks += 1
+                      used = 0
+                  out.write(rec)
+                  used += len(rec)
+                  if off + SLICE >= len(data):
+                      return
+                  off += STEP
+
+
+          def names(raw, id_len):
+              """Entry names of a raw tree object, one per line."""
+              lines, pos = [], 0
+              while pos < len(raw):
+                  space = raw.index(b" ", pos)
+                  nul = raw.index(b"\0", space)
+                  if not raw[pos:space].isdigit() or nul == space + 1:
+                      fail("unexpected tree entry")
+                  lines.append(raw[space + 1:nul] + b"\n")
+                  pos = nul + 1 + id_len
+              if pos != len(raw):
+                  fail("unexpected end of a tree")
+              return b"".join(lines)
+
+
+          with open(sys.argv[1], "rb") as f:
+              objects = [line.split(b" ") for line in f.read().split(b"\n") if line]
+          stream = os.path.join(sys.argv[2], "objects.yaml")
+          with open(stream, "wb") as out:
+              out.write(b"\n" * BLOCK)  # the lead, a full block
+              blocks, used = 1, BLOCK
+              git = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+              for kind, oid in objects:
+                  git.stdin.write(oid + b"\n")
+                  git.stdin.flush()
+                  head = git.stdout.readline()
+                  prefix = oid + b" " + kind + b" "
+                  size = head[len(prefix):-1]
+                  if not head.startswith(prefix) or not head.endswith(b"\n") or not size.isdigit():
+                      fail("unexpected output of git cat-file")
+                  data = git.stdout.read(int(size))
+                  if len(data) != int(size) or git.stdout.read(1) != b"\n":
+                      fail("short output of git cat-file")
+                  if kind == b"tree":
+                      data = names(data, len(oid) // 2)
+                  put(kind + b" " + oid, data)
+              git.stdin.close()
+              if git.stdout.read() or git.wait():
+                  fail("git cat-file failed")
+              r = subprocess.run(["git", "rev-list", "--objects", "--all"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+              if r.returncode:
+                  fail("git rev-list failed")
+              put(b"names", r.stdout)
+              out.write(b"\n" * (BLOCK - used))
+          for name in ("objects.tf", "objects.php", "nuget.config"):
+              os.link(stream, os.path.join(sys.argv[2], name))
+          size = os.path.getsize(stream)
+          if size != blocks * BLOCK:
+              fail("stream size is not a whole number of blocks")
+          print(f"objects: {len(objects)}, blocks: {blocks}, stream: {size} bytes, under 4 names")
+          PY
           log="$RUNNER_TEMP/gitleaks-objects.log"
           rc=0
           docker run --rm \
