@@ -68,24 +68,35 @@ jobs:
           exit "$rc"
 
       # The default config skips some paths (for example *.svg, or a file
-      # named gitleaks.toml at any depth) and never reads commit messages.
-      # Every blob reachable from any ref is written under its object id and
-      # every commit message under msg-<commit id>, so neither is skipped.
+      # named gitleaks.toml at any depth) and never reads commit or tag
+      # objects. Every object reachable from any ref is written raw under its
+      # object id: a blob as <id>, a commit (headers and message) as
+      # msg-<id>, an annotated tag as tag-<id>. The names have no extension,
+      # so gitleaks guesses no archive format from them.
+      #
+      # gitleaks also skips a file whose first read (up to 100000 bytes)
+      # looks like an application/* type, and some of those signatures are
+      # plain ASCII text. Until it has read a newline it checks again on each
+      # later read. Every file therefore starts with 100000 newlines, so the
+      # bytes it checks are newlines only.
       - name: gitleaks dir (every object by id)
         run: |
           set -o pipefail
           objects="$RUNNER_TEMP/objects"
+          pad="$RUNNER_TEMP/pad"
           mkdir "$objects"
+          head -c 100000 /dev/zero | tr '\0' '\n' > "$pad"
           git rev-list --objects --all --no-object-names \
             | git cat-file --batch-check='%(objecttype) %(objectname)' \
             | while read -r type id; do
-                if [ "$type" = blob ]; then
-                  git cat-file blob "$id" > "$objects/$id"
-                fi
+                case "$type" in
+                  blob) name="$id" ;;
+                  commit) name="msg-$id" ;;
+                  tag) name="tag-$id" ;;
+                  *) continue ;;
+                esac
+                { cat "$pad"; git cat-file "$type" "$id"; } > "$objects/$name"
               done
-          git rev-list --all | while read -r id; do
-            git cat-file commit "$id" | sed '1,/^$/d' > "$objects/msg-$id"
-          done
           log="$RUNNER_TEMP/gitleaks-objects.log"
           rc=0
           docker run --rm \
@@ -137,7 +148,7 @@ jobs:
           persist-credentials: false
 
       - name: Hygiene (tree)
-        run: python3 tools/hygiene.py
+        run: python3 -I tools/hygiene.py
 
       - name: Commit range
         id: range
@@ -172,7 +183,7 @@ jobs:
       - name: Hygiene (range)
         env:
           RANGE: ${{ steps.range.outputs.range }}
-        run: python3 tools/hygiene.py --range "$RANGE"
+        run: python3 -I tools/hygiene.py --range "$RANGE"
 
   identity:
     # Branch pushes other than main, and pull requests from this repository.
