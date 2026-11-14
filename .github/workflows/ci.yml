@@ -67,36 +67,55 @@ jobs:
           fi
           exit "$rc"
 
-      # The default config skips some paths (for example *.svg, or a file
-      # named gitleaks.toml at any depth) and never reads commit or tag
-      # objects. Every object reachable from any ref is written raw under its
-      # object id: a blob as <id>, a commit (headers and message) as
-      # msg-<id>, an annotated tag as tag-<id>. The names have no extension,
-      # so gitleaks guesses no archive format from them.
+      # The default config skips some paths (for example *.svg, a file named
+      # gitleaks.toml at any depth, or anything under node_modules/) and never
+      # reads commit, tag or tree objects. Every object reachable from any ref
+      # is therefore written into one stream, each after a separator: blobs,
+      # commits (headers and message) and annotated tags raw, trees as the
+      # names of their entries. The stream ends with the output of
+      # "git rev-list --objects --all": object ids with path names.
       #
-      # gitleaks also skips a file whose first read (up to 100000 bytes)
-      # looks like an application/* type, and some of those signatures are
-      # plain ASCII text. Until it has read a newline it checks again on each
-      # later read. Every file therefore starts with 100000 newlines, so the
-      # bytes it checks are newlines only.
-      - name: gitleaks dir (every object by id)
+      # gitleaks skips a file whose first read (up to 100000 bytes) looks like
+      # an application/* type, and some of those signatures are plain ASCII
+      # text. It checks only until it has read a newline, so the stream starts
+      # with 100000 newlines and nothing after them is checked.
+      #
+      # Four rules of the default config fire only on a path ending in .yaml
+      # or .yml (Kubernetes Secret), .tf or .hcl (Terraform password), .php
+      # (Freemius key) or nuget.config (NuGet password). The stream is
+      # hard-linked under one name for each. No name is on a path allowlist,
+      # has an archive extension, or matches a rule that fires on the path
+      # alone (such as *.p12). gitleaks reads each name in full, so the scan
+      # costs four reads of the stream but no extra disk, and a finding of
+      # any other rule shows up to four times.
+      - name: gitleaks dir (every object, one stream)
         run: |
           set -o pipefail
           objects="$RUNNER_TEMP/objects"
-          pad="$RUNNER_TEMP/pad"
+          list="$RUNNER_TEMP/object-list"
+          stream="$objects/objects.yaml"
           mkdir "$objects"
-          head -c 100000 /dev/zero | tr '\0' '\n' > "$pad"
           git rev-list --objects --all --no-object-names \
-            | git cat-file --batch-check='%(objecttype) %(objectname)' \
-            | while read -r type id; do
-                case "$type" in
-                  blob) name="$id" ;;
-                  commit) name="msg-$id" ;;
-                  tag) name="tag-$id" ;;
-                  *) continue ;;
-                esac
-                { cat "$pad"; git cat-file "$type" "$id"; } > "$objects/$name"
-              done
+            | git cat-file --batch-check='%(objecttype) %(objectname)' > "$list"
+          if grep -Evq '^(blob|tree|commit|tag) ([0-9a-f]{40}|[0-9a-f]{64})$' "$list"; then
+            echo "::error::unexpected line in the object list"
+            exit 1
+          fi
+          {
+            head -c 100000 /dev/zero | tr '\0' '\n'
+            grep -v '^tree ' "$list" | cut -d ' ' -f 2 \
+              | git cat-file --batch=$'\n---\n%(objecttype) %(objectname)'
+            grep '^tree ' "$list" | cut -d ' ' -f 2 | while read -r id; do
+              printf '\n---\ntree %s\n' "$id"
+              git ls-tree -z --name-only "$id" | tr '\0' '\n'
+            done
+            printf '\n---\nnames\n'
+            git rev-list --objects --all
+          } > "$stream"
+          for name in objects.tf objects.php nuget.config; do
+            ln "$stream" "$objects/$name"
+          done
+          echo "objects: $(wc -l < "$list"), stream: $(wc -c < "$stream") bytes, under 4 names"
           log="$RUNNER_TEMP/gitleaks-objects.log"
           rc=0
           docker run --rm \
@@ -186,9 +205,11 @@ jobs:
         run: python3 -I tools/hygiene.py --range "$RANGE"
 
   identity:
-    # Branch pushes other than main, and pull requests from this repository.
+    # Branch pushes other than main in this repository (not in a fork), and
+    # pull requests from this repository.
     if: >-
-      (github.event_name == 'push' && github.ref != 'refs/heads/main') ||
+      (github.event_name == 'push' && github.ref != 'refs/heads/main' &&
+       github.event.repository.fork == false) ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
