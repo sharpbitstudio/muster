@@ -24,7 +24,7 @@ jobs:
       # flags it gets, so the scan refuses to run when one exists.
       - name: No .gitleaksignore
         run: |
-          if find . -path ./.git -prune -o -iname .gitleaksignore -print | grep -q .; then
+          if [ -n "$(find . -path ./.git -prune -o -iname .gitleaksignore -print -quit)" ]; then
             echo "::error::.gitleaksignore is not allowed in this repository"
             exit 1
           fi
@@ -38,25 +38,94 @@ jobs:
       # The checkout belongs to the runner user, not to the container user, so
       # git inside the container would refuse it as "dubious ownership". The
       # GIT_CONFIG_* variables mark only /repo as safe, in command scope.
-      - name: gitleaks git (full history, first-parent diffs)
+      #
+      # gitleaks exits 0 when git fails or the path is missing, so each scan
+      # step also fails unless its log shows an actual scan and no error. The
+      # log lines carry ANSI colour codes even without a TTY; they are
+      # stripped before matching. A finding still fails through the exit code.
+      - name: gitleaks git (all fetched refs, first-parent diffs)
         run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/gitleaks-git.log"
+          rc=0
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             -v "$RUNNER_TEMP/gitleaks.toml:/config/gitleaks.toml:ro" \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
             "$GITLEAKS_IMAGE" git /repo \
             --config /config/gitleaks.toml \
-            --log-opts=--diff-merges=first-parent \
-            --ignore-gitleaks-allow --redact --no-banner
+            --log-opts="--all --full-history --diff-merges=first-parent" \
+            --ignore-gitleaks-allow --redact --no-banner 2>&1 | tee "$log" || rc=$?
+          plain="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          if grep -Eq '^[^ ]+ (ERR|FTL) ' <<< "$plain"; then
+            echo "::error::gitleaks logged an error"
+            exit 1
+          fi
+          if ! grep -Eq '^[^ ]+ INF [1-9][0-9]* commits scanned' <<< "$plain"; then
+            echo "::error::gitleaks did not report any scanned commit"
+            exit 1
+          fi
+          exit "$rc"
+
+      # The default config skips some paths (for example *.svg, or a file
+      # named gitleaks.toml at any depth) and never reads commit messages.
+      # Every blob reachable from any ref is written under its object id and
+      # every commit message under msg-<commit id>, so neither is skipped.
+      - name: gitleaks dir (every object by id)
+        run: |
+          set -o pipefail
+          objects="$RUNNER_TEMP/objects"
+          mkdir "$objects"
+          git rev-list --objects --all --no-object-names \
+            | git cat-file --batch-check='%(objecttype) %(objectname)' \
+            | while read -r type id; do
+                if [ "$type" = blob ]; then
+                  git cat-file blob "$id" > "$objects/$id"
+                fi
+              done
+          git rev-list --all | while read -r id; do
+            git cat-file commit "$id" | sed '1,/^$/d' > "$objects/msg-$id"
+          done
+          log="$RUNNER_TEMP/gitleaks-objects.log"
+          rc=0
+          docker run --rm \
+            -v "$objects:/objects:ro" \
+            -v "$RUNNER_TEMP/gitleaks.toml:/config/gitleaks.toml:ro" \
+            "$GITLEAKS_IMAGE" dir /objects \
+            --config /config/gitleaks.toml \
+            --ignore-gitleaks-allow --redact --no-banner 2>&1 | tee "$log" || rc=$?
+          plain="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          if grep -Eq '^[^ ]+ (ERR|FTL) ' <<< "$plain"; then
+            echo "::error::gitleaks logged an error"
+            exit 1
+          fi
+          if ! grep -Eq '^[^ ]+ INF scanned ~[1-9][0-9]* bytes' <<< "$plain"; then
+            echo "::error::gitleaks did not report any scanned bytes"
+            exit 1
+          fi
+          exit "$rc"
 
       - name: gitleaks dir (working tree)
         run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/gitleaks-tree.log"
+          rc=0
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             -v "$RUNNER_TEMP/gitleaks.toml:/config/gitleaks.toml:ro" \
             "$GITLEAKS_IMAGE" dir /repo \
             --config /config/gitleaks.toml \
-            --ignore-gitleaks-allow --redact --no-banner
+            --ignore-gitleaks-allow --redact --no-banner 2>&1 | tee "$log" || rc=$?
+          plain="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          if grep -Eq '^[^ ]+ (ERR|FTL) ' <<< "$plain"; then
+            echo "::error::gitleaks logged an error"
+            exit 1
+          fi
+          if ! grep -Eq '^[^ ]+ INF scanned ~[1-9][0-9]* bytes' <<< "$plain"; then
+            echo "::error::gitleaks did not report any scanned bytes"
+            exit 1
+          fi
+          exit "$rc"
 
   hygiene:
     runs-on: ubuntu-latest
@@ -78,20 +147,25 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
         run: |
           if [ "$EVENT" = pull_request ]; then
             base="$PR_BASE"
             head="$PR_HEAD"
-          else
-            head="$SHA"
-            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
-              base="$(git merge-base origin/main "$head")"
-            elif ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-              echo "::notice::previous tip is not in the history (force push); using the merge-base with origin/main"
-              base="$(git merge-base origin/main "$head")"
-            else
-              base="$BEFORE"
+          elif [ "$REF" = refs/heads/main ]; then
+            # main takes changes only through pull requests, so its previous
+            # tip is always a known commit; anything else fails closed.
+            if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "::error::previous tip of main is not a commit in the history"
+              exit 1
             fi
+            base="$BEFORE"
+            head="$SHA"
+          else
+            # The whole branch, not only this push, so a later push cannot
+            # hide an earlier commit of the branch.
+            base="$(git merge-base origin/main "$SHA")"
+            head="$SHA"
           fi
           echo "range=$base..$head" >> "$GITHUB_OUTPUT"
 
@@ -122,20 +196,25 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
         run: |
           if [ "$EVENT" = pull_request ]; then
             base="$PR_BASE"
             head="$PR_HEAD"
-          else
-            head="$SHA"
-            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
-              base="$(git merge-base origin/main "$head")"
-            elif ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-              echo "::notice::previous tip is not in the history (force push); using the merge-base with origin/main"
-              base="$(git merge-base origin/main "$head")"
-            else
-              base="$BEFORE"
+          elif [ "$REF" = refs/heads/main ]; then
+            # main takes changes only through pull requests, so its previous
+            # tip is always a known commit; anything else fails closed.
+            if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "::error::previous tip of main is not a commit in the history"
+              exit 1
             fi
+            base="$BEFORE"
+            head="$SHA"
+          else
+            # The whole branch, not only this push, so a later push cannot
+            # hide an earlier commit of the branch.
+            base="$(git merge-base origin/main "$SHA")"
+            head="$SHA"
           fi
           echo "range=$base..$head" >> "$GITHUB_OUTPUT"
 
