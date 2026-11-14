@@ -80,6 +80,21 @@ jobs:
       # text. It checks only until it has read a newline, so the stream starts
       # with 100000 newlines and nothing after them is checked.
       #
+      # A match may start in one object and run into the next; when a rule's
+      # allowlist then drops it (the Kubernetes rule drops any match that
+      # holds "\n---\n"), the next object's own match is never tried. So 1024
+      # newlines come before every separator. A bounded window of the default
+      # rules spans at most 300 newlines (the Kubernetes rule). Where an
+      # unbounded \s* or \s+ can take the newlines, the rule next needs text
+      # that the "---" line does not give (a key and a colon, a value, "=>"
+      # or "/>"), and the jwt-base64 class stops at the barrier line below.
+      # Two rules run on, unbounded, to a closing marker or quote:
+      # private-key to "KEY-----", curl-auth-user to a quote followed by a
+      # space. So a barrier line "'KEY----- follows the newlines: its quotes
+      # are followed by no space and it holds the marker, so both matches end
+      # inside the separator. After any bump of the gitleaks image, re-check
+      # the rules for windows that can cross the separator.
+      #
       # Four rules of the default config fire only on a path ending in .yaml
       # or .yml (Kubernetes Secret), .tf or .hcl (Terraform password), .php
       # (Freemius key) or nuget.config (NuGet password). The stream is
@@ -101,15 +116,17 @@ jobs:
             echo "::error::unexpected line in the object list"
             exit 1
           fi
+          printf -v pad '%1024s' ''
+          pad="${pad// /$'\n'}"$'"\'KEY-----\n'
           {
             head -c 100000 /dev/zero | tr '\0' '\n'
             grep -v '^tree ' "$list" | cut -d ' ' -f 2 \
-              | git cat-file --batch=$'\n---\n%(objecttype) %(objectname)'
+              | git cat-file --batch="$pad"$'---\n%(objecttype) %(objectname)'
             grep '^tree ' "$list" | cut -d ' ' -f 2 | while read -r id; do
-              printf '\n---\ntree %s\n' "$id"
+              printf '%s---\ntree %s\n' "$pad" "$id"
               git ls-tree -z --name-only "$id" | tr '\0' '\n'
             done
-            printf '\n---\nnames\n'
+            printf '%s---\nnames\n' "$pad"
             git rev-list --objects --all
           } > "$stream"
           for name in objects.tf objects.php nuget.config; do
