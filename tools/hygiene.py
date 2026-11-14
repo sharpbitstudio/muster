@@ -12,8 +12,8 @@ Checks:
 - absolute local paths (any Windows drive path, Linux and macOS home
   folders, the root home folder, WSL drive mounts, and in text also Git Bash
   and Cygwin drive paths); a home folder counts only at the start of a path,
-  also after an escape sequence or a one-letter flag, not inside a URL or a
-  relative path;
+  not inside a URL or a relative path; drive, home and Git Bash paths count
+  after an escape sequence or a one-letter flag too;
 - email addresses other than GitHub noreply addresses and GitHub's SSH user,
   quoted local parts included; an address glued to an allowed one is found
   too;
@@ -96,9 +96,10 @@ def path_start(word: str) -> str:
 # The patterns are phrased so that this file does not match them itself.
 # Checked in text and in path names.
 PATH_NAME_RES = (
-    # Any drive path. The drive letter may follow an escape such as \n, but
-    # not a letter or digit of a word, so "https://" and "s3://" are no drive.
-    re.compile(r"(?:(?<![A-Za-z0-9])|(?<=\\[A-Za-z]))[A-Za-z]:[\\/]"),
+    # Any drive path. The drive letter may follow an escape such as \n or a
+    # one-letter flag (see path_start), but not a letter or digit of a word,
+    # so "https://" and "s3://" are no drive.
+    re.compile(path_start("A-Za-z0-9") + r"[A-Za-z]:[\\/]"),
     # Only at the start of a path (see path_start): not after a word, a dot
     # or a dash, so a URL path or a relative path is no home folder.
     re.compile(path_start(r"\w.-") + r"/(?:home|Users)/[^\s/'\"<>]+"),
