@@ -1,0 +1,167 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # gitleaks honours a .gitleaksignore inside the scanned path, whatever
+      # flags it gets, so the scan refuses to run when one exists.
+      - name: No .gitleaksignore
+        run: |
+          if find . -path ./.git -prune -o -iname .gitleaksignore -print | grep -q .; then
+            echo "::error::.gitleaksignore is not allowed in this repository"
+            exit 1
+          fi
+
+      # The config is generated here, never read from the checkout.
+      - name: Write gitleaks config
+        run: |
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          echo "27630a96d6c55755cc37620f3933d5cab94b1eb78a726a32e11212972525d76e  $RUNNER_TEMP/gitleaks.toml" | sha256sum -c -
+
+      # The checkout belongs to the runner user, not to the container user, so
+      # git inside the container would refuse it as "dubious ownership". The
+      # GIT_CONFIG_* variables mark only /repo as safe, in command scope.
+      - name: gitleaks git (full history, first-parent diffs)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/gitleaks.toml:/config/gitleaks.toml:ro" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            "$GITLEAKS_IMAGE" git /repo \
+            --config /config/gitleaks.toml \
+            --log-opts=--diff-merges=first-parent \
+            --ignore-gitleaks-allow --redact --no-banner
+
+      - name: gitleaks dir (working tree)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/gitleaks.toml:/config/gitleaks.toml:ro" \
+            "$GITLEAKS_IMAGE" dir /repo \
+            --config /config/gitleaks.toml \
+            --ignore-gitleaks-allow --redact --no-banner
+
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Hygiene (tree)
+        run: python3 tools/hygiene.py
+
+      - name: Commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            head="$SHA"
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              base="$(git merge-base origin/main "$head")"
+            elif ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "::notice::previous tip is not in the history (force push); using the merge-base with origin/main"
+              base="$(git merge-base origin/main "$head")"
+            else
+              base="$BEFORE"
+            fi
+          fi
+          echo "range=$base..$head" >> "$GITHUB_OUTPUT"
+
+      - name: Hygiene (range)
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+        run: python3 tools/hygiene.py --range "$RANGE"
+
+  identity:
+    # Branch pushes other than main, and pull requests from this repository.
+    if: >-
+      (github.event_name == 'push' && github.ref != 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            head="$SHA"
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              base="$(git merge-base origin/main "$head")"
+            elif ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "::notice::previous tip is not in the history (force push); using the merge-base with origin/main"
+              base="$(git merge-base origin/main "$head")"
+            else
+              base="$BEFORE"
+            fi
+          fi
+          echo "range=$base..$head" >> "$GITHUB_OUTPUT"
+
+      # Identities are compared raw (no mailmap) and never printed: a public
+      # log must not repeat a wrong identity.
+      - name: Author and committer identity
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          owner='SharpBit Studio <66270150+sharpbitstudio@users.noreply.github.com>'
+          web='GitHub <noreply@github.com>'
+          bot='dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>'
+          allow_bot=0
+          case "$BRANCH" in dependabot/*) allow_bot=1 ;; esac
+          commits="$(git -c log.mailmap=false log --no-use-mailmap --format='%H%x09%an <%ae>%x09%cn <%ce>' "$RANGE")"
+          bad=0
+          while IFS=$'\t' read -r sha author committer; do
+            [ -n "$sha" ] || continue
+            if [ "$author" != "$owner" ] && ! { [ "$allow_bot" = 1 ] && [ "$author" = "$bot" ]; }; then
+              echo "::error::commit $sha: author is not an allowed identity"
+              bad=1
+            fi
+            if [ "$committer" != "$owner" ] && [ "$committer" != "$web" ]; then
+              echo "::error::commit $sha: committer is not an allowed identity"
+              bad=1
+            fi
+          done <<< "$commits"
+          exit "$bad"
