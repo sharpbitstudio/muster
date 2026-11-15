@@ -70,16 +70,16 @@ jobs:
       # The default config skips some paths (for example *.svg, a file named
       # gitleaks.toml at any depth, or anything under node_modules/) and never
       # reads commit, tag or tree objects. Every object reachable from any ref
-      # is therefore written into one stream as a record, after a separator:
-      # blobs, commits (headers and message) and annotated tags raw, trees as
-      # the names of their entries, and last the output of
+      # is therefore written into a stream, objects.txt, as a record after a
+      # separator: blobs, commits (headers and message) and annotated tags
+      # raw, trees as the names of their entries, and last the output of
       # "git rev-list --objects --all": object ids with path names.
       #
       # gitleaks 8.30.1 reads a file in chunks of 100000 bytes; when a chunk
       # does not end in two newlines, it reads on to the next blank line, at
       # most 25000 bytes (sources/file.go and sources/common.go). Each chunk
       # is matched on its own and chunks do not overlap, so a secret across a
-      # chunk end is not found. The stream is therefore laid out in blocks of
+      # chunk end is not found. Each stream is therefore laid out in blocks of
       # exactly 100000 bytes, each ending in at least two newlines: every read
       # ends at a block end without reading on, and each block is one chunk.
       # A record that does not fit in what is left of a block starts the next
@@ -93,8 +93,8 @@ jobs:
       #
       # gitleaks skips a file whose first chunk looks like an application/*
       # type, and some of those signatures are plain ASCII text. It checks
-      # only until it has read a newline, so the stream starts with a block of
-      # 100000 newlines and nothing after it is checked.
+      # only until it has read a newline, so each stream starts with a block
+      # of 100000 newlines and nothing after it is checked.
       #
       # A match may start in one record and run into the next; when a rule's
       # allowlist then drops it (the Kubernetes rule drops any match that
@@ -110,23 +110,31 @@ jobs:
       # are followed by no space and it holds the marker, so both matches end
       # inside the separator. After any bump of the gitleaks image, re-check
       # the rules for windows that can cross the separator or exceed 32000
-      # bytes, and the chunk size and the read-on limit.
+      # bytes, the chunk size and the read-on limit, and the path regexes
+      # below.
       #
-      # Four rules of the default config fire only on a path ending in .yaml
-      # or .yml (Kubernetes Secret), .tf or .hcl (Terraform password), .php
-      # (Freemius key) or nuget.config (NuGet password). The stream is
-      # hard-linked under one name for each. No name is on a path allowlist,
-      # has an archive extension, or matches a rule that fires on the path
-      # alone (such as *.p12). gitleaks reads each name in full, so the scan
-      # costs four reads of the stream but no extra disk, and a finding of
-      # any other rule shows up to four times. gitleaks can skip a file it
+      # Four rules of the default config fire only on a path that matches
+      # their path regex: kubernetes-secret-yaml (?i)\.ya?ml$,
+      # hashicorp-tf-password (?i)\.(?:tf|hcl)$, freemius-secret-key
+      # (?i)\.php$ and nuget-config-password (?i)nuget\.config$. The trees
+      # are read for the names each blob has in any reachable tree, and each
+      # of the four rules gets a stream of its own (objects.yaml, objects.tf,
+      # objects.php, nuget.config) that holds only the blobs with a name
+      # matching its regex. The rule thus sees a blob as gitleaks would see a
+      # file at that path: a file under a skipped path (node_modules/x.yaml)
+      # is still covered, and other text is not. A stream without records
+      # holds only its lead. No name is on a path allowlist, has an archive
+      # extension, or matches a rule that fires on the path alone (such as
+      # *.p12). Every rule runs on every stream, so a finding of another rule
+      # in a routed blob shows up more than once. gitleaks can skip a file it
       # cannot read without logging an error, so the scan must report exactly
-      # four times the stream size.
-      - name: gitleaks dir (every object, one stream)
+      # the bytes of all five streams, which the builder writes down.
+      - name: gitleaks dir (every object, in streams)
         run: |
           set -o pipefail
           objects="$RUNNER_TEMP/objects"
           list="$RUNNER_TEMP/object-list"
+          total="$RUNNER_TEMP/objects-bytes"
           mkdir "$objects"
           git rev-list --objects --all --no-object-names \
             | git cat-file --batch-check='%(objecttype) %(objectname)' > "$list"
@@ -134,13 +142,20 @@ jobs:
             echo "::error::unexpected line in the object list"
             exit 1
           fi
-          python3 -I - "$list" "$objects" <<'PY'
-          import os, subprocess, sys
+          python3 -I - "$list" "$objects" "$total" <<'PY'
+          import os, re, subprocess, sys
 
           BLOCK = 100000  # the read size of gitleaks, see above
           SLICE = 64000
           STEP = SLICE // 2
           SEP = b"\n" * 1024 + b"\"'KEY-----\n---\n"
+          # The path regexes of the path-bound rules, with Go's $ written as \Z.
+          ROUTES = (
+              ("objects.yaml", rb"(?i)\.ya?ml\Z"),  # kubernetes-secret-yaml
+              ("objects.tf", rb"(?i)\.(?:tf|hcl)\Z"),  # hashicorp-tf-password
+              ("objects.php", rb"(?i)\.php\Z"),  # freemius-secret-key
+              ("nuget.config", rb"(?i)nuget\.config\Z"),  # nuget-config-password
+          )
 
 
           def fail(msg):
@@ -148,76 +163,105 @@ jobs:
               sys.exit(1)
 
 
-          def put(header, data):
-              """Writes data as one record, or as overlapping slices."""
-              global blocks, used
-              off = 0
-              while True:
-                  head = header if len(data) <= SLICE else b"%s offset %d" % (header, off)
-                  rec = SEP + head + b"\n" + data[off:off + SLICE] + b"\n"
-                  if len(rec) > BLOCK - 2:
-                      fail("record longer than a block")
-                  if used + len(rec) > BLOCK - 2:
-                      out.write(b"\n" * (BLOCK - used))
-                      blocks += 1
-                      used = 0
-                  out.write(rec)
-                  used += len(rec)
-                  if off + SLICE >= len(data):
-                      return
-                  off += STEP
+          class Stream:
+              """One file: a lead block of newlines, then records in blocks."""
+
+              def __init__(self, name):
+                  self.name = name
+                  self.out = open(os.path.join(sys.argv[2], name), "wb")
+                  self.out.write(b"\n" * BLOCK)
+                  self.blocks, self.used, self.records = 1, BLOCK, 0
+
+              def put(self, header, data):
+                  """Writes data as one record, or as overlapping slices."""
+                  off = 0
+                  while True:
+                      head = header if len(data) <= SLICE else b"%s offset %d" % (header, off)
+                      rec = SEP + head + b"\n" + data[off:off + SLICE] + b"\n"
+                      if len(rec) > BLOCK - 2:
+                          fail("record longer than a block")
+                      if self.used + len(rec) > BLOCK - 2:
+                          self.out.write(b"\n" * (BLOCK - self.used))
+                          self.blocks += 1
+                          self.used = 0
+                      self.out.write(rec)
+                      self.used += len(rec)
+                      self.records += 1
+                      if off + SLICE >= len(data):
+                          return
+                      off += STEP
+
+              def close(self):
+                  self.out.write(b"\n" * (BLOCK - self.used))
+                  self.out.close()
+                  size = os.path.getsize(self.out.name)
+                  if size != self.blocks * BLOCK:
+                      fail("stream size is not a whole number of blocks")
+                  return size
 
 
-          def names(raw, id_len):
-              """Entry names of a raw tree object, one per line."""
-              lines, pos = [], 0
+          def cat(kind, oid):
+              """The raw content of one object, read through git cat-file."""
+              git.stdin.write(oid + b"\n")
+              git.stdin.flush()
+              head = git.stdout.readline()
+              prefix = oid + b" " + kind + b" "
+              size = head[len(prefix):-1]
+              if not head.startswith(prefix) or not head.endswith(b"\n") or not size.isdigit():
+                  fail("unexpected output of git cat-file")
+              data = git.stdout.read(int(size))
+              if len(data) != int(size) or git.stdout.read(1) != b"\n":
+                  fail("short output of git cat-file")
+              return data
+
+
+          def entries(raw, id_len):
+              """(name, hex id) of each entry of a raw tree object."""
+              out, pos = [], 0
               while pos < len(raw):
                   space = raw.index(b" ", pos)
                   nul = raw.index(b"\0", space)
-                  if not raw[pos:space].isdigit() or nul == space + 1:
+                  end = nul + 1 + id_len
+                  if not raw[pos:space].isdigit() or nul == space + 1 or end > len(raw):
                       fail("unexpected tree entry")
-                  lines.append(raw[space + 1:nul] + b"\n")
-                  pos = nul + 1 + id_len
-              if pos != len(raw):
-                  fail("unexpected end of a tree")
-              return b"".join(lines)
+                  out.append((raw[space + 1:nul], raw[nul + 1:end].hex().encode()))
+                  pos = end
+              return out
 
 
           with open(sys.argv[1], "rb") as f:
               objects = [line.split(b" ") for line in f.read().split(b"\n") if line]
-          stream = os.path.join(sys.argv[2], "objects.yaml")
-          with open(stream, "wb") as out:
-              out.write(b"\n" * BLOCK)  # the lead, a full block
-              blocks, used = 1, BLOCK
-              git = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-              for kind, oid in objects:
-                  git.stdin.write(oid + b"\n")
-                  git.stdin.flush()
-                  head = git.stdout.readline()
-                  prefix = oid + b" " + kind + b" "
-                  size = head[len(prefix):-1]
-                  if not head.startswith(prefix) or not head.endswith(b"\n") or not size.isdigit():
-                      fail("unexpected output of git cat-file")
-                  data = git.stdout.read(int(size))
-                  if len(data) != int(size) or git.stdout.read(1) != b"\n":
-                      fail("short output of git cat-file")
-                  if kind == b"tree":
-                      data = names(data, len(oid) // 2)
-                  put(kind + b" " + oid, data)
-              git.stdin.close()
-              if git.stdout.read() or git.wait():
-                  fail("git cat-file failed")
-              r = subprocess.run(["git", "rev-list", "--objects", "--all"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-              if r.returncode:
-                  fail("git rev-list failed")
-              put(b"names", r.stdout)
-              out.write(b"\n" * (BLOCK - used))
-          for name in ("objects.tf", "objects.php", "nuget.config"):
-              os.link(stream, os.path.join(sys.argv[2], name))
-          size = os.path.getsize(stream)
-          if size != blocks * BLOCK:
-              fail("stream size is not a whole number of blocks")
-          print(f"objects: {len(objects)}, blocks: {blocks}, stream: {size} bytes, under 4 names")
+          git = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+          # First the names each blob has in any reachable tree.
+          blob_names = {}
+          for kind, oid in objects:
+              if kind == b"tree":
+                  for name, entry in entries(cat(kind, oid), len(oid) // 2):
+                      blob_names.setdefault(entry, set()).add(name)
+          everything = Stream("objects.txt")
+          routes = [(Stream(name), re.compile(rx)) for name, rx in ROUTES]
+          for kind, oid in objects:
+              data = cat(kind, oid)
+              if kind == b"tree":
+                  data = b"".join(name + b"\n" for name, _ in entries(data, len(oid) // 2))
+              everything.put(kind + b" " + oid, data)
+              if kind == b"blob":
+                  for stream, rx in routes:
+                      if any(rx.search(name) for name in blob_names.get(oid, ())):
+                          stream.put(kind + b" " + oid, data)
+          git.stdin.close()
+          if git.stdout.read() or git.wait():
+              fail("git cat-file failed")
+          r = subprocess.run(["git", "rev-list", "--objects", "--all"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+          if r.returncode:
+              fail("git rev-list failed")
+          everything.put(b"names", r.stdout)
+          streams = [everything] + [stream for stream, _ in routes]
+          size = sum(stream.close() for stream in streams)
+          with open(sys.argv[3], "w") as f:
+              f.write(f"{size}\n")
+          parts = "; ".join(f"{s.name}: records {s.records}, blocks {s.blocks}" for s in streams)
+          print(f"objects: {len(objects)}; {parts}; bytes in all: {size}")
           PY
           log="$RUNNER_TEMP/gitleaks-objects.log"
           rc=0
@@ -232,9 +276,9 @@ jobs:
             echo "::error::gitleaks logged an error"
             exit 1
           fi
-          expected=$((4 * $(wc -c < "$objects/objects.yaml")))
+          expected="$(cat "$total")"
           if ! grep -Eq "^[^ ]+ INF scanned ~$expected bytes " <<< "$plain"; then
-            echo "::error::gitleaks did not scan the whole stream under all 4 names"
+            echo "::error::gitleaks did not scan every stream in full"
             exit 1
           fi
           exit "$rc"

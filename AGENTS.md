@@ -20,6 +20,8 @@ The tests arrive together with the tool.
 
 Fixtures are synthetic; never copy names, reports or paths from another project.
 
+Synthetic absolute paths in tests and fixtures use a POSIX root whose first folder has more than one letter (for example `/work/src/...`); a test that needs a Windows drive path builds it at run time, since hygiene treats any drive path in the repository as a local one.
+
 ## Checks
 
 CI runs three checks:
