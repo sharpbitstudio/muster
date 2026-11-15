@@ -10,11 +10,12 @@ header lines, the message and every file the commit adds or changes.
 Checks:
 
 - absolute local paths (any Windows drive path, device prefixes included,
-  Linux, BSD, Solaris and macOS home folders, the root home folder, WSL
-  drive mounts, and in text also Git Bash and Cygwin drive paths); a home
-  folder counts only at the start of a path, not inside a URL or a relative
-  path, and also with its slashes escaped as in JSON; drive, home and Git
-  Bash paths count after an escape sequence or a one-letter flag too;
+  Linux, BSD, Solaris and macOS home folders, the root home folder, media
+  mounts and pytest temporary folders named after the user, WSL drive
+  mounts, and in text also Git Bash and Cygwin drive paths); a home folder
+  counts only at the start of a path, not inside a URL or a relative path,
+  and also with its slashes escaped as in JSON; drive, home and Git Bash
+  paths count after an escape sequence or a one-letter flag too;
 - email addresses other than GitHub noreply addresses and GitHub's SSH user,
   quoted local parts included; an address glued to an allowed one is found
   too;
@@ -26,10 +27,11 @@ Checks:
 - ``.gitleaks.toml`` and ``.gitattributes`` byte-identical to their canonical
   content (compared by SHA-256), at any depth; the two at the root are read
   straight from disk, tracked or not, and must exist;
-- path names: the text checks above plus control characters; the local
-  path checks see the path with a leading slash, so a top-level ``home/...``
-  is found, and skip the Git Bash and Cygwin forms, so a top-level folder
-  with a one-letter name is no finding;
+- path names, of files and in the range also of folders: the text checks
+  above plus control characters; the local path checks see the path with a
+  leading slash, so a top-level ``home/...`` is found, and skip the Git Bash
+  and Cygwin forms, so a top-level folder with a one-letter name is no
+  finding;
 - in the range: the emails of the first author and committer lines must be
   plain ASCII GitHub noreply addresses; every raw header line, signatures
   included, gets the local path, email and suppression marker checks (not
@@ -108,8 +110,11 @@ PATH_NAME_RES = (
     # one-letter flag (see path_start), but not a letter or digit of a word,
     # so "https://" and "s3://" are no drive, nor a percent sign or a
     # backslash, so format and regex text such as "%s:" is none either. A
-    # Windows device prefix (two backslashes, "?" or ".", a backslash) counts.
-    re.compile("(?:" + path_start(r"A-Za-z0-9%\\") + r"|(?<=\\\\[?.]\\))[A-Za-z]:[\\/]"),
+    # Windows device prefix (two backslashes, "?" or ".", a backslash) counts,
+    # also with each backslash doubled as in JSON.
+    re.compile(
+        "(?:" + path_start(r"A-Za-z0-9%\\") + r"|(?<=\\\\[?.]\\)|(?<=\\\\\\\\[?.]\\\\))[A-Za-z]:[\\/]"
+    ),
     # Only at the start of a path (see path_start): not after a word, a dot,
     # a dash or a backslash, so a URL path or a relative path is no home
     # folder, escaped as in JSON or not. Home roots under /var, /usr and
@@ -121,6 +126,14 @@ PATH_NAME_RES = (
         + SLASH + r"[^\s/'\"<>]+"
     ),
     re.compile(path_start(r"\w.\\-") + SLASH + "root" + SLASH),
+    # Folders named after the user outside a home root: removable media
+    # mounts and the pytest temporary root. Same start rule as above.
+    re.compile(
+        path_start(r"\w.\\-")
+        + "(?:(?:" + SLASH + "run)?" + SLASH + "media" + SLASH
+        + "|" + SLASH + "tmp" + SLASH + "pytest-of-)"
+        + r"[^\s/'\"<>]+" + SLASH
+    ),
     re.compile(r"/mnt/[A-Za-z]/"),
 )
 # Checked in text only: a path name may well start with a one-letter folder.
@@ -191,6 +204,7 @@ SIGNATURE_LINE_RE = re.compile(r" [A-Za-z0-9+/=]+")
 MESSAGE_LINE_RE = re.compile(r"\r\n|\r|\n")
 
 MODE_GITLINK = "160000"
+MODE_TREE = "040000"
 
 
 class GitError(Exception):
@@ -436,7 +450,9 @@ def scan_range(top: str, spec: str, rep: Report) -> None:
         rep.header(raw, f"commit/{short}/header")
         message = raw.partition(b"\n\n")[2]
         rep.text(message.decode("utf-8", "replace"), f"commit/{short}", message=True)
-        opts = ("diff-tree", "-r", "-z", "--no-commit-id", "--no-renames", "--diff-filter=d")
+        # -t lists the trees too, so the name of a tree entry (even one that
+        # points at an empty tree) gets the path name checks.
+        opts = ("diff-tree", "-r", "-t", "-z", "--no-commit-id", "--no-renames", "--diff-filter=d")
         if parents:
             diff = git(top, *opts, parents[0], sha)
         else:
@@ -448,7 +464,7 @@ def scan_range(top: str, spec: str, rep: Report) -> None:
                 continue
             seen.add((path, blob))
             where = rep.path(path, f"@{short}")
-            if new_mode == MODE_GITLINK:
+            if new_mode in (MODE_GITLINK, MODE_TREE):
                 continue
             rep.blob(path, git(top, "cat-file", "blob", blob), where)
 
