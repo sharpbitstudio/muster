@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Hygiene check for a public repository.
 
 Without arguments it scans the working tree of the repository that contains
@@ -9,10 +8,13 @@ header lines, the message and every file the commit adds or changes.
 
 Checks:
 
-- absolute local paths (any Windows drive path, device prefixes included,
-  Linux, BSD, Solaris and macOS home folders, the root home folder, media
-  mounts and pytest temporary folders named after the user, WSL drive
-  mounts, and in text also Git Bash and Cygwin drive paths); a home folder
+- absolute local paths (any Windows drive path, a Windows device path to a
+  drive, a volume, a UNC share or the global root after any device prefix
+  (two backslashes and a question mark or a dot, or a backslash and two
+  question marks), also with its backslashes escaped as in JSON, Linux,
+  BSD, Solaris and macOS home folders, the root home folder, media mounts
+  and pytest temporary folders named after the user, WSL drive mounts, and
+  in text also Git Bash and Cygwin drive paths); a home folder
   counts only at the start of a path, not inside a URL or a relative path,
   and also with its slashes escaped as in JSON; drive, home and Git Bash
   paths count after an escape sequence or a one-letter flag too;
@@ -102,6 +104,15 @@ def path_start(word: str) -> str:
 
 # A slash, or a slash escaped as in JSON.
 SLASH = r"\\?/"
+# A backslash, or a backslash escaped as in JSON.
+BACKSLASH = r"\\\\?"
+
+
+def ascii_nocase(word: str) -> str:
+    """A pattern for word in any ASCII letter case. IGNORECASE would also
+    take a non-ASCII look-alike, such as the Kelvin sign for a K."""
+    return "".join(f"[{ch.upper()}{ch.lower()}]" for ch in word)
+
 
 # The patterns are phrased so that this file does not match them itself.
 # Checked in text and in path names.
@@ -109,11 +120,17 @@ PATH_NAME_RES = (
     # Any drive path. The drive letter may follow an escape such as \n or a
     # one-letter flag (see path_start), but not a letter or digit of a word,
     # so "https://" and "s3://" are no drive, nor a percent sign or a
-    # backslash, so format and regex text such as "%s:" is none either. A
-    # Windows device prefix (two backslashes, "?" or ".", a backslash) counts,
-    # also with each backslash doubled as in JSON.
+    # backslash, so format and regex text such as "%s:" is none either.
+    re.compile(path_start(r"A-Za-z0-9%\\") + r"[A-Za-z]:[\\/]"),
+    # A Windows device path: a device prefix (two backslashes, then "?" or
+    # ".", then a backslash; or a backslash, two "?" and a backslash), each
+    # backslash also doubled as in JSON, then a drive, a volume GUID, a UNC
+    # share or the global root. A prefix followed by anything else, such as
+    # regex text or a named pipe, is none.
     re.compile(
-        "(?:" + path_start(r"A-Za-z0-9%\\") + r"|(?<=\\\\[?.]\\)|(?<=\\\\\\\\[?.]\\\\))[A-Za-z]:[\\/]"
+        BACKSLASH + r"(?:" + BACKSLASH + r"[?.]|\?\?)" + BACKSLASH
+        + r"(?:[A-Za-z]:|" + ascii_nocase("Volume") + r"\{|(?:"
+        + ascii_nocase("UNC") + "|" + ascii_nocase("GLOBALROOT") + ")" + BACKSLASH + ")"
     ),
     # Only at the start of a path (see path_start): not after a word, a dot,
     # a dash or a backslash, so a URL path or a relative path is no home
