@@ -110,8 +110,8 @@ jobs:
       # are followed by no space and it holds the marker, so both matches end
       # inside the separator. After any bump of the gitleaks image, re-check
       # the rules for windows that can cross the separator or exceed 32000
-      # bytes, the chunk size and the read-on limit, and the path regexes
-      # below.
+      # bytes, the chunk size and the read-on limit, the path regexes below
+      # and the path-only rules.
       #
       # Four rules of the default config fire only on a path that matches
       # their path regex: kubernetes-secret-yaml (?i)\.ya?ml$,
@@ -125,10 +125,14 @@ jobs:
       # is still covered, and other text is not. A stream without records
       # holds only its lead. No name is on a path allowlist, has an archive
       # extension, or matches a rule that fires on the path alone (such as
-      # *.p12). Every rule runs on every stream, so a finding of another rule
-      # in a routed blob shows up more than once. gitleaks can skip a file it
-      # cannot read without logging an error, so the scan must report exactly
-      # the bytes of all five streams, which the builder writes down.
+      # *.p12), so those path-only rules never fire on a stream; the builder
+      # checks them by name instead (in the default config only pkcs12-file,
+      # (?i)(?:^|\/)[^\/]+\.p(?:12|fx)$): every name a blob has in any
+      # reachable tree, and on a match the step fails, naming the rule but not
+      # the file. Every rule runs on every stream, so a finding of another
+      # rule in a routed blob shows up more than once. gitleaks can skip a
+      # file it cannot read without logging an error, so the scan must report
+      # exactly the bytes of all five streams, which the builder writes down.
       - name: gitleaks dir (every object, in streams)
         run: |
           set -o pipefail
@@ -155,6 +159,11 @@ jobs:
               ("objects.tf", rb"(?i)\.(?:tf|hcl)\Z"),  # hashicorp-tf-password
               ("objects.php", rb"(?i)\.php\Z"),  # freemius-secret-key
               ("nuget.config", rb"(?i)nuget\.config\Z"),  # nuget-config-password
+          )
+          # The rules that fire on the path alone, as a regex for the full name
+          # of a tree entry; gitleaks matches the whole path, which ends in it.
+          PATH_ONLY = (
+              ("pkcs12-file", rb"(?i)[^/]+\.p(?:12|fx)"),
           )
 
 
@@ -238,6 +247,10 @@ jobs:
               if kind == b"tree":
                   for name, entry in entries(cat(kind, oid), len(oid) // 2):
                       blob_names.setdefault(entry, set()).add(name)
+          names = {name for kind, oid in objects if kind == b"blob" for name in blob_names.get(oid, ())}
+          for rule, rx in PATH_ONLY:
+              if any(re.fullmatch(rx, name) for name in names):
+                  fail(f"a blob has a name that matches the path-only rule {rule}")
           everything = Stream("objects.txt")
           routes = [(Stream(name), re.compile(rx)) for name, rx in ROUTES]
           for kind, oid in objects:
@@ -261,7 +274,7 @@ jobs:
           with open(sys.argv[3], "w") as f:
               f.write(f"{size}\n")
           parts = "; ".join(f"{s.name}: records {s.records}, blocks {s.blocks}" for s in streams)
-          print(f"objects: {len(objects)}; {parts}; bytes in all: {size}")
+          print(f"objects: {len(objects)}; {parts}; bytes in all: {size}; blob names checked: {len(names)}")
           PY
           log="$RUNNER_TEMP/gitleaks-objects.log"
           rc=0
