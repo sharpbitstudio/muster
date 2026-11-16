@@ -117,11 +117,12 @@ def ascii_nocase(word: str) -> str:
 # The patterns are phrased so that this file does not match them itself.
 # Checked in text and in path names.
 PATH_NAME_RES = (
-    # Any drive path. The drive letter may follow an escape such as \n or a
+    # Any drive path, also with the colon escaped by a backslash as in a Java
+    # properties file. The drive letter may follow an escape such as \n or a
     # one-letter flag (see path_start), but not a letter or digit of a word,
     # so "https://" and "s3://" are no drive, nor a percent sign or a
     # backslash, so format and regex text such as "%s:" is none either.
-    re.compile(path_start(r"A-Za-z0-9%\\") + r"[A-Za-z]:[\\/]"),
+    re.compile(path_start(r"A-Za-z0-9%\\") + r"[A-Za-z]\\?:[\\/]"),
     # A Windows device path: a device prefix (two backslashes, then "?" or
     # ".", then a backslash; or a backslash, two "?" and a backslash), each
     # backslash also doubled as in JSON, then a drive, a volume GUID, a UNC
@@ -143,13 +144,19 @@ PATH_NAME_RES = (
         + SLASH + r"[^\s/'\"<>]+"
     ),
     re.compile(path_start(r"\w.\\-") + SLASH + "root" + SLASH),
-    # Folders named after the user outside a home root: removable media
-    # mounts and the pytest temporary root. Same start rule as above.
+    # Folders named after the user outside a home root. Removable media
+    # mounts, with the same start rule as above.
     re.compile(
-        path_start(r"\w.\\-")
-        + "(?:(?:" + SLASH + "run)?" + SLASH + "media" + SLASH
-        + "|" + SLASH + "tmp" + SLASH + "pytest-of-)"
+        path_start(r"\w.\\-") + "(?:" + SLASH + "run)?" + SLASH + "media" + SLASH
         + r"[^\s/'\"<>]+" + SLASH
+    ),
+    # The pytest temporary root, which pytest puts in the temporary folder
+    # the system gives (/tmp, /var/tmp, a macOS /private/var/folders path):
+    # after any slash or backslash, escaped as in JSON or not, with no start
+    # rule.
+    re.compile(
+        "(?:" + SLASH + "|" + BACKSLASH + ")pytest-of-"
+        + r"[^\s/\\'\"<>]+" + "(?:" + SLASH + "|" + BACKSLASH + ")"
     ),
     re.compile(r"/mnt/[A-Za-z]/"),
 )
@@ -457,7 +464,7 @@ def scan_range(top: str, spec: str, rep: Report) -> None:
     head = resolve(top, head_rev)
     # Parents before children, so a file is reported at the commit that added it.
     rows = git(top, "rev-list", "--topo-order", "--reverse", "--parents", f"{base}..{head}").decode().split("\n")
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, bool]] = set()
     for row in filter(None, rows):
         sha, *parents = row.split()
         short = sha[:12]
@@ -477,13 +484,15 @@ def scan_range(top: str, spec: str, rep: Report) -> None:
         fields = split_z(diff)
         for meta, path in zip(fields[0::2], fields[1::2]):
             _, new_mode, _, blob, _ = meta.lstrip(":").split(" ")
-            if (path, blob) in seen:
+            # A gitlink or a tree is never read, so it does not stand in for
+            # a file with the same id at the same path in a later commit.
+            content = new_mode not in (MODE_GITLINK, MODE_TREE)
+            if (path, blob, content) in seen:
                 continue
-            seen.add((path, blob))
+            seen.add((path, blob, content))
             where = rep.path(path, f"@{short}")
-            if new_mode in (MODE_GITLINK, MODE_TREE):
-                continue
-            rep.blob(path, git(top, "cat-file", "blob", blob), where)
+            if content:
+                rep.blob(path, git(top, "cat-file", "blob", blob), where)
 
 
 def main(argv: list[str] | None = None) -> int:
