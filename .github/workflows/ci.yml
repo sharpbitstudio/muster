@@ -108,10 +108,17 @@ jobs:
       # private-key to "KEY-----", curl-auth-user to a quote followed by a
       # space. So a barrier line "'KEY----- follows the newlines: its quotes
       # are followed by no space and it holds the marker, so both matches end
-      # inside the separator. After any bump of the gitleaks image, re-check
-      # the rules for windows that can cross the separator or exceed 32000
-      # bytes, the chunk size and the read-on limit, the path regexes below
-      # and the path-only rules.
+      # inside the separator. Every record ends in a newline and none starts
+      # a chunk, so a rule anchored at the end or start of the text, with no
+      # alternative that takes a newline, can match a file but not its
+      # record. In the default config only sidekiq-sensitive-url is one: it
+      # ends in (?:[\/|\#|\?|:]|$), so a blob that ends in such a URL without
+      # a newline, held only in history or under a skipped path, is not found
+      # here (the history scan still sees one outside the skipped paths).
+      # After any bump of the gitleaks image, re-check the rules for windows
+      # that can cross the separator or exceed 32000 bytes, the chunk size
+      # and the read-on limit, rules anchored at the end or start of text,
+      # the path regexes below and the path-only rules.
       #
       # Four rules of the default config fire only on a path that matches
       # their path regex: kubernetes-secret-yaml (?i)\.ya?ml$,
