@@ -83,13 +83,21 @@ jobs:
       # exactly 100000 bytes, each ending in at least two newlines: every read
       # ends at a block end without reading on, and each block is one chunk.
       # A record that does not fit in what is left of a block starts the next
-      # block; the rest is filled with newlines. A record longer than 64000
-      # bytes is split into slices of 64000 bytes that start every 32000
-      # bytes, the last one ending at the end of the record; each slice is a
-      # record of its own, its header naming the object and the offset of the
-      # slice. A match of up to 32000 bytes (more than twice a 16384-bit RSA
-      # private key block) thus lies whole in one slice, and a slice with its
-      # separator always fits in a block.
+      # block; the rest is filled with newlines. A record is written whole
+      # when it fits in one block with its separator, the longest header (a
+      # SHA-256 id and an offset) and two newlines of padding: up to 98857
+      # bytes of data. So every object up to that size lies whole in one
+      # chunk, as a file of that size does in a file scan. A longer record is
+      # split into slices of 98857 bytes that start every 49428 bytes, the
+      # last one ending at the end of the record; each slice is a record of
+      # its own, its header naming the object and the offset of the slice,
+      # and fits in a block with its separator. A match of up to 49428 bytes
+      # (half a slice, more than three times a 16384-bit RSA private key
+      # block) thus lies whole in one slice. gitleaks applies the keywords of
+      # a rule per chunk (see below), so in an object larger than one block
+      # a keyword and a match more than half a slice apart can be missed, as
+      # a file scan misses them across its own chunk ends in a file over
+      # 100000 bytes.
       #
       # gitleaks skips a file whose first chunk looks like an application/*
       # type, and some of those signatures are plain ASCII text. It checks
@@ -125,17 +133,24 @@ jobs:
       # record of the rev-list output holds only its path names, and in the
       # header lines of a raw commit or tag (up to the first empty line) the
       # id of a tree, parent or object line, also of the tag inside a
-      # mergetag header, is broken the same way. Every other header line,
-      # the signatures and the message stay raw. What is left fails closed:
-      # a keyword in one record and a real 40-hex value in another record of
-      # the same block, such as the pinned commit of an action, still give a
-      # finding.
+      # mergetag header, is broken the same way, but only when it is the id
+      # of an object the builder has listed itself. A real object id is no
+      # secret; any other value, such as an extra "object" header line that
+      # git accepts in a commit, is scanned as written. Every other header
+      # line, the signatures and the message stay raw. What is left fails
+      # closed: a keyword in one record and a real 40-hex value in another
+      # record of the same block, such as the pinned commit of an action,
+      # still give a finding, and so does the object line of a tag inside a
+      # mergetag header when that object is not in the repository.
       #
       # After any bump of the gitleaks image, re-check the rules for windows
-      # that can cross the separator or exceed 32000 bytes, the chunk size
-      # and the read-on limit, rules anchored at the end or start of text,
-      # rules that match a bare object id, the path regexes below and the
-      # path-only rules.
+      # that can cross the separator or exceed half a slice, the chunk size
+      # and the read-on limit, whether keywords still apply per chunk (in an
+      # object larger than one block, a keyword and a match more than half a
+      # slice apart can be missed, as a file scan misses them across its own
+      # chunk ends in a file over 100000 bytes), rules anchored at the end or
+      # start of text, rules that match a bare object id, the path regexes
+      # below and the path-only rules.
       #
       # Four rules of the default config fire only on a path that matches
       # their path regex: kubernetes-secret-yaml (?i)\.ya?ml$,
@@ -174,9 +189,16 @@ jobs:
           import os, re, subprocess, sys
 
           BLOCK = 100000  # the read size of gitleaks, see above
-          SLICE = 64000
-          STEP = SLICE // 2
           SEP = b"\n" * 1024 + b"\"'KEY-----\n---\n"
+          # The longest record header: the longest type, a SHA-256 id broken
+          # by a dot, and an offset of up to 20 digits.
+          HEADER = len(b"commit ") + 65 + len(b" offset ") + 20
+          # The most data that fits in one block with the separator, the
+          # longest header, two newlines around the data and two of padding.
+          # A record up to that size is written whole; a longer one in slices
+          # of that size that start every half of it.
+          SLICE = BLOCK - len(SEP) - HEADER - 2 - 2
+          STEP = SLICE // 2
           # The path regexes of the path-bound rules, with Go's $ written as \Z.
           ROUTES = (
               ("objects.yaml", rb"(?i)\.ya?ml\Z"),  # kubernetes-secret-yaml
@@ -243,14 +265,14 @@ jobs:
               return oid[:half] + b"." + oid[half:]
 
 
-          def unbare(raw):
-              """A raw commit or tag whose header lines name no object by a bare id."""
+          def unbare(raw, known):
+              """A raw commit or tag whose header lines name no object of known by a bare id."""
               lines = raw.split(b"\n")
               for i, line in enumerate(lines):
                   if not line:
                       break
                   m = ID_LINE.fullmatch(line)
-                  if m:
+                  if m and m.group(2) in known:
                       lines[i] = m.group(1) + broken(m.group(2))
               return b"\n".join(lines)
 
@@ -286,6 +308,7 @@ jobs:
 
           with open(sys.argv[1], "rb") as f:
               objects = [line.split(b" ") for line in f.read().split(b"\n") if line]
+          known = {oid for _, oid in objects}
           git = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
           # First the names each blob has in any reachable tree.
           blob_names = {}
@@ -304,7 +327,7 @@ jobs:
               if kind == b"tree":
                   data = b"".join(name + b"\n" for name, _ in entries(data, len(oid) // 2))
               elif kind != b"blob":
-                  data = unbare(data)
+                  data = unbare(data, known)
               header = kind + b" " + broken(oid)
               everything.put(header, data)
               if kind == b"blob":

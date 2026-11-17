@@ -159,11 +159,11 @@ PATH_NAME_RES = (
     # The pytest temporary root, which pytest puts in the temporary folder
     # the system gives (/tmp, /var/tmp, a macOS /private/var/folders path):
     # after any slash or backslash, escaped as in JSON or not, with no start
-    # rule.
-    re.compile(
-        "(?:" + SLASH + "|" + BACKSLASH + ")pytest-of-"
-        + r"[^\s/\\'\"<>]+" + "(?:" + SLASH + "|" + BACKSLASH + ")"
-    ),
+    # rule. The user name is at least one character and needs nothing after
+    # it, so a root at the end of a path, before a space, a quote or ">",
+    # or at the end of a line counts; code that builds one from an empty
+    # name ("/pytest-of-" before a quote) does not.
+    re.compile("(?:" + SLASH + "|" + BACKSLASH + ")pytest-of-" + r"[^\s/\\'\"<>]+"),
     re.compile(r"/mnt/[A-Za-z]/"),
 )
 # Checked in text only: a path name may well start with a one-letter folder.
