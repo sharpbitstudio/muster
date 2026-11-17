@@ -72,8 +72,8 @@ jobs:
       # reads commit, tag or tree objects. Every object reachable from any ref
       # is therefore written into a stream, objects.txt, as a record after a
       # separator: blobs, commits (headers and message) and annotated tags
-      # raw, trees as the names of their entries, and last the output of
-      # "git rev-list --objects --all": object ids with path names.
+      # raw, trees as the names of their entries, and last the path names
+      # that "git rev-list --objects --all" gives.
       #
       # gitleaks 8.30.1 reads a file in chunks of 100000 bytes; when a chunk
       # does not end in two newlines, it reads on to the next blank line, at
@@ -115,10 +115,27 @@ jobs:
       # ends in (?:[\/|\#|\?|:]|$), so a blob that ends in such a URL without
       # a newline, held only in history or under a skipped path, is not found
       # here (the history scan still sees one outside the skipped paths).
+      #
+      # gitleaks applies the keywords of a rule to a whole chunk, and a chunk
+      # here is a block of many records: once one record holds a keyword of
+      # a rule, the rule runs over every record of the block. One default
+      # rule takes a bare string of 40 hex digits, which every SHA-1 object
+      # id is. So the builder never writes a bare object id of its own: a
+      # record header names its object by the id broken in two by a dot, the
+      # record of the rev-list output holds only its path names, and in the
+      # header lines of a raw commit or tag (up to the first empty line) the
+      # id of a tree, parent or object line, also of the tag inside a
+      # mergetag header, is broken the same way. Every other header line,
+      # the signatures and the message stay raw. What is left fails closed:
+      # a keyword in one record and a real 40-hex value in another record of
+      # the same block, such as the pinned commit of an action, still give a
+      # finding.
+      #
       # After any bump of the gitleaks image, re-check the rules for windows
       # that can cross the separator or exceed 32000 bytes, the chunk size
       # and the read-on limit, rules anchored at the end or start of text,
-      # the path regexes below and the path-only rules.
+      # rules that match a bare object id, the path regexes below and the
+      # path-only rules.
       #
       # Four rules of the default config fire only on a path that matches
       # their path regex: kubernetes-secret-yaml (?i)\.ya?ml$,
@@ -172,6 +189,10 @@ jobs:
           PATH_ONLY = (
               ("pkcs12-file", rb"(?i)[^/]+\.p(?:12|fx)"),
           )
+          OID = rb"[0-9a-f]{40}|[0-9a-f]{64}"
+          # A header line of a commit or tag that names an object, also one of
+          # the tag inside a mergetag header: its first line, then indented.
+          ID_LINE = re.compile(rb"((?: ?(?:tree|parent|object)|mergetag object) )(" + OID + rb")")
 
 
           def fail(msg):
@@ -214,6 +235,24 @@ jobs:
                   if size != self.blocks * BLOCK:
                       fail("stream size is not a whole number of blocks")
                   return size
+
+
+          def broken(oid):
+              """An object id broken by a dot, so that no rule takes it for a bare hex value."""
+              half = len(oid) // 2
+              return oid[:half] + b"." + oid[half:]
+
+
+          def unbare(raw):
+              """A raw commit or tag whose header lines name no object by a bare id."""
+              lines = raw.split(b"\n")
+              for i, line in enumerate(lines):
+                  if not line:
+                      break
+                  m = ID_LINE.fullmatch(line)
+                  if m:
+                      lines[i] = m.group(1) + broken(m.group(2))
+              return b"\n".join(lines)
 
 
           def cat(kind, oid):
@@ -264,18 +303,28 @@ jobs:
               data = cat(kind, oid)
               if kind == b"tree":
                   data = b"".join(name + b"\n" for name, _ in entries(data, len(oid) // 2))
-              everything.put(kind + b" " + oid, data)
+              elif kind != b"blob":
+                  data = unbare(data)
+              header = kind + b" " + broken(oid)
+              everything.put(header, data)
               if kind == b"blob":
                   for stream, rx in routes:
                       if any(rx.search(name) for name in blob_names.get(oid, ())):
-                          stream.put(kind + b" " + oid, data)
+                          stream.put(header, data)
           git.stdin.close()
           if git.stdout.read() or git.wait():
               fail("git cat-file failed")
           r = subprocess.run(["git", "rev-list", "--objects", "--all"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
           if r.returncode:
               fail("git rev-list failed")
-          everything.put(b"names", r.stdout)
+          paths = []
+          for line in r.stdout.split(b"\n"):
+              oid, _, path = line.partition(b" ")
+              if line and not re.fullmatch(OID, oid):
+                  fail("unexpected output of git rev-list")
+              if path:
+                  paths.append(path + b"\n")
+          everything.put(b"names", b"".join(paths))
           streams = [everything] + [stream for stream, _ in routes]
           size = sum(stream.close() for stream in streams)
           with open(sys.argv[3], "w") as f:
