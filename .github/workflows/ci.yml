@@ -72,14 +72,20 @@ jobs:
       # reads commit, tag or tree objects. Every object reachable from any ref
       # is therefore written into a stream, objects.txt, as a record after a
       # separator: blobs, commits (headers and message) and annotated tags
-      # raw. Then come the names: every distinct entry name of any tree and
+      # raw. Then come the names: every distinct entry name of any tree,
       # every distinct path name that "git rev-list --objects --all" gives,
-      # each as a record of its own (header "name"), in sorted order. A tree
-      # gives no record of its own. Each name is its own record so that the
-      # separator stops a match from running across names, as it does across
-      # objects (see below): otherwise crafted names could form one match
-      # that spans several of them and that a rule's allowlist then drops,
-      # with a real secret in a name in the middle.
+      # and every distinct complete path of a file, folder or submodule in
+      # any reachable tree (the tree of each commit and any tree a tag
+      # points at, walked with the path prefix of each folder), each as a
+      # record of its own (header "name"), in sorted order. rev-list gives
+      # each object one path only, and a credential can run across folder
+      # names (base64 holds "/"): when two paths share a blob or a folder,
+      # the one that forms the credential may be the path rev-list does not
+      # give. A tree gives no record of its own. Each name is its own record
+      # so that the separator stops a match from running across names, as
+      # it does across objects (see below): otherwise crafted names could
+      # form one match that spans several of them and that a rule's
+      # allowlist then drops, with a real secret in a name in the middle.
       #
       # gitleaks 8.30.1 reads a file in chunks of 100000 bytes; when a chunk
       # does not end in two newlines, it reads on to the next blank line, at
@@ -300,15 +306,16 @@ jobs:
 
 
           def entries(raw, id_len):
-              """(name, hex id) of each entry of a raw tree object."""
+              """(name, hex id, is a folder) of each entry of a raw tree object."""
               out, pos = [], 0
               while pos < len(raw):
                   space = raw.index(b" ", pos)
                   nul = raw.index(b"\0", space)
                   end = nul + 1 + id_len
-                  if not raw[pos:space].isdigit() or nul == space + 1 or end > len(raw):
+                  if not re.fullmatch(rb"[0-7]+", raw[pos:space]) or nul == space + 1 or end > len(raw):
                       fail("unexpected tree entry")
-                  out.append((raw[space + 1:nul], raw[nul + 1:end].hex().encode()))
+                  folder = int(raw[pos:space], 8) & 0o170000 == 0o040000
+                  out.append((raw[space + 1:nul], raw[nul + 1:end].hex().encode(), folder))
                   pos = end
               return out
 
@@ -317,13 +324,15 @@ jobs:
               objects = [line.split(b" ") for line in f.read().split(b"\n") if line]
           known = {oid for _, oid in objects}
           git = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-          # First the trees: the names each blob has in any reachable tree, and
-          # every entry name for the name records.
-          blob_names = {}
+          # First the trees, kept for the walk of complete paths below: the
+          # names each blob has in any reachable tree, and every entry name for
+          # the name records.
+          trees, blob_names = {}, {}
           all_names = set()
           for kind, oid in objects:
               if kind == b"tree":
-                  for name, entry in entries(cat(kind, oid), len(oid) // 2):
+                  trees[oid] = entries(cat(kind, oid), len(oid) // 2)
+                  for name, entry, _ in trees[oid]:
                       blob_names.setdefault(entry, set()).add(name)
                       all_names.add(name)
           names = {name for kind, oid in objects if kind == b"blob" for name in blob_names.get(oid, ())}
@@ -332,10 +341,22 @@ jobs:
                   fail(f"a blob has a name that matches the path-only rule {rule}")
           everything = Stream("objects.txt")
           routes = [(Stream(name), re.compile(rx)) for name, rx in ROUTES]
+          roots = []  # the tree of each commit, and each tree a tag points at
           for kind, oid in objects:
               if kind == b"tree":
                   continue  # its entry names are name records, below
               data = cat(kind, oid)
+              if kind == b"commit":
+                  m = re.match(rb"tree (" + OID + rb")\n", data)
+                  if not m or m.group(1) not in trees:
+                      fail("unexpected tree line in a commit")
+                  roots.append(m.group(1))
+              elif kind == b"tag":
+                  m = re.match(rb"object (" + OID + rb")\ntype ([a-z]+)\n", data)
+                  if not m or (m.group(2) == b"tree" and m.group(1) not in trees):
+                      fail("unexpected object line in a tag")
+                  if m.group(2) == b"tree":
+                      roots.append(m.group(1))
               if kind != b"blob":
                   data = unbare(data, known)
               header = kind + b" " + broken(oid)
@@ -356,6 +377,22 @@ jobs:
                   fail("unexpected output of git rev-list")
               if path:
                   all_names.add(path)
+          # Every complete path: each root walked with an empty prefix, each
+          # folder with its own path as the prefix of its entries, and no
+          # (tree, prefix) pair walked twice.
+          walked = set()
+          todo = [(root, b"") for root in roots]
+          while todo:
+              tree, prefix = todo.pop()
+              if (tree, prefix) in walked:
+                  continue
+              walked.add((tree, prefix))
+              for name, entry, folder in trees[tree]:
+                  all_names.add(prefix + name)
+                  if folder:
+                      if entry not in trees:
+                          fail("a folder of a tree is not in the object list")
+                      todo.append((entry, prefix + name + b"/"))
           # Each distinct name is a record of its own, so no match runs across names.
           before = everything.records
           for name in sorted(all_names):
