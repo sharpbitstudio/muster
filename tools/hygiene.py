@@ -267,18 +267,18 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # Host and user names in test reports (JUnit, JaCoCo and Surefire XML), in
 # text only. Bound to attribute syntax, so prose that names an attribute is
-# none: the name does not follow a word character, a dot, a colon or a dash
-# and ignores case in ASCII only (see ascii_nocase); then "=", spaces
-# around it allowed, and an opening quote, single or double, also escaped
-# by a backslash as in a Python or JSON string. The value runs up to the
-# next quote, backslash, "<", ">" or space, and a fine value must be closed
-# by the same quote, escaped the same way (XML_CLOSE), so an unclosed value
-# counts. Each name is assembled from letter classes, so this file does not
-# match the patterns itself.
+# none: the name does not follow a word character, a dot, a colon or a dash,
+# except right after an escape such as \t or \n in a string literal, and
+# ignores case in ASCII only (see ascii_nocase); then "=", spaces around it
+# allowed, and an opening quote, single or double, also escaped by a
+# backslash as in a Python or JSON string. A fine value must be closed by
+# the same quote, escaped the same way (XML_CLOSE), so any other value,
+# unclosed or closed otherwise, counts. Each name is assembled from letter
+# classes, so this file does not match the patterns itself.
 def xml_attr(name: str) -> str:
     """An attribute name, "=" and the opening quote: group 1 is the
     backslash that escapes the quote, or empty, and group 2 the quote."""
-    return r"(?<![\w.:-])" + ascii_nocase(name) + r"\s*+=\s*+(\\?)([\"'])"
+    return r"(?:(?<![\w.:-])|(?<=\\[A-Za-z]))" + ascii_nocase(name) + r"\s*+=\s*+(\\?)([\"'])"
 
 
 XML_CLOSE = r"\1\2"
@@ -295,9 +295,11 @@ SESSIONINFO_RE = re.compile("<" + ascii_nocase("sessioninfo") + r"(?![\w.:-])([^
 # localhost, a dash and hex digits, closed.
 SESSION_ID_RE = re.compile(xml_attr("id") + "(localhost-[0-9A-Fa-f]++" + XML_CLOSE + ")?", re.ASCII)
 # A property named after the user, as in a Surefire report, in any attribute
-# order, or a keyword argument of the same name in code that builds one.
+# order, or a keyword argument of the same name in code that builds one. The
+# value ends where a name cannot go on, closed by any quote or not at all,
+# so a mismatched close counts too and user.name.x does not.
 USER_NAME_RE = re.compile(
-    xml_attr("name") + ascii_nocase("user") + r"\." + ascii_nocase("name") + XML_CLOSE, re.ASCII
+    xml_attr("name") + ascii_nocase("user") + r"\." + ascii_nocase("name") + r"(?![\w.-])", re.ASCII
 )
 
 
@@ -444,7 +446,8 @@ class Report:
         cols = [
             m.start() + 1 for m in SESSIONINFO_RE.finditer(line) if not session_id_ok(m.group(1), bool(m.group(2)))
         ]
-        self.columns(where, n, "sessioninfo", "sessioninfo id other than localhost-<hex>", cols)
+        detail = "sessioninfo id other than localhost-<hex>, or an open tag without one"
+        self.columns(where, n, "sessioninfo", detail, cols)
         cols = [m.start() + 1 for m in USER_NAME_RE.finditer(line)]
         self.columns(where, n, "user-name", "user.name property", cols)
 

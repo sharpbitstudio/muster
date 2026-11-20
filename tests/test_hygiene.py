@@ -66,6 +66,10 @@ class HostnameTest(unittest.TestCase):
         line = "<testsuite " + "hostname" + "=" + '\\"localhost"' + ">"
         self.assertEqual(categories(line), ["hostname"])
 
+    def test_after_an_escape_in_a_string_literal(self):
+        self.assertEqual(categories("xml = '<testsuite" + "\\t" + attr("hostname", HOST) + "/>'"), ["hostname"])
+        self.assertEqual(categories('"<testsuite' + "\\n" + attr("hostname", HOST, '"', "\\") + '/>"'), ["hostname"])
+
     def test_two_on_one_line_give_one_finding(self):
         line = "<a " + attr("hostname", HOST) + "/><b " + attr("hostname", HOST) + "/>"
         rep = check(line)
@@ -99,6 +103,18 @@ class SessioninfoTest(unittest.TestCase):
 
     def test_id_with_escaped_quotes(self):
         line = '"<' + "sessioninfo " + attr("id", HOST + "-1a2b3c", '"', "\\") + '/>"'
+        self.assertEqual(categories(line), ["sessioninfo"])
+
+    def test_id_in_single_quotes(self):
+        line = "<" + "sessioninfo " + attr("id", HOST + "-1a2b3c", "'") + "/>"
+        self.assertEqual(categories(line), ["sessioninfo"])
+
+    def test_id_after_an_escape_in_a_string_literal(self):
+        line = "xml = '<" + "sessioninfo" + "\\t" + attr("id", HOST + "-1a2b3c") + "/>'"
+        self.assertEqual(categories(line), ["sessioninfo"])
+
+    def test_upper_case_prefix(self):
+        line = "<" + "sessioninfo " + attr("id", "LOCALHOST-1a2b3c") + "/>"
         self.assertEqual(categories(line), ["sessioninfo"])
 
     def test_id_with_non_hex_digits(self):
@@ -145,6 +161,16 @@ class UserNameTest(unittest.TestCase):
         line = 'SubElement(p, "property", ' + attr("name", "user.name") + ', value="' + USER + '")'
         self.assertEqual(categories(line), ["user-name"])
 
+    def test_after_an_escape_in_a_string_literal(self):
+        line = "xml = '<property" + "\\t" + attr("name", "user.name") + ' value="' + USER + "\"/>'"
+        self.assertEqual(categories(line), ["user-name"])
+
+    def test_mismatched_or_missing_close(self):
+        start = "<property " + "name" + '="' + "user.name"
+        self.assertEqual(categories(start + '\\" value="' + USER + '"/>'), ["user-name"])
+        self.assertEqual(categories(start + "' value='" + USER + "'/>"), ["user-name"])
+        self.assertEqual(categories(start), ["user-name"])
+
     def test_other_property_is_fine(self):
         self.assertEqual(categories('<property name="java.version" value="17"/>'), [])
 
@@ -185,6 +211,7 @@ class RootHomeTest(unittest.TestCase):
 
     def test_redirect_from_root_home(self):
         self.assertEqual(categories("cat <" + "/" + "root/x"), ["abs-path"])
+        self.assertEqual(categories('"cat <' + "\\/" + "root" + "\\/" + 'x"'), ["abs-path"])
 
     def test_root_home(self):
         self.assertEqual(categories("/" + "root/x"), ["abs-path"])
