@@ -21,8 +21,9 @@ Checks:
   Windows home folder without a drive; in text a home folder also counts
   below one to three other folders at the start of a path, as in a bind
   mount or on a network share; the root home folder counts with or without
-  a separator after it; drive, home and Git Bash paths count after an
-  escape sequence or a one-letter flag too;
+  a separator after it, but not as the closing tag of an XML element named
+  root; drive, home and Git Bash paths count after an escape sequence or a
+  one-letter flag too; a Git Bash path does not start after a glob star;
 - email addresses other than GitHub noreply addresses and GitHub's SSH user,
   quoted local parts included; an address glued to an allowed one is found
   too; GitHub's SSH user and noreply address stay exempt in text when only
@@ -41,6 +42,14 @@ Checks:
   leading slash, so a top-level ``home/...`` is found, and skip the Git Bash
   and Cygwin forms, so a top-level folder with a one-letter name is no
   finding;
+- in file content and commit messages, host and user names as test reports
+  write them: a hostname attribute other than localhost or empty, a
+  sessioninfo id other than localhost, a dash and hex digits (a sessioninfo
+  tag that does not end on its line and has no id there counts too), and a
+  name attribute whose value is user.name; only in attribute syntax, a
+  value in single or double quotes, also escaped by a backslash as in JSON,
+  so prose that names them is no finding; the names ignore case in ASCII
+  only;
 - in the range: the emails of the first author and committer lines must be
   plain ASCII GitHub noreply addresses; every raw header line, signatures
   included, gets the local path, email and suppression marker checks (not
@@ -173,8 +182,13 @@ PATH_NAME_RES = (
     HOME_RE,
     # The root home folder, ending in a separator or before a character that
     # cannot continue the folder name, so a longer name such as rootfs is
-    # none.
-    re.compile(path_start(r"\w.\\-") + SLASH + "root" + "(?:" + SLASH + r"|(?![\w.-]))"),
+    # none. The closing tag of an XML element named root, its slash escaped
+    # as in JSON or not, is none either: only a "<" right before the slash
+    # together with a ">" right after the name, so a shell redirect from a
+    # file under the root home folder still counts.
+    re.compile(
+        path_start(r"\w.\\-") + "(?!(?<=<)" + SLASH + "root>)" + SLASH + "root" + "(?:" + SLASH + r"|(?![\w.-]))"
+    ),
     # Folders named after the user outside a home root. Removable media
     # mounts, with the same start rule as above.
     re.compile(
@@ -206,8 +220,9 @@ LOCAL_PATH_RES = tuple(HOME_TEXT_RE if rx is HOME_RE else rx for rx in PATH_NAME
     # Other text of that shape is found too. The slashes may be escaped as
     # in JSON; the path does not start after a backslash either, so a match
     # cannot begin at the slash of an escaped one and skip the start rule.
+    # Nor after a star, so a glob such as **/x/... is none.
     re.compile(
-        path_start(r"\w./\\-") + SLASH + "[A-Za-z]" + SLASH
+        path_start(r"\w./\\*-") + SLASH + "[A-Za-z]" + SLASH
         + r"""(?=[\w.-][^\x00-\x1f\x7f/\\:*?"<>|'`]{0,254}+(?<! )""" + SLASH + ")"
     ),
 )
@@ -248,6 +263,51 @@ CI_SKIP_RE = re.compile(
 SKIP_CHECKS_RE = re.compile(r"^\s*skip-checks\s*:\s*true\b", re.IGNORECASE | re.ASCII)
 # C0 control characters except TAB, LF and CR (CR has its own check), and DEL.
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+# Host and user names in test reports (JUnit, JaCoCo and Surefire XML), in
+# text only. Bound to attribute syntax, so prose that names an attribute is
+# none: the name does not follow a word character, a dot, a colon or a dash
+# and ignores case in ASCII only (see ascii_nocase); then "=", spaces
+# around it allowed, and an opening quote, single or double, also escaped
+# by a backslash as in a Python or JSON string. The value runs up to the
+# next quote, backslash, "<", ">" or space, and a fine value must be closed
+# by the same quote, escaped the same way (XML_CLOSE), so an unclosed value
+# counts. Each name is assembled from letter classes, so this file does not
+# match the patterns itself.
+def xml_attr(name: str) -> str:
+    """An attribute name, "=" and the opening quote: group 1 is the
+    backslash that escapes the quote, or empty, and group 2 the quote."""
+    return r"(?<![\w.:-])" + ascii_nocase(name) + r"\s*+=\s*+(\\?)([\"'])"
+
+
+XML_CLOSE = r"\1\2"
+# A JUnit host name: fine only when empty or localhost, closed. The
+# lookahead holds the two fine values, so any other value is a match.
+HOSTNAME_RE = re.compile(
+    xml_attr("hostname") + "(?!(?:" + ascii_nocase("localhost") + ")?" + XML_CLOSE + ")", re.ASCII
+)
+# The opening tag of a JaCoCo session and its text up to the next "<" or ">"
+# on the line, taken possessively so the scan stays linear; group 2 is the
+# ">" that ends the tag on this line, or empty.
+SESSIONINFO_RE = re.compile("<" + ascii_nocase("sessioninfo") + r"(?![\w.:-])([^<>]*+)(>?)", re.ASCII)
+# An id attribute in that tag text; group 3 is set when the value is fine:
+# localhost, a dash and hex digits, closed.
+SESSION_ID_RE = re.compile(xml_attr("id") + "(localhost-[0-9A-Fa-f]++" + XML_CLOSE + ")?", re.ASCII)
+# A property named after the user, as in a Surefire report, in any attribute
+# order, or a keyword argument of the same name in code that builds one.
+USER_NAME_RE = re.compile(
+    xml_attr("name") + ascii_nocase("user") + r"\." + ascii_nocase("name") + XML_CLOSE, re.ASCII
+)
+
+
+def session_id_ok(tag: str, closed: bool) -> bool:
+    """Whether every id in the text of a sessioninfo tag is fine. A tag with
+    no id is fine only when it ends on its line: otherwise the id may be on
+    the next one."""
+    ids = list(SESSION_ID_RE.finditer(tag))
+    return all(m.group(3) is not None for m in ids) if ids else closed
+
 
 NOREPLY_SUFFIX = "@users.noreply.github.com"
 NOREPLY_RE = re.compile(r"[^@\s]+" + re.escape(NOREPLY_SUFFIX), re.IGNORECASE)
@@ -377,11 +437,23 @@ class Report:
         cols = [m.start() + 1 for m in MARKER_RE.finditer(line)]
         self.columns(where, n, "suppression-marker", "inline gitleaks suppression marker", cols)
 
+    def names(self, line: str, where: str, n: int) -> None:
+        """Host and user name checks on one line of text."""
+        cols = [m.start() + 1 for m in HOSTNAME_RE.finditer(line)]
+        self.columns(where, n, "hostname", "hostname attribute other than localhost or empty", cols)
+        cols = [
+            m.start() + 1 for m in SESSIONINFO_RE.finditer(line) if not session_id_ok(m.group(1), bool(m.group(2)))
+        ]
+        self.columns(where, n, "sessioninfo", "sessioninfo id other than localhost-<hex>", cols)
+        cols = [m.start() + 1 for m in USER_NAME_RE.finditer(line)]
+        self.columns(where, n, "user-name", "user.name property", cols)
+
     def text(self, text: str, where: str, *, message: bool = False) -> None:
         """Line checks on decoded text: file content or a commit message."""
         lines = MESSAGE_LINE_RE.split(text) if message else text.split("\n")
         for n, line in enumerate(lines, 1):
             self.leaks(line, where, n, emails=not (message and line == DEPENDABOT_SIGNOFF))
+            self.names(line, where, n)
             cols = [col for col, ch in enumerate(line, 1) if ord(ch) > 127 and ch not in NON_ASCII_ALLOW]
             self.columns(where, n, "non-ascii", "non-ASCII character", cols)
             cols = [m.start() + 1 for m in CONTROL_RE.finditer(line)]
