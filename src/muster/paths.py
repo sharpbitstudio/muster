@@ -27,7 +27,8 @@ def normalize(path: str) -> str:
 
 def exists_exact(root: Path, path: str, *, folder: bool = False) -> bool:
     """Whether `path` (relative to `root`) is a file, or a folder, whose every part has exactly the
-    configured name. Path.exists() alone would accept another case on Windows and macOS."""
+    configured name. Path.exists() alone would accept another case on Windows and macOS. It never
+    raises: a folder that cannot be read hides what is in it."""
     current = root
     for part in [part for part in normalize(path).split("/") if part]:
         try:
@@ -37,20 +38,24 @@ def exists_exact(root: Path, path: str, *, folder: bool = False) -> bool:
         if part not in names:
             return False
         current = current / part
-    return current.is_dir() if folder else current.is_file()
+    return os.path.isdir(current) if folder else os.path.isfile(current)  # False on any OSError
+
+
+def _is_junction(path: str) -> bool:
+    """os.path.isjunction() of Python 3.12 for 3.11: only a mount point is a junction, not any other
+    reparse point (a cloud-synced folder, say). Only Windows has reparse tags."""
+    mount_point = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+    if mount_point is None:
+        return False
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) == mount_point
+    except OSError:
+        return False
 
 
 def is_link(path: str) -> bool:
     """Whether `path` is a symbolic link or a Windows directory junction."""
-    if os.path.islink(path):
-        return True
-    if hasattr(os.path, "isjunction"):  # Python 3.12 and newer
-        return os.path.isjunction(path)
-    try:
-        attributes = getattr(os.lstat(path), "st_file_attributes", 0)  # only Windows has them
-    except OSError:
-        return False
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return os.path.islink(path) or getattr(os.path, "isjunction", _is_junction)(path)
 
 
 def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | None = None) -> list[str]:

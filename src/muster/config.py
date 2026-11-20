@@ -13,6 +13,7 @@ import math
 import os
 import re
 import tomllib
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,8 @@ _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 _DRIVE = re.compile(r"[A-Za-z]:")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MISSING = object()
+# The range of a TOML integer: 64-bit signed.
+INT_MIN, INT_MAX = -(2**63), 2**63 - 1
 
 
 def _key(prefix: str, name: str) -> str:
@@ -80,18 +83,26 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)  # a TOML boolean is never a number
 
 
+def _in_toml_range(key: str, value: Any) -> None:
+    """An integer that TOML cannot hold (Python reads one of any length) is an error; checked after
+    the range of the key, so that a key with a range keeps its own message."""
+    if _is_int(value) and not INT_MIN <= value <= INT_MAX:
+        raise ConfigError(f"{key}: must be a 64-bit integer, from {INT_MIN} to {INT_MAX}")
+
+
 def integer(minimum: int | None = None) -> Check:
     def check(key: str, value: Any) -> None:
         _expect(key, value, _is_int(value), "an integer")
         if minimum is not None and value < minimum:
             raise ConfigError(f"{key}: must be {minimum} or more, got {_shown(value)}")
+        _in_toml_range(key, value)
 
     return check
 
 
 def number(low: float, high: float | None = None, *, above: bool = False) -> Check:
-    """A float or an integer, finite, in [low, high], or above low when `above`. An integer is
-    compared exactly, however large: it is never converted to a float."""
+    """A float or an integer, finite, in [low, high], or above low when `above`; an integer also fits
+    in 64 bits. An integer is compared exactly, however large: it is never converted to a float."""
 
     def check(key: str, value: Any) -> None:
         _expect(key, value, _is_int(value) or isinstance(value, float), "a number")
@@ -103,6 +114,7 @@ def number(low: float, high: float | None = None, *, above: bool = False) -> Che
             raise ConfigError(f"{key}: must be {low:g} or more, got {_shown(value)}")
         if high is not None and value > high:
             raise ConfigError(f"{key}: must be {high:g} or less, got {_shown(value)}")
+        _in_toml_range(key, value)
 
     return check
 
@@ -119,10 +131,13 @@ def string(choices: tuple[str, ...] = (), pattern: re.Pattern[str] | None = None
 
 
 _NOT_RELATIVE = "must be a path relative to the repository root with / separators"
+_LINE_SEPARATORS = ("\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}")
 
 
 def _has_control(value: str) -> bool:
-    return any(ch < " " or ch == "\x7f" for ch in value)
+    """A control character (Unicode category Cc: C0, DEL and C1), or a line or paragraph separator,
+    which the zone grammar takes as a line terminator."""
+    return any(unicodedata.category(ch) == "Cc" or ch in _LINE_SEPARATORS for ch in value)
 
 
 def _path_problem(value: str, allow_empty: bool = False) -> str | None:
@@ -174,10 +189,13 @@ def glob(key: str, value: Any) -> None:
 
 
 def name_glob(key: str, value: Any) -> None:
-    """A well-formed glob of file names, without control characters."""
+    """A well-formed glob of file names, without control characters, and without / or backslash in
+    the glob or in any of its alternatives: it is matched against a file name only."""
     _expect(key, value, isinstance(value, str), "a string")
     if _has_control(value):
         raise ConfigError(f"{key}: has a control character")
+    if "/" in value or "\\" in value:  # an alternative is made of parts of the glob
+        raise ConfigError(f"{key}: must be a glob of file names, without / or \\")
     _alternatives(key, value)
 
 
@@ -236,7 +254,7 @@ def _check_table(prefix: str, value: dict, schema: dict[str, Check], required: t
 
 
 def _schema_version(key: str, value: Any) -> None:
-    integer()(key, value)
+    _expect(key, value, _is_int(value), "an integer")
     if value != SCHEMA_VERSION:
         raise ConfigError(f"{key}: unsupported schema {_shown(value)}; this muster reads schema {SCHEMA_VERSION}")
 
@@ -445,3 +463,13 @@ def load(root: Path, value: str = DEFAULT_CONFIG) -> Config:
     except ConfigError as exc:
         raise ConfigError(f"{name}: {exc}") from None
     return Config(root, file, data)
+
+
+def load_unchecked(root: Path, value: str = DEFAULT_CONFIG) -> Config | None:
+    """The profile parsed but not checked against the schema, for a best-effort look into one that
+    load() refused; None when it cannot be read or is not TOML. It never raises."""
+    file = config_path(root, value)
+    try:
+        return Config(root, file, tomllib.loads(file.read_bytes().decode("utf-8")))
+    except Exception:  # noqa: BLE001 - any failure means there is nothing to look into
+        return None

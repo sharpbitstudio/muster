@@ -476,6 +476,12 @@ class GrammarHelperTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(expand(bad), [])
 
+    def test_many_groups_on_one_line(self):
+        line = "billing/" + "{x}" * 1000 + "/**"
+        self.assertEqual(expand(line), ["billing/" + "x" * 1000 + "/**"])
+        dead = f"{CRITICAL}: '{expand(line)[0]}' (alternative of '{line}') matches no source file"
+        self.assertEqual(check(zoned(line), ["auth/*"], sources("auth/Token.java")), [dead])
+
     def test_glob_error(self):
         self.assertIsNone(glob_error("billing/**"))
         self.assertIsNone(glob_error("**"))

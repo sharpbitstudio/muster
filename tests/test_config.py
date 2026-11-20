@@ -414,6 +414,10 @@ class PathTest(ValidateCase):
         ("app/" + chr(0) + "src", "has a control character"),
         ("app/src" + chr(0x1F), "has a control character"),
         ("app/" + chr(0x7F), "has a control character"),
+        ("app/" + chr(0x85) + "src", "has a control character"),
+        ("app/src" + chr(0x9F), "has a control character"),
+        ("app/" + chr(0x2028) + "src", "has a control character"),
+        ("app/" + chr(0x2029), "has a control character"),
     ]
     GOOD = ["app/src/main", "**/*.java", "app/release..notes/x", "app/.hidden/x", "TEST-*.xml"]
 
@@ -496,11 +500,19 @@ class GlobTest(ValidateCase):
         validate(doc("source.include", ["{src,lib}/**/*.{py,pyi}", "src/{,app/}main.py"]))
 
     def test_own_test_forbidden_is_a_glob_of_file_names(self):
-        validate(doc("mutation.own_test_forbidden", ["*IntegrationTest*", "{Slow,Live}*", "dir/../*Test*"]))
+        validate(doc("mutation.own_test_forbidden", ["*IntegrationTest*", "{Slow,Live}*"]))
         message = self.error(doc("mutation.own_test_forbidden", ["*Test*", "{Integration"]))
         self.assertEqual(message, "mutation.own_test_forbidden[1]: bad glob \"{Integration\": a '{' without its '}'")
-        message = self.error(doc("mutation.own_test_forbidden", ["*" + chr(0) + "*"]))
-        self.assertEqual(message, "mutation.own_test_forbidden[0]: has a control character")
+        for value in ("*" + chr(0) + "*", "*" + chr(0x85) + "*"):
+            with self.subTest(value=value):
+                message = self.error(doc("mutation.own_test_forbidden", [value]))
+                self.assertEqual(message, "mutation.own_test_forbidden[0]: has a control character")
+
+    def test_own_test_forbidden_has_no_folder(self):
+        message = "mutation.own_test_forbidden[0]: must be a glob of file names, without / or \\"
+        for value in ("dir/../*Test*", "{Slow,support/Live}*", "support\\*Test*"):
+            with self.subTest(value=value):
+                self.assertEqual(self.error(doc("mutation.own_test_forbidden", [value])), message)
 
 
 class OwnTestTemplateTest(ValidateCase):
@@ -530,8 +542,20 @@ class NeverInternalErrorTest(ValidateCase):
         self.assertEqual(
             self.error(doc("duration.warn_s", -(10**400))), f"duration.warn_s: must be greater than 0, got {-(10**400)}"
         )
-        validate(doc("duration.warn_s", 10**400))
+        self.assertEqual(self.error(doc("duration.warn_s", 10**400)), f"duration.warn_s: {self.BEYOND_64_BITS}")
         self.assertIn("unsupported schema 0xfff", self.error({"schema": huge}))
+
+    BEYOND_64_BITS = "must be a 64-bit integer, from -9223372036854775808 to 9223372036854775807"
+
+    def test_integer_beyond_64_bits(self):
+        for key in COUNT_KEYS + POSITIVE_KEYS:
+            with self.subTest(key=key):
+                validate(doc(key, 2**63 - 1))
+                self.assertEqual(self.error(doc(key, 2**63)), f"{shown(key)}: {self.BEYOND_64_BITS}")
+                self.assertEqual(self.error(doc(key, 16**5000)), f"{shown(key)}: {self.BEYOND_64_BITS}")
+        huge = -(16**5000)
+        message = f"zones.exemption_max_days: must be 0 or more, got {hex(huge)}"
+        self.assertEqual(self.error(doc("zones.exemption_max_days", huge)), message)
 
     def test_regular_expression_that_overflows(self):
         for pattern in ("x{4294967296}", "(" * 2000 + ")" * 2000):

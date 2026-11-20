@@ -66,32 +66,44 @@ def _policy_files(cfg: Config) -> list[tuple[str, str]]:
 
 
 def inputs(cfg: Config) -> list[tuple[str, Path]]:
-    """The policy files the profile names (label, path). It never raises: the command line protects
-    them before this command can report any error."""
-    return [(f"the file of {key}", cfg.root / value) for key, value in _policy_files(cfg)]
+    """The policy files and the coverage.full_run_suites files the profile names (label, path). It
+    never raises, not even on a profile that failed its check, where it takes the string values it
+    finds: the command line protects them before this command can report any error."""
+    named = [(f"the file of {key}", cfg.get(key)) for key in POLICY_FILES]
+    suites = cfg.get("coverage.full_run_suites")
+    for i, suite in enumerate(suites if isinstance(suites, list) else []):
+        if isinstance(suite, dict):
+            named.append((f"the file of coverage.full_run_suites[{i}].file", suite.get("file")))
+    usable = [(label, value) for label, value in named if isinstance(value, str) and value and "\0" not in value]
+    return [(label, cfg.root / value) for label, value in usable]
 
 
-def outputs(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path, bool, bool]]:
-    """The output files (label, path, removed before the check, removed when the run fails)."""
-    files = []
-    if args.zones_out is not None:
-        files.append((f"--zones-out {args.zones_out}", Path(args.zones_out), True, False))
-    snapshot = snapshot_path(args, cfg)
+def outputs(args: argparse.Namespace, cfg: Config) -> tuple[list[tuple[str, Path, bool, bool]], FatalError | None]:
+    """The output files that can be named (label, path, removed before the check, removed when the
+    run fails), and the error that keeps one from being named, or None. It never raises: the command
+    line checks the named files first and then raises the error."""
+    files, error = [], None
+    if args.zones_out == "":
+        error = FatalError("--zones-out: the file name is empty")
+    elif args.zones_out is not None:
+        files.append((f"--zones-out {args.zones_out}", Path(args.zones_out), True, True))
+    try:
+        snapshot = snapshot_path(args, cfg)
+    except FatalError as exc:
+        snapshot, error = None, error or exc
     if snapshot is not None:
         # Kept while the check runs, so that an unchanged snapshot keeps its created_epoch_ms.
         files.append((f"the snapshot {snapshot}", snapshot, False, True))
-    return files
+    return files, error
 
 
 def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
-    """The repository files no output may be: every walked source and test file and every
-    coverage.full_run_suites file. It never raises: the walk is kept in args.source_sets for run(),
-    which reports a folder that is missing or cannot be read."""
+    """The repository files no output may be: every walked source and test file. It never raises:
+    the walk is kept in args.source_sets for run(), which reports a folder that is missing or cannot
+    be read."""
     sets = args.source_sets = source_sets(cfg, defer=True)
     files = [(f"the source file {path}", cfg.root / path) for path in sets.sources]
     files += [(f"the test file {path}", cfg.root / path) for path in sorted(sets.tests)]
-    for i, suite in enumerate(cfg.get("coverage.full_run_suites", [])):
-        files.append((f"the file of coverage.full_run_suites[{i}].file", cfg.root / suite["file"]))
     return files
 
 
@@ -109,9 +121,20 @@ def policy_sha256(critical: bytes, standard: bytes, exemptions: bytes, tables: d
     return hashlib.sha256(digests + canonical.encode("ascii")).hexdigest()
 
 
+def utf8_name(path: str) -> bytes:
+    """The UTF-8 bytes of a file name. A name that UTF-8 cannot encode (a POSIX name with a byte that
+    is not UTF-8, a lone surrogate in a Windows name) is a FatalError that names it escaped."""
+    try:
+        return path.encode("utf-8")
+    except UnicodeEncodeError:
+        shown = path.encode("utf-8", "backslashreplace").decode("utf-8")
+        raise FatalError(f"{shown}: the file name is not valid UTF-8, which --zones-out and --snapshot need") from None
+
+
 def sources_sha256(sources: list[str]) -> str:
-    """SHA-256 over the UTF-8 text of the sorted paths, each followed by a line feed."""
-    return hashlib.sha256("".join(f"{path}\n" for path in sources).encode("utf-8", "surrogateescape")).hexdigest()
+    """SHA-256 over the UTF-8 text of the sorted paths, each followed by a line feed; a path that
+    UTF-8 cannot encode is a FatalError (see utf8_name)."""
+    return hashlib.sha256(b"".join(utf8_name(path) + b"\n" for path in sources)).hexdigest()
 
 
 def zones_text(classification: Classification) -> str:
@@ -209,19 +232,18 @@ def _passed(rep: Report, classification: Classification, targets: int | None) ->
 def _write_zones(target: Path, text: str) -> None:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(text.encode("utf-8", "surrogateescape"))
+        target.write_bytes(text.encode("utf-8"))
     except OSError as exc:
         raise FatalError(f"cannot write --zones-out {target}: {exc.strerror or exc}") from None
 
 
-def _write_snapshot(target: Path, sources: list[str], policy_hash: str) -> None:
+def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_hash: str) -> None:
     """Write the snapshot, unless the one there already has the same sources and policy hashes."""
-    sources_hash = sources_sha256(sources)
     try:
         old = json.loads(target.read_bytes())
         if old.get("sources_sha256") == sources_hash and old.get("policy_sha256") == policy_hash:
             return
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):  # unreadable: it is written anew
         pass
     document = {
         "schema": SNAPSHOT_SCHEMA,
@@ -277,10 +299,13 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     if violations:
         raise _invalid(rep, violations)
     _passed(rep, classification, targets)
+    snapshot = snapshot_path(args, cfg)
+    if args.zones_out is None and snapshot is None:
+        return
+    sources_hash = sources_sha256(sets.sources)  # every name is UTF-8 before an output is written
     if args.zones_out is not None:
         _write_zones(Path(args.zones_out), zones_text(classification))
-    snapshot = snapshot_path(args, cfg)
     if snapshot is not None:
         tables = {"source": cfg.get("source"), "zones": cfg.get("zones")}
         parts = [raw.get(key, b"") for key in ("zones.critical", "zones.standard", "zones.exemptions")]
-        _write_snapshot(snapshot, sets.sources, policy_sha256(*parts, tables))
+        _write_snapshot(snapshot, sets.sources, sources_hash, policy_sha256(*parts, tables))

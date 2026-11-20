@@ -18,8 +18,9 @@ from pathlib import Path
 from unittest import mock
 
 from muster import __version__, cli
-from muster.config import Config
-from muster.policy import outputs, policy_sha256, sources_sha256
+from muster.config import Config, load
+from muster.policy import outputs, policy_sha256, protected, sources_sha256
+from muster.report import FatalError
 
 BASE = "src/main/java/org/example/app"
 TESTS = "src/test/java/org/example/app"
@@ -64,6 +65,20 @@ ZONES = (
 )
 VERDICT = "policy: PASS (4 source files: 2 critical in 2 zones, 2 standard; 1 exemption)\n"
 UNCLASSIFIED = "unclassified package 'report' - add it to policy/critical.txt or policy/standard.txt"
+TABLES = {
+    "source": {
+        "roots": ["src/main/java"],
+        "tests": ["src/test/java"],
+        "include": ["**/*.java"],
+        "exclude": ["**/package-info.java"],
+    },
+    "zones": {
+        "base": BASE,
+        "critical": "policy/critical.txt",
+        "standard": "policy/standard.txt",
+        "exemptions": "policy/exemptions.txt",
+    },
+}
 
 
 class PolicyCase(unittest.TestCase):
@@ -117,6 +132,13 @@ class PolicyCase(unittest.TestCase):
 
     def unclassify(self) -> None:
         self.write(f"{BASE}/report/Summary.java", "class X {}\n")
+
+    def link(self, target: Path, link: Path) -> None:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symbolic link here")
 
 
 class ValidPolicyTest(PolicyCase):
@@ -296,6 +318,19 @@ class ProfileTest(PolicyCase):
         self.suite(f"{TESTS}/FullrunSuite.java")
         self.assertEqual(self.policy()[0], 2)
 
+    def test_integer_that_toml_cannot_hold(self):
+        huge = "0x" + "f" * 5000
+        cases = [
+            (f"exemption_max_days = {huge}", "zones.exemption_max_days: must be a 64-bit integer"),
+            (f"[coverage.floor]\nline = {huge}", "coverage.floor.line: must be 1 or less, got 0x"),
+        ]
+        for table, message in cases:
+            with self.subTest(message=message):
+                self.write("muster.toml", PROFILE.replace("[policy]", f"{table}\n\n[policy]"))
+                code, env = self.envelope("--snapshot")
+                self.assertEqual((code, env["error"]["kind"]), (2, "config"))
+                self.assertEqual(env["error"]["message"][: len(message) + 13], f"muster.toml: {message}")
+
 
 class ZoneListOutputTest(PolicyCase):
     def test_rows(self):
@@ -329,6 +364,23 @@ class ZoneListOutputTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot write --zones-out taken", err)
         self.assertTrue((self.work / "taken").is_dir())
+
+    def test_removed_when_a_later_output_fails(self):
+        (self.work / "taken").mkdir()
+        code, _, err = self.policy("--zones-out", "zones.tsv", "--summary-file", "taken")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the summary taken", err)
+        self.assertFalse((self.work / "zones.tsv").exists())
+
+    def test_empty_name_is_refused_before_anything_is_removed(self):
+        snapshot = self.work / "snapshot.json"
+        snapshot.write_bytes(b"old\n")
+        for options in (["--zones-out", ""], ["--zones-out=", "--snapshot", "snapshot.json"]):
+            with self.subTest(options=options):
+                code, _, err = self.policy(*options)
+                self.assertEqual(code, 2)
+                self.assertIn("muster policy: error: --zones-out: the file name is empty", err)
+                self.assertEqual(snapshot.read_bytes(), b"old\n")
 
 
 class SnapshotTest(PolicyCase):
@@ -396,6 +448,21 @@ class SnapshotTest(PolicyCase):
         self.assertNotEqual(after["created_epoch_ms"], 1)
         self.assertEqual(after["sources_sha256"], before["sources_sha256"])
         self.assertNotEqual(after["policy_sha256"], before["policy_sha256"])
+
+    def test_without_exemptions_the_hash_takes_empty_bytes(self):
+        self.write("muster.toml", PROFILE.replace('exemptions = "policy/exemptions.txt"\n', ""))
+        (self.repo / "policy" / "exemptions.txt").unlink()
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        tables = {"source": TABLES["source"], "zones": {**TABLES["zones"]}}
+        del tables["zones"]["exemptions"]
+        expected = policy_sha256(CRITICAL, STANDARD, b"", tables)
+        self.assertEqual(self.read_json(self.snapshot)["policy_sha256"], expected)
+
+    def test_prior_snapshot_nested_too_deeply_is_written_anew(self):
+        self.snapshot.parent.mkdir(parents=True)
+        self.snapshot.write_bytes(b"[" * 100_000 + b"]" * 100_000)
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertEqual(self.read_json(self.snapshot)["sources"], SOURCES)
 
     def test_change_of_the_zones_table_changes_it(self):
         self.assertEqual(self.policy("--snapshot")[0], 0)
@@ -501,9 +568,9 @@ class SnapshotTest(PolicyCase):
         cfg = Config(self.repo, self.repo / "muster.toml", {"policy": {"snapshot": "build/muster/snapshot.json"}})
         args = argparse.Namespace(zones_out=None, snapshot="<policy.snapshot>")
         expected = [("the snapshot <policy.snapshot>", Path("<policy.snapshot>"), False, True)]
-        self.assertEqual(outputs(args, cfg), expected)
+        self.assertEqual(outputs(args, cfg), (expected, None))
         args = cli.build_parser().parse_args(["policy", "--snapshot"])
-        self.assertEqual(outputs(args, cfg)[0][1], self.repo / "build" / "muster" / "snapshot.json")
+        self.assertEqual(outputs(args, cfg)[0][0][1], self.repo / "build" / "muster" / "snapshot.json")
 
 
 class OutputClashTest(PolicyCase):
@@ -566,6 +633,60 @@ class OutputClashTest(PolicyCase):
                 self.assertEqual(code, 2)
                 self.assertIn("is the file of zones.critical", err)
                 self.assertUntouched({critical: CRITICAL})
+
+    def test_json_out_is_a_policy_file_of_an_invalid_profile(self):
+        self.write("muster.toml", PROFILE.replace("schema = 1", "schema = 2"))
+        critical = self.repo / "policy" / "critical.txt"
+        code, _, err = self.policy("--json-out", str(critical))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--json-out {critical} is the file of zones.critical", err)
+        self.assertUntouched({critical: CRITICAL})
+
+    def test_json_out_is_a_policy_file_when_the_tree_cannot_be_walked(self):
+        critical = self.repo / "policy" / "critical.txt"
+        with mock.patch("muster.policy.source_sets", side_effect=RuntimeError("boom")):
+            code, _, err = self.policy("--json-out", str(critical))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--json-out {critical} is the file of zones.critical", err)
+        self.assertUntouched({critical: CRITICAL})
+
+    def test_protected_files_never_raise_on_a_denied_folder(self):
+        denied = PermissionError(13, "Permission denied")
+        with (
+            mock.patch("os.stat", side_effect=denied),
+            mock.patch.object(Path, "is_dir", side_effect=denied),
+            mock.patch.object(Path, "is_file", side_effect=denied),
+        ):
+            self.assertIsInstance(protected(argparse.Namespace(), load(self.repo)), list)
+
+    def test_outputs_are_checked_when_the_snapshot_cannot_be_named(self):
+        self.write("muster.toml", PROFILE.replace('[policy]\nsnapshot = "build/muster/snapshot.json"\n', ""))
+        same = self.work / "same.txt"
+        same.write_bytes(b"keep\n")
+        code, _, err = self.policy("--zones-out", "same.txt", "--json-out", "same.txt", "--snapshot")
+        self.assertEqual(code, 2)
+        self.assertIn("--zones-out same.txt is the same file as --json-out same.txt", err)
+        self.assertUntouched({same: b"keep\n"})
+
+    def test_output_is_the_file_a_full_run_suite_links_to(self):
+        target = self.write("outside/FullRunSuite.java", "class Suite {}\n")
+        self.link(target, self.repo / "suites" / "Alias.java")
+        entry = '\n[[coverage.full_run_suites]]\nname = "FullRunSuite"\nfile = "suites/Alias.java"\n'
+        self.write("muster.toml", PROFILE + entry)
+        code, _, err = self.policy("--zones-out", str(target))
+        self.assertEqual(code, 2)
+        self.assertIn("is the file of coverage.full_run_suites[0].file", err)
+        self.assertUntouched({target: b"class Suite {}\n"})
+
+    def test_output_is_a_source_file_that_is_a_link(self):
+        target = self.write("outside/Linked.java", "class X {}\n")
+        link = self.repo / BASE / "codec" / "Linked.java"
+        self.link(target, link)
+        code, _, err = self.policy("--zones-out", str(link))
+        self.assertEqual(code, 2)
+        self.assertIn(f"is the source file {BASE}/codec/Linked.java", err)
+        self.assertTrue(link.is_symlink())
+        self.assertUntouched({target: b"class X {}\n"})
 
     def test_summary_file_is_a_policy_file(self):
         critical = self.repo / "policy" / "critical.txt"
@@ -702,6 +823,18 @@ class UndecodableNameTest(PolicyCase):
         summary = (self.work / "summary.md").read_bytes().decode("utf-8")
         self.assertIn("unclassified package 'bad\N{REPLACEMENT CHARACTER}'", summary)
 
+    def test_classified_name_that_is_not_utf8_stops_the_outputs(self):
+        try:
+            self.write(f"{BASE}/codec/" + os.fsdecode(b"Bad\xff.java"), "class X {}\n")
+        except (OSError, UnicodeError):
+            self.skipTest("this file system takes only valid UTF-8 names")
+        self.assertEqual(self.policy()[0], 0)
+        code, _, err = self.policy("--zones-out", "zones.tsv", "--snapshot")
+        self.assertEqual(code, 2)
+        self.assertIn(f"muster policy: error: {BASE}/codec/Bad\\udcff.java: the file name is not valid UTF-8", err)
+        self.assertFalse((self.work / "zones.tsv").exists())
+        self.assertFalse(self.snapshot.exists())
+
 
 class MutationTargetTest(PolicyCase):
     def setUp(self):
@@ -762,6 +895,14 @@ class MutationTargetTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertTrue(env["error"]["message"].startswith("muster.toml: mutation.own_test_forbidden[0]: bad glob"))
 
+    def test_change_of_only_the_allowlist_leaves_the_policy_hash(self):
+        self.write("policy/mutation.txt", "codec/KeyParser.java\n")
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        before = self.read_json(self.snapshot)["policy_sha256"]
+        self.write("policy/mutation.txt", "# pure logic\ncodec/KeyParser.java\n")
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertEqual(self.read_json(self.snapshot)["policy_sha256"], before)
+
     def test_missing_allowlist(self):
         code, env = self.envelope()
         self.assertEqual(code, 2)
@@ -794,6 +935,15 @@ class HashTest(unittest.TestCase):
     def test_sources_hash(self):
         self.assertEqual(sources_sha256(["a.py", "src/b.py"]), hashlib.sha256(b"a.py\nsrc/b.py\n").hexdigest())
         self.assertEqual(sources_sha256([]), hashlib.sha256(b"").hexdigest())
+
+    def test_name_that_utf8_cannot_encode(self):
+        for surrogate in (0xDCFF, 0xD800):
+            with self.subTest(surrogate=hex(surrogate)):
+                with self.assertRaises(FatalError) as caught:
+                    sources_sha256(["src/ok.py", "src/bad" + chr(surrogate) + ".py"])
+                message = str(caught.exception)
+                self.assertTrue(message.startswith(f"src/bad\\u{surrogate:04x}.py: the file name is not valid UTF-8"))
+                message.encode("utf-8")  # no lone surrogate left
 
 
 if __name__ == "__main__":
