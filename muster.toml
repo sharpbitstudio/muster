@@ -1,0 +1,12 @@
+# muster's own profile: muster checks its own source tree with it.
+schema = 1
+
+[source]
+roots   = ["src/muster"]
+tests   = ["tests"]
+include = ["**/*.py"]
+
+[zones]
+base     = "src/muster"
+critical = "policy/critical.txt"
+standard = "policy/standard.txt"

@@ -2,7 +2,7 @@
 
 This is the entry point for anyone who changes this repository, whether a person or a coding agent.
 
-muster reads test reports after a test run and checks them against a testing policy ([POLICY.md](POLICY.md)). The project is pre-release: the tool, its tests and `docs/` arrive with 0.1.
+muster reads test reports after a test run and checks them against a testing policy ([POLICY.md](POLICY.md)). The project is pre-release: the tool is being built up to 0.1, and `docs/` arrive with 0.1.
 
 ## Code
 
@@ -16,7 +16,7 @@ muster reads test reports after a test run and checks them against a testing pol
 python -m unittest discover -s tests -t . -v
 ```
 
-The tests under `tests/` cover `tools/hygiene.py` today; the tests of the tool arrive with the tool.
+The tests under `tests/` cover the tool in `src/muster/` and `tools/hygiene.py`; they import `muster` from `src/` without an install.
 
 Fixtures are synthetic; never copy names, reports or paths from another project. A report fixture names no real host or user: a JUnit `hostname` is `localhost` or empty, a JaCoCo `sessioninfo` id is `localhost-` followed by hex digits, and no fixture has a `user.name` property; hygiene checks these three.
 
@@ -24,13 +24,21 @@ Synthetic absolute paths in tests and fixtures use a POSIX root whose first fold
 
 Synthetic globs and relative paths also use folders whose names have more than one letter, since hygiene reads a one-letter folder after a slash as a Git Bash drive path.
 
+## Own policy
+
+muster checks its own source tree with its own profile, `muster.toml`, and the lists in `policy/`. Every module under `src/muster/` is in a zone of `policy/critical.txt` or covered by `policy/standard.txt`; a new module is added to one of them in the same change. Check it before committing:
+
+```sh
+python -I src policy
+```
+
 ## Checks
 
 CI runs four checks:
 
 - **gitleaks**, on every push and every pull request: over every fetched ref, every object and the working tree;
 - **hygiene**, `python tools/hygiene.py`, on every push and every pull request: over the tree and over the commits of the change; run it locally before committing, and with `--range origin/main..HEAD` before pushing;
-- **tests**, on every push and every pull request: the unit tests on Linux and Windows for each supported Python version from 3.11 on; the job `tests` passes only when every combination passed;
+- **tests**, on every push and every pull request: the unit tests on Linux and Windows for each supported Python version from 3.11 on, and in the same jobs `python -I src policy` over muster's own profile; the job `tests` passes only when every combination passed;
 - **identity**, on pushes to branches other than `main` and on pull requests from branches of this repository: every commit must carry the project's commit identity.
 
 ## Identity
