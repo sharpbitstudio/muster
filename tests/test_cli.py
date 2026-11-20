@@ -5,6 +5,7 @@ The analysis command here is a stand-in registered for the test only; its state 
 Every run happens in temporary folders, with git's global and system configuration switched off.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -31,6 +32,20 @@ IDENTITY = (
 
 def version_envelope(code: int = 0, error=None, command="version") -> dict:
     return envelope(command, exit_code=code, error=error)
+
+
+def option_strings(parser: argparse.ArgumentParser) -> tuple[set[str], set[str]]:
+    """Every option string of the parser and of its commands, and those of the parser itself that
+    take a value."""
+    every, values = set(), set()
+    for action in parser._actions:
+        every.update(action.option_strings)
+        if action.option_strings and action.nargs != 0:
+            values.update(action.option_strings)
+        if isinstance(action, argparse._SubParsersAction):
+            for command in action.choices.values():
+                every |= option_strings(command)[0]
+    return every, values
 
 
 class CliCase(unittest.TestCase):
@@ -122,6 +137,18 @@ class EntryPointTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn(b"invalid choice", proc.stderr)
 
+    def entry_point(self) -> dict:
+        return runpy.run_path(str(REPO_ROOT / "src" / "__main__.py"), run_name="entry_point")
+
+    def test_scanners_know_the_options_of_the_parser(self):
+        every, global_values = option_strings(cli.build_parser())
+        entry = self.entry_point()
+        self.assertEqual((set(cli.OPTIONS), set(entry["OPTIONS"])), (every, every))
+        self.assertEqual((set(cli.GLOBAL_OPTIONS), set(entry["GLOBAL_OPTIONS"])), (global_values, global_values))
+
+    def test_entry_point_knows_the_commands(self):
+        self.assertEqual(set(self.entry_point()["COMMANDS"]), {"version", *cli.ANALYSES})
+
 
 class OldPythonTest(unittest.TestCase):
     """src/__main__.py on a Python older than 3.11, run with the version patched."""
@@ -185,6 +212,49 @@ class OldPythonTest(unittest.TestCase):
         code, _, err = self.run_old("version", "--json-out", "taken")
         self.assertEqual(code, 2)
         self.assertIn("muster: error: cannot write --json-out taken", err)
+
+    def test_option_with_a_value_is_no_value_of_the_option_before(self):
+        code, _, _ = self.run_old("policy", "--json-out", "--summary-file=my dir/summary.md")
+        self.assertEqual(code, 2)
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_unknown_command_is_none(self):
+        code, out, _ = self.run_old("--config", "other.toml", "lint", "--format", "json")
+        self.assertEqual((code, json.loads(out)["command"]), (2, None))
+
+
+class BrokenInstallTest(unittest.TestCase):
+    """src/__main__.py when the command line cannot be imported."""
+
+    MESSAGE = "ModuleNotFoundError: import of muster.cli halted; None in sys.modules"
+
+    def setUp(self):
+        self.work = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        self.enterContext(contextlib.chdir(self.work))
+
+    def run_broken(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, {"muster.cli": None}),
+            mock.patch.object(sys, "argv", ["src", *argv]),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            runpy.run_path(str(REPO_ROOT / "src" / "__main__.py"), run_name="__main__")
+        return caught.exception.code, out.getvalue(), err.getvalue()
+
+    def test_text_mode(self):
+        code, out, err = self.run_broken("policy", "--strict")
+        self.assertEqual((code, out), (3, f"::error title=muster::{self.MESSAGE}\n"))
+        self.assertIn("Traceback", err)
+        self.assertTrue(err.endswith(f"muster: error: {self.MESSAGE}\n"), err)
+
+    def test_json_format_and_json_out(self):
+        code, out, _ = self.run_broken("policy", "--format", "json", "--json-out", "out/env.json")
+        expected = envelope("policy", exit_code=3, error=("internal", self.MESSAGE))
+        self.assertEqual((code, json.loads(out)), (3, expected))
+        self.assertEqual(json.loads((self.work / "out" / "env.json").read_bytes()), expected)
 
 
 class UsageErrorTest(CliCase):
@@ -306,12 +376,43 @@ class ArgumentScanTest(CliCase):
         self.assertIn("--json-out: '-' is not a file; use --format json to print the envelope", err)
         self.assertEqual(os.listdir(self.work), [])
 
-    def test_empty_summary_file(self):
+    def test_empty_summary_file_still_gets_the_envelope(self):
         self.config.write_bytes(b'[output]\ndir = "build"\n')
-        code, _, err = self.run_main("--repo", str(self.repo), "coverage", "--summary-file", "")
+        (self.work / "out.json").write_bytes(b"stale\n")
+        argv = ["--repo", str(self.repo), "coverage", "--json-out", "out.json", "--summary-file", ""]
+        code, _, err = self.run_main(*argv)
         self.assertEqual(code, 2)
-        self.assertIn("--summary-file: the file name is empty", err)
+        message = "--summary-file: the file name is empty"
+        self.assertIn(message, err)
+        self.assertEqual(self.read_json(self.work / "out.json")["error"], {"kind": "usage", "message": message})
         self.assertFalse((self.repo / "build").exists())
+
+    def test_empty_json_out_still_gets_the_summary_line(self):
+        argv = ["--repo", str(self.repo), "coverage", "--json-out", "", "--summary-file", "summary.md"]
+        self.assertEqual(self.run_main(*argv)[0], 2)
+        line = b"muster coverage: error: --json-out: the file name is empty\n\n"
+        self.assertEqual((self.work / "summary.md").read_bytes(), line)
+
+    def test_global_option_after_the_command_is_not_the_config_file(self):
+        with contextlib.chdir(self.repo):
+            code, _, err = self.run_main("coverage", "--config", "other.toml", "--json-out", "muster.toml")
+        self.assertEqual(code, 2)
+        self.assertIn("--json-out muster.toml is the config file", err)
+        self.assertEqual(self.config.read_bytes(), b"")
+
+    def test_default_profile_is_kept_with_another_config_file(self):
+        with contextlib.chdir(self.repo):
+            code, _, err = self.run_main("--config", "other.toml", "coverage", "--bogus", "--json-out", "muster.toml")
+        self.assertEqual(code, 2)
+        self.assertIn("--json-out muster.toml is the default config file", err)
+        self.assertEqual(self.config.read_bytes(), b"")
+
+    def test_option_with_a_value_is_no_value_of_the_option_before(self):
+        code, _, err = self.run_main("coverage", "--json-out", "--summary-file=my dir/summary.md")
+        self.assertEqual(code, 2)
+        self.assertIn("argument --json-out: expected one argument", err)
+        self.assertEqual(os.listdir(self.work), ["my dir"])
+        self.assertTrue((self.work / "my dir" / "summary.md").read_bytes().startswith(b"muster coverage: error:"))
 
     def test_summary_file_on_a_usage_error_is_checked_against_the_config_file(self):
         with contextlib.chdir(self.repo):
@@ -370,6 +471,16 @@ class InternalErrorTest(CliCase):
 
     def test_data_that_json_cannot_carry_is_a_bug(self):
         self.behave = lambda args, cfg, rep: rep.data.update(when=object())
+        code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json")
+        self.assertEqual(code, 3)
+        env = json.loads(out)
+        self.assertEqual((env["error"]["kind"], env["sections"]), ("internal", []))
+
+    def test_data_nested_too_deeply_for_json_is_a_bug(self):
+        nested: list = []
+        for _ in range(10_000):
+            nested = [nested]
+        self.behave = lambda args, cfg, rep: rep.data.update(nested=nested)
         code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json")
         self.assertEqual(code, 3)
         env = json.loads(out)
@@ -443,7 +554,7 @@ class FailedRunOutputTest(CliCase):
         stand_in = cli.Analysis(
             lambda args, cfg, rep: self.behave(args, cfg, rep),
             "stand-in section",
-            outputs=lambda args, cfg: [("the kept file", self.kept, False, True)],
+            outputs=lambda args, cfg: ([("the kept file", self.kept, False, True)], None),
         )
         self.enterContext(mock.patch.dict(cli.ANALYSES, {"coverage": stand_in}))
 
@@ -470,6 +581,18 @@ class FailedRunOutputTest(CliCase):
         (self.work / "taken").mkdir()
         self.assertEqual(self.analyse("--json-out", "taken"), 2)
         self.assertFalse(self.kept.exists())
+
+    def test_every_output_is_removed_when_one_cannot_be(self):
+        stale = self.work / "stale.tsv"
+        stale.write_bytes(b"old\n")
+        outputs = [("the stale file", stale, True, False)]
+        stand_in = cli.Analysis(lambda args, cfg, rep: None, "stand-in", outputs=lambda args, cfg: (outputs, None))
+        self.enterContext(mock.patch.dict(cli.ANALYSES, {"coverage": stand_in}))
+        (self.work / "taken").mkdir()
+        code, _, err = self.run_main("--repo", str(self.repo), "coverage", "--json-out", "taken")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write --json-out taken", err)
+        self.assertFalse(stale.exists())
 
     def test_kept_when_the_profile_cannot_be_read(self):
         self.config.write_bytes(b"[coverage\n")

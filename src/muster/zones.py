@@ -132,19 +132,19 @@ def zone_number(digits: str) -> int | None:
 
 
 def expand(glob: str) -> list[str]:
-    """All alternatives of `glob` with each `{a,b}` group expanded; empty on bad braces."""
-    open_, close = glob.find("{"), glob.find("}")
-    if open_ < 0 and close < 0:
-        return [glob]
-    if open_ < 0 or close < open_ or "{" in glob[open_ + 1 : close]:
-        return []
-    alternatives = []
-    for option in glob[open_ + 1 : close].split(","):
-        expanded = expand(glob[:open_] + option + glob[close + 1 :])
-        if not expanded:
+    """All alternatives of `glob` with each `{a,b}` group expanded, left to right; empty on bad
+    braces. One group at a time, without recursion, so that the number of groups has no limit."""
+    alternatives = [""]
+    rest = glob
+    while True:
+        open_, close = rest.find("{"), rest.find("}")
+        if open_ < 0 and close < 0:
+            return [head + rest for head in alternatives]
+        if open_ < 0 or close < open_ or "{" in rest[open_ + 1 : close]:
             return []
-        alternatives.extend(expanded)
-    return alternatives
+        options = rest[open_ + 1 : close].split(",")
+        alternatives = [head + rest[:open_] + option for head in alternatives for option in options]
+        rest = rest[close + 1 :]
 
 
 def glob_error(glob: str) -> str | None:

@@ -4,13 +4,15 @@ Every tree is built in a temporary folder.
 """
 
 import os
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from muster.config import Config, ConfigError
-from muster.paths import exists_exact, is_link, normalize, root_of, source_sets, walk
+from muster.paths import _is_junction, exists_exact, is_link, normalize, root_of, source_sets, walk
 
 
 class TreeCase(unittest.TestCase):
@@ -82,6 +84,21 @@ class WalkTest(TreeCase):
         self.make("elsewhere/other.py")
         self.junction("elsewhere", "linked")
         self.assertEqual(walk(self.root, "source.roots", ["linked"]), ["linked/other.py"])
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX symbolic links")
+    def test_root_that_is_a_symbolic_link_is_walked(self):
+        self.make("elsewhere/other.py")
+        os.symlink(self.root / "elsewhere", self.root / "linked", target_is_directory=True)
+        self.assertEqual(walk(self.root, "source.roots", ["linked"]), ["linked/other.py"])
+
+    def test_only_a_mount_point_is_a_junction_on_python_3_11(self):
+        mount_point, cloud_files = 0xA0000003, 0x9000001A  # Windows reparse tags; only Windows has them in stat
+        self.enterContext(mock.patch.object(stat, "IO_REPARSE_TAG_MOUNT_POINT", mount_point, create=True))
+        for tag, junction in ((mount_point, True), (cloud_files, False), (0, False)):
+            with self.subTest(tag=hex(tag)):
+                found = mock.Mock(st_reparse_tag=tag, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                with mock.patch("os.lstat", return_value=found):
+                    self.assertIs(_is_junction("/work/src/folder"), junction)
 
     def test_plain_folder_and_file_are_no_links(self):
         self.make("src/main.py")
