@@ -16,11 +16,13 @@ muster reads test reports after a test run and checks them against a testing pol
 python -m unittest discover -s tests -t . -v
 ```
 
-The tests arrive together with the tool.
+The tests under `tests/` cover `tools/hygiene.py` today; the tests of the tool arrive with the tool.
 
-Fixtures are synthetic; never copy names, reports or paths from another project.
+Fixtures are synthetic; never copy names, reports or paths from another project. A report fixture names no real host or user: a JUnit `hostname` is `localhost` or empty, a JaCoCo `sessioninfo` id is `localhost-` followed by hex digits, and no fixture has a `user.name` property; hygiene checks these three.
 
 Synthetic absolute paths in tests and fixtures use a POSIX root whose first folder has more than one letter (for example `/work/src/...`); a test that needs a Windows drive or device path builds it at run time, since hygiene treats any drive or device path in the repository as a local one.
+
+Synthetic globs and relative paths also use folders whose names have more than one letter, since hygiene reads a one-letter folder after a slash as a Git Bash drive path.
 
 ## Checks
 
