@@ -5,7 +5,9 @@ section, or an input error under strict or --fail-on-error; 2 a usage or configu
 always; 3 an internal error (a bug), always.
 
 --json-out and --format are read from argv before argparse runs, so that the envelope is written,
-and printed with --format json, on every exit, a usage error and a bug included.
+and printed with --format json, on every exit, a usage error and a bug included. No output file may
+be the config file, an input of the command or another output; once that holds, the outputs that
+must not outlive a failed run are removed before the command does anything else.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__
+from muster import __version__, policy
 from muster.config import DEFAULT_CONFIG, SECTIONS, Config, config_path, load
 from muster.gitio import find_repo_root, git
 from muster.report import (
@@ -51,16 +53,24 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(message, self.format_usage())
 
 
+Outputs = list[tuple[str, Path, bool]]  # (label, path, removed before the command runs)
+Inputs = list[tuple[str, Path]]  # (label, path)
+
+
 @dataclass(frozen=True)
 class Analysis:
-    """An analysis command: `run` judges one section into the Report; `arguments` adds its own options."""
+    """An analysis command: `run` judges one section into the Report; `arguments` adds its own options;
+    `files` names its own output and input files, once the profile is read."""
 
     run: Callable[[argparse.Namespace, Config, Report], None]
     help: str
     arguments: Callable[[argparse.ArgumentParser], None] = lambda parser: None
+    files: Callable[[argparse.Namespace, Config], tuple[Outputs, Inputs]] = lambda args, cfg: ([], [])
 
 
-ANALYSES: dict[str, Analysis] = {}
+ANALYSES: dict[str, Analysis] = {
+    "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.files),
+}
 
 
 def _section_list(text: str) -> frozenset[str]:
@@ -155,12 +165,14 @@ def _head_commit(root: Path) -> str | None:
 
 
 def _same_file(first: Path, second: Path) -> bool:
+    """Whether two paths name one file: the same file on disk, else the same resolved path (ignoring
+    case on Windows)."""
     try:
         if first.exists() and second.exists():
             return os.path.samefile(first, second)
     except OSError:
         pass
-    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
+    return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
 
 
 @dataclass
@@ -175,19 +187,39 @@ class Invocation:
     sections: list[Report] = field(default_factory=list)
 
 
-def _prepare_json_out(inv: Invocation) -> None:
-    """Refuse a --json-out that is the config file; else remove the old envelope before any check."""
-    out = Path(inv.json_out)
+def _check_outputs(inv: Invocation, outputs: Outputs, inputs: Inputs) -> None:
+    """Refuse an output (--json-out included) that is an input or another output: exit 2, and nothing
+    is removed or written, the envelope included."""
+    named = [(f"--json-out {inv.json_out}", Path(inv.json_out))] if inv.json_out else []
+    named += [(label, path) for label, path, _ in outputs]
+    for i, (label, path) in enumerate(named):
+        clash = next((f"is {other}" for other, file in inputs if _same_file(path, file)), None)
+        if clash is None:
+            clash = next((f"is the same file as {other}" for other, file in named[:i] if _same_file(path, file)), None)
+        if clash is not None:
+            inv.json_out = None
+            raise UsageError(f"{label} {clash}")
+
+
+def _clear_outputs(inv: Invocation, outputs: Outputs) -> None:
+    """Remove the old envelope and the outputs that must not outlive a failed run."""
+    named = [(f"--json-out {inv.json_out}", Path(inv.json_out), True)] if inv.json_out else []
+    for i, (label, path, remove) in enumerate(named + outputs):
+        if not remove:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            if i == 0 and named:  # the envelope cannot be written either
+                inv.json_out = None
+            raise UsageError(f"cannot write {label}: {exc.strerror or exc}") from None
+
+
+def _check_json_out_early(inv: Invocation) -> None:
+    """Before argparse only the config file is known: a --json-out that is the config file is refused."""
     root = _repo_root(_scan_option(inv.argv, "--repo"))
     profile = config_path(root, _scan_option(inv.argv, "--config") or DEFAULT_CONFIG)
-    if _same_file(out, profile):
-        inv.json_out = None  # nothing is written or deleted
-        raise UsageError(f"--json-out {out} is the config file")
-    try:
-        out.unlink(missing_ok=True)
-    except OSError as exc:
-        inv.json_out = None
-        raise UsageError(f"cannot write --json-out {out}: {exc.strerror or exc}") from None
+    _check_outputs(inv, [], [("the config file", profile)])
 
 
 def run_version(args: argparse.Namespace, inv: Invocation) -> int:
@@ -216,24 +248,42 @@ def run_analysis(args: argparse.Namespace, inv: Invocation, analysis: Analysis) 
     root = _repo_root(args.repo)
     inv.commit = _head_commit(root)
     cfg = load(root, args.config)
+    outputs, inputs = analysis.files(args, cfg)
+    _check_outputs(inv, outputs, [("the config file", cfg.path), *inputs])
+    _clear_outputs(inv, outputs)
     strict = args.strict or (args.strict_only is not None and args.command in args.strict_only)
     rep = Report(args.command, strict=strict, fail_on_error=args.fail_on_error)
-    analysis.run(args, cfg, rep)
+    try:
+        analysis.run(args, cfg, rep)
+    except FatalError:
+        if rep.violations:  # a fatal finding, such as an invalid policy: the section is reported too
+            _report_section(args, inv, cfg, rep, fatal=True)
+        raise
+    _report_section(args, inv, cfg, rep)
+    return EXIT_VIOLATION if (rep.violation and rep.strict) or (rep.error and rep.fail_on_error) else EXIT_PASS
+
+
+def _report_section(args: argparse.Namespace, inv: Invocation, cfg: Config, rep: Report, fatal: bool = False) -> None:
     inv.sections.append(rep)
-    _write_summary(args, cfg, rep)
+    try:
+        _write_summary(args, cfg, rep)
+    except UsageError as exc:
+        if not fatal:
+            raise
+        print(f"muster: error: {exc}", file=sys.stderr)  # the fatal finding stays the error reported
     if inv.fmt == "text":
         for line in rep.annotations:
             print(line)
         print(one_line(rep.verdict))
-    return EXIT_VIOLATION if (rep.violation and rep.strict) or (rep.error and rep.fail_on_error) else EXIT_PASS
 
 
 def _run(inv: Invocation) -> int:
     if inv.json_out:
-        _prepare_json_out(inv)
+        _check_json_out_early(inv)
     args = build_parser().parse_args(inv.argv)
     inv.command, inv.fmt = args.command, args.format
     if args.command == "version":
+        _clear_outputs(inv, [])
         return run_version(args, inv)
     return run_analysis(args, inv, ANALYSES[args.command])
 

@@ -123,10 +123,10 @@ class EntryPointTest(unittest.TestCase):
 
 class UsageErrorTest(CliCase):
     def test_unknown_command(self):
-        code, out, err = self.run_main("policy")
+        code, out, err = self.run_main("lint")
         self.assertEqual(code, 2)
-        self.assertTrue(out.startswith("::error title=muster::argument command: invalid choice: 'policy'"), out)
-        self.assertIn("muster: error: argument command: invalid choice: 'policy'", err)
+        self.assertTrue(out.startswith("::error title=muster::argument command: invalid choice: 'lint'"), out)
+        self.assertIn("muster: error: argument command: invalid choice: 'lint'", err)
         self.assertIn("usage: muster", err)
 
     def test_no_command(self):
@@ -146,7 +146,7 @@ class UsageErrorTest(CliCase):
         self.assertEqual(self.read_json(out_file), version_envelope(2, ("usage", message)))
 
     def test_unknown_command_envelope_has_no_command(self):
-        code, _, _ = self.run_main("policy", "--json-out", "out.json")
+        code, _, _ = self.run_main("lint", "--json-out", "out.json")
         env = self.read_json(self.work / "out.json")
         self.assertEqual((code, env["command"], env["verdict"], env["exit_code"]), (2, None, "error", 2))
         self.assertEqual(env["error"]["kind"], "usage")
@@ -166,7 +166,7 @@ class UsageErrorTest(CliCase):
         self.assertTrue(out.startswith("::error"), out)
 
     def test_json_out_equals_form(self):
-        self.assertEqual(self.run_main("policy", "--json-out=eq.json")[0], 2)
+        self.assertEqual(self.run_main("lint", "--json-out=eq.json")[0], 2)
         self.assertEqual(self.read_json(self.work / "eq.json")["exit_code"], 2)
 
     def test_last_json_out_wins(self):
