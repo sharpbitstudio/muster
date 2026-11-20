@@ -1,0 +1,2 @@
+# Standard packages of muster, relative to src/muster: '*' is the base folder itself.
+*

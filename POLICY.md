@@ -66,6 +66,8 @@ Any change to the policy files or to the profile is reported as a policy change:
 
 Every check starts warn-only: it reports but does not fail the build. A repository makes a check strict, so that a violation fails the build, once that check has been stable on its main branch. Strict is a choice made by the caller, for example the CI workflow, not a setting inside the profile.
 
+Warn-only covers findings measured against a valid policy. An invalid policy, such as an unclassified file or a dead glob (point 3) or an expired exemption (point 4), always fails the check, strict or not: nothing can be judged against it.
+
 ## 12. The repository profile carries zones, thresholds and deviations
 
 The policy text is generic. Everything specific to a repository lives in its profile: where the sources and reports are, the zone and package lists, exemptions, the mutation allowlist, thresholds, budgets and any deliberate deviation from the defaults. Changing the profile is itself a policy change (point 10).

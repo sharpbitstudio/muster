@@ -517,6 +517,10 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -t . -v
 
+      # muster checks its own profile (muster.toml and policy/).
+      - name: Own policy
+        run: python -I src policy
+
   # The one check the ruleset requires for the unit tests: its name stays
   # the same when the matrix changes. It also reads the conclusion of each
   # test job of the run, since a job cancelled before any runner took it
