@@ -1,0 +1,10 @@
+"""The tests import muster from the repository's src folder, without an
+install: this puts that folder on sys.path once, before any test module
+loads."""
+
+import sys
+from pathlib import Path
+
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
