@@ -2,11 +2,11 @@
 schema = 1
 
 [source]
-roots   = ["src/muster"]
+roots   = ["src"]
 tests   = ["tests"]
 include = ["**/*.py"]
 
 [zones]
-base     = "src/muster"
+base     = "src"
 critical = "policy/critical.txt"
 standard = "policy/standard.txt"

@@ -4,18 +4,22 @@ snapshot and zone-list formats.
 Every run happens in temporary folders, with git's global and system configuration switched off.
 """
 
+import argparse
 import contextlib
 import hashlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
 from muster import __version__, cli
-from muster.policy import policy_sha256, sources_sha256
+from muster.config import Config
+from muster.policy import outputs, policy_sha256, sources_sha256
 
 BASE = "src/main/java/org/example/app"
 TESTS = "src/test/java/org/example/app"
@@ -67,6 +71,7 @@ class PolicyCase(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(mock.patch.dict(os.environ))
+        self.enterContext(mock.patch("muster.policy.utc_today", return_value=date(2026, 5, 19)))
         for key in [key for key in os.environ if key.startswith("GIT_") or key == "GITHUB_STEP_SUMMARY"]:
             del os.environ[key]
         os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
@@ -96,7 +101,7 @@ class PolicyCase(unittest.TestCase):
 
     def policy(self, *options: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
-        argv = ["--repo", str(self.repo), "policy", "--today", "2026-05-19", *options]
+        argv = ["--repo", str(self.repo), "policy", *options]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(argv)
         return code, out.getvalue(), err.getvalue()
@@ -149,10 +154,11 @@ class ValidPolicyTest(PolicyCase):
         code, out, _ = self.policy()
         self.assertEqual((code, out), (0, VERDICT.replace("1 exemption", "0 exemptions")))
 
-    def test_today_must_be_a_date(self):
-        code, _, err = self.policy("--today", "2026-02-30")
+    def test_today_cannot_be_given(self):
+        self.write("policy/exemptions.txt", b"auth/Token.java | rename only | 2026-05-18\n")
+        code, _, err = self.policy("--today", "2026-05-17")
         self.assertEqual(code, 2)
-        self.assertIn("expected a date YYYY-MM-DD", err)
+        self.assertIn("unrecognized arguments: --today 2026-05-17", err)
 
     def test_root_folder_in_another_case_does_not_exist(self):
         self.write("muster.toml", PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/Java"]'))
@@ -356,9 +362,8 @@ class SnapshotTest(PolicyCase):
             },
         }
         canonical = json.dumps(tables, sort_keys=True, separators=(",", ":")).encode("ascii")
-        self.assertEqual(
-            document["policy_sha256"], hashlib.sha256(CRITICAL + STANDARD + EXEMPTIONS + canonical).hexdigest()
-        )
+        digests = b"".join(hashlib.sha256(content).digest() for content in (CRITICAL, STANDARD, EXEMPTIONS))
+        self.assertEqual(document["policy_sha256"], hashlib.sha256(digests + canonical).hexdigest())
         self.assertIsInstance(document["created_epoch_ms"], int)
 
     def test_file_option_is_relative_to_the_working_directory(self):
@@ -439,6 +444,67 @@ class SnapshotTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot write the snapshot", err)
 
+    def written(self) -> None:
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertTrue(self.snapshot.exists())
+
+    def test_empty_source_set_removes_it(self):
+        self.written()
+        self.write("muster.toml", PROFILE.replace('include = ["**/*.java"]', 'include = ["**/*.py"]'))
+        self.assertEqual(self.policy("--snapshot")[0], 2)
+        self.assertFalse(self.snapshot.exists())
+
+    def test_missing_source_root_removes_it(self):
+        self.written()
+        self.write("muster.toml", PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/java", "lib/src"]'))
+        code, env = self.envelope("--snapshot")
+        self.assertEqual(env["error"]["message"], "muster.toml: source.roots[1]: folder lib/src does not exist")
+        self.assertFalse(self.snapshot.exists())
+
+    def test_output_that_cannot_be_cleared_removes_it(self):
+        self.written()
+        (self.work / "taken").mkdir()
+        code, _, err = self.policy("--snapshot", "--zones-out", "taken")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write --zones-out taken", err)
+        self.assertFalse(self.snapshot.exists())
+
+    def test_summary_that_cannot_be_written_removes_it(self):
+        self.written()
+        (self.work / "taken").mkdir()
+        code, _, err = self.policy("--snapshot", "--summary-file", "taken")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the summary taken", err)
+        self.assertFalse(self.snapshot.exists())
+
+    def test_json_out_that_cannot_be_written_at_the_end_removes_it(self):
+        self.written()
+        with mock.patch.object(cli, "write_json", side_effect=PermissionError(13, "Permission denied")):
+            code, _, err = self.policy("--snapshot", "--json-out", "out.json")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write --json-out out.json", err)
+        self.assertFalse(self.snapshot.exists())
+
+    def test_bug_removes_it(self):
+        self.written()
+        with mock.patch("muster.policy.classify", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.policy("--snapshot")[0], 3)
+        self.assertFalse(self.snapshot.exists())
+
+    def test_profile_key_without_the_option_is_not_touched_on_failure(self):
+        self.written()
+        (self.work / "taken").mkdir()
+        self.assertEqual(self.policy("--zones-out", "taken")[0], 2)
+        self.assertTrue(self.snapshot.exists())
+
+    def test_file_named_like_the_profile_default_is_a_file(self):
+        cfg = Config(self.repo, self.repo / "muster.toml", {"policy": {"snapshot": "build/muster/snapshot.json"}})
+        args = argparse.Namespace(zones_out=None, snapshot="<policy.snapshot>")
+        expected = [("the snapshot <policy.snapshot>", Path("<policy.snapshot>"), False, True)]
+        self.assertEqual(outputs(args, cfg), expected)
+        args = cli.build_parser().parse_args(["policy", "--snapshot"])
+        self.assertEqual(outputs(args, cfg)[0][1], self.repo / "build" / "muster" / "snapshot.json")
+
 
 class OutputClashTest(PolicyCase):
     def assertUntouched(self, files: dict[Path, bytes]) -> None:
@@ -483,11 +549,158 @@ class OutputClashTest(PolicyCase):
         self.assertEqual(self.policy("--snapshot", str(exemptions))[0], 2)
         self.assertUntouched({exemptions: EXEMPTIONS})
 
+    def test_json_out_is_a_policy_file_when_a_required_key_is_missing(self):
+        self.write("muster.toml", PROFILE.replace('standard = "policy/standard.txt"\n', ""))
+        critical = self.repo / "policy" / "critical.txt"
+        code, _, err = self.policy("--json-out", str(critical))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--json-out {critical} is the file of zones.critical", err)
+        self.assertUntouched({critical: CRITICAL})
+
+    def test_json_out_is_a_policy_file_when_the_snapshot_cannot_be_named(self):
+        critical = self.repo / "policy" / "critical.txt"
+        self.write("muster.toml", PROFILE.replace('[policy]\nsnapshot = "build/muster/snapshot.json"\n', ""))
+        for options in (["--snapshot"], ["--snapshot", ""]):
+            with self.subTest(options=options):
+                code, _, err = self.policy(*options, "--json-out", str(critical))
+                self.assertEqual(code, 2)
+                self.assertIn("is the file of zones.critical", err)
+                self.assertUntouched({critical: CRITICAL})
+
+    def test_summary_file_is_a_policy_file(self):
+        critical = self.repo / "policy" / "critical.txt"
+        code, _, err = self.policy("--summary-file", str(critical))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--summary-file {critical} is the file of zones.critical", err)
+        self.assertUntouched({critical: CRITICAL})
+
+    def test_github_summary_is_the_profile(self):
+        profile = self.repo / "muster.toml"
+        before = profile.read_bytes()
+        os.environ["GITHUB_STEP_SUMMARY"] = str(profile)
+        code, _, err = self.policy("--github")
+        self.assertEqual(code, 2)
+        self.assertIn("is the config file", err)
+        self.assertUntouched({profile: before})
+
+    def test_nothing_is_written_after_a_clash(self):
+        critical = self.repo / "policy" / "critical.txt"
+        code, out, _ = self.policy("--json-out", str(critical), "--summary-file", "summary.md")
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith("::error title=muster policy::"), out)
+        self.assertFalse((self.work / "summary.md").exists())
+        self.assertUntouched({critical: CRITICAL})
+
+    def test_summary_file_is_the_json_out(self):
+        code, _, err = self.policy("--json-out", "same.md", "--summary-file", "same.md")
+        self.assertEqual(code, 2)
+        self.assertIn("--summary-file same.md is the same file as --json-out same.md", err)
+        self.assertFalse((self.work / "same.md").exists())
+
+    def test_output_dir_summary_is_an_output(self):
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "build/muster"\n')
+        target = self.repo / "build" / "muster" / "policy.md"
+        code, _, err = self.policy("--zones-out", str(target))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--zones-out {target} is the same file as the summary {target}", err)
+        self.assertFalse(target.exists())
+
+    def test_output_dir_summary_is_a_policy_file(self):
+        profile = PROFILE.replace("policy/standard.txt", "policy/policy.md")
+        self.write("muster.toml", profile + '\n[output]\ndir = "policy"\n')
+        self.write("policy/policy.md", STANDARD)
+        code, _, err = self.policy()
+        self.assertEqual(code, 2)
+        self.assertIn("the summary", err)
+        self.assertIn("is the file of zones.standard", err)
+        self.assertUntouched({self.repo / "policy" / "policy.md": STANDARD})
+
+    def test_output_is_a_source_file(self):
+        source = self.repo / SOURCES[2]
+        for option in ("--zones-out", "--json-out", "--summary-file", "--snapshot"):
+            with self.subTest(option=option):
+                code, _, err = self.policy(option, str(source))
+                self.assertEqual(code, 2)
+                label = "the snapshot" if option == "--snapshot" else option
+                self.assertIn(f"{label} {source} is the source file {SOURCES[2]}", err)
+                self.assertUntouched({source: b"class X {}\n"})
+
+    def test_output_is_a_test_file_or_a_full_run_suite(self):
+        test_file = self.repo / TESTS / "codec" / "KeyParserTest.java"
+        suite = self.write("suites/FullRunSuite.java", "class Suite {}\n")  # outside the test roots
+        entry = '\n[[coverage.full_run_suites]]\nname = "FullRunSuite"\nfile = "suites/FullRunSuite.java"\n'
+        self.write("muster.toml", PROFILE + entry)
+        code, _, err = self.policy("--zones-out", str(test_file))
+        self.assertEqual(code, 2)
+        self.assertIn(f"is the test file {TESTS}/codec/KeyParserTest.java", err)
+        code, _, err = self.policy("--snapshot", str(suite))
+        self.assertEqual(code, 2)
+        self.assertIn("is the file of coverage.full_run_suites[0].file", err)
+        self.assertUntouched({test_file: b"class X {}\n", suite: b"class Suite {}\n"})
+
+    def test_source_file_is_protected_when_another_root_is_missing(self):
+        self.write("muster.toml", PROFILE.replace('roots = ["src/main/java"]', 'roots = ["lib/src", "src/main/java"]'))
+        source = self.repo / SOURCES[2]
+        code, _, err = self.policy("--json-out", str(source))
+        self.assertEqual(code, 2)
+        self.assertIn(f"is the source file {SOURCES[2]}", err)
+        self.assertUntouched({source: b"class X {}\n"})
+
     @unittest.skipUnless(os.path.normcase("A") == "a", "case-insensitive paths only on Windows")
     def test_other_case_is_the_same_file_on_windows(self):
         profile = self.repo / "MUSTER.TOML"
         self.assertEqual(self.policy("--zones-out", str(profile))[0], 2)
         self.assertTrue((self.repo / "muster.toml").read_bytes().startswith(b"schema = 1"))
+
+
+class OutputDirSummaryTest(PolicyCase):
+    """<[output].dir>/policy.md holds only what this run wrote."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "build/muster"\n')
+        self.target = self.write("build/muster/policy.md", "stale report\n")
+
+    def test_failure_line_replaces_an_old_report(self):
+        profile = PROFILE.replace('include = ["**/*.java"]', 'include = ["**/*.py"]')
+        self.write("muster.toml", profile + '\n[output]\ndir = "build/muster"\n')
+        self.assertEqual(self.policy()[0], 2)
+        line = "muster policy: error: muster.toml: no file under source.roots matches source.include\n\n"
+        self.assertEqual(self.target.read_text(encoding="utf-8"), line)
+
+    def test_failure_line_when_the_command_cannot_name_its_outputs(self):
+        self.assertEqual(self.policy("--snapshot", "")[0], 2)
+        self.assertEqual(self.target.read_bytes(), b"muster policy: error: --snapshot: the file name is empty\n\n")
+
+    def test_invalid_policy_keeps_its_violations_and_the_failure_line(self):
+        self.unclassify()
+        self.assertEqual(self.policy()[0], 2)
+        text = self.target.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("## Policy\n"), text)
+        self.assertIn(f"- `{UNCLASSIFIED}`", text)
+        self.assertTrue(text.endswith("muster policy: error: the policy is invalid: 1 violation\n\n"), text)
+        self.assertNotIn("stale", text)
+
+    def test_unreadable_profile_leaves_it(self):
+        self.write("muster.toml", "[output\n")
+        self.assertEqual(self.policy()[0], 2)
+        self.assertEqual(self.target.read_bytes(), b"stale report\n")
+
+
+@unittest.skipIf(sys.platform == "win32", "Windows file names are always Unicode")
+class UndecodableNameTest(PolicyCase):
+    def test_folder_name_that_is_not_utf8_reaches_the_summary(self):
+        folder = self.repo / BASE / os.fsdecode(b"bad\xff")
+        try:
+            folder.mkdir()
+            (folder / "Odd.java").write_bytes(b"class X {}\n")
+        except (OSError, UnicodeError):
+            self.skipTest("this file system takes only valid UTF-8 names")
+        code, out, _ = self.policy("--summary-file", "summary.md", "--json-out", "out.json")
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.read_json(self.work / "out.json")["error"]["kind"], "policy")
+        summary = (self.work / "summary.md").read_bytes().decode("utf-8")
+        self.assertIn("unclassified package 'bad\N{REPLACEMENT CHARACTER}'", summary)
 
 
 class MutationTargetTest(PolicyCase):
@@ -557,12 +770,21 @@ class MutationTargetTest(PolicyCase):
 
 
 class HashTest(unittest.TestCase):
-    def test_policy_hash_covers_the_raw_bytes_of_the_three_files_in_order(self):
+    def test_policy_hash_covers_the_digests_of_the_three_files_in_order(self):
         canonical = b'{"source":{"roots":["src"]},"zones":{"base":""}}'
         tables = {"zones": {"base": ""}, "source": {"roots": ["src"]}}
-        self.assertEqual(policy_sha256(b"a", b"b", b"c", tables), hashlib.sha256(b"abc" + canonical).hexdigest())
+        digests = b"".join(hashlib.sha256(content).digest() for content in (b"a", b"b", b"c"))
+        self.assertEqual(policy_sha256(b"a", b"b", b"c", tables), hashlib.sha256(digests + canonical).hexdigest())
+        no_exemptions = b"".join(hashlib.sha256(content).digest() for content in (b"a", b"b", b""))
+        self.assertEqual(policy_sha256(b"a", b"b", b"", tables), hashlib.sha256(no_exemptions + canonical).hexdigest())
         self.assertNotEqual(policy_sha256(b"a\r\n", b"", b"", tables), policy_sha256(b"a\n", b"", b"", tables))
         self.assertNotEqual(policy_sha256(b"a", b"b", b"", tables), policy_sha256(b"b", b"a", b"", tables))
+
+    def test_line_moved_from_the_critical_to_the_standard_file_changes_it(self):
+        tables = {"source": {"roots": ["src"]}, "zones": {"base": ""}}
+        before = policy_sha256(b"# Zone 1: money.\nbilling/**\nauth/**\n", b"codec/*\n", b"", tables)
+        after = policy_sha256(b"# Zone 1: money.\nbilling/**\n", b"auth/**\ncodec/*\n", b"", tables)
+        self.assertNotEqual(before, after)
 
     def test_policy_hash_covers_the_tables(self):
         tables = {"source": {"roots": ["src"]}, "zones": {"base": ""}}

@@ -8,7 +8,9 @@ Every run happens in temporary folders, with git's global and system configurati
 import contextlib
 import io
 import json
+import math
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -17,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from muster import __version__, cli
-from muster.report import envelope, json_text
+from muster.report import FatalError, envelope, json_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = (
@@ -121,6 +123,70 @@ class EntryPointTest(unittest.TestCase):
         self.assertIn(b"invalid choice", proc.stderr)
 
 
+class OldPythonTest(unittest.TestCase):
+    """src/__main__.py on a Python older than 3.11, run with the version patched."""
+
+    def setUp(self):
+        self.work = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        self.enterContext(contextlib.chdir(self.work))
+
+    def run_old(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(sys, "version_info", (3, 10, 4, "final", 0)),
+            mock.patch.object(sys, "argv", ["src", *argv]),
+            mock.patch("muster.cli.main", side_effect=AssertionError("the command line must not run")),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            runpy.run_path(str(REPO_ROOT / "src" / "__main__.py"), run_name="__main__")
+        return caught.exception.code, out.getvalue(), err.getvalue()
+
+    MESSAGE = "Python 3.11 or newer is needed, this is 3.10"
+
+    def expected(self, command) -> dict:
+        document = envelope(command, exit_code=2, error=("usage", self.MESSAGE))
+        return document
+
+    def test_text_mode(self):
+        code, out, err = self.run_old("policy", "--strict")
+        self.assertEqual((code, out), (2, f"::error title=muster::{self.MESSAGE}\n"))
+        self.assertEqual(err, f"muster: error: {self.MESSAGE}\n")
+
+    def test_json_format_and_json_out(self):
+        code, out, err = self.run_old("--repo", "repo", "policy", "--format=json", "--json-out", "out/env.json")
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out), self.expected("policy"))
+        raw = (self.work / "out" / "env.json").read_bytes()
+        self.assertNotIn(b"\r", raw)
+        self.assertEqual(json.loads(raw), self.expected("policy"))
+        self.assertEqual(err, f"muster: error: {self.MESSAGE}\n")
+
+    def test_scan_follows_the_command_line_rules(self):
+        code, out, _ = self.run_old("--config", "x.toml", "version", "--json-out", "first.json", "--json-out=-1",
+                                    "--", "--json-out=ignored.json", "--format=json")
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith("::error title=muster::"), out)
+        self.assertEqual(sorted(os.listdir(self.work)), ["-1"])
+        self.assertEqual(json.loads((self.work / "-1").read_bytes())["command"], "version")
+
+    def test_no_command(self):
+        code, out, _ = self.run_old("--format=json", "--json-out=")
+        self.assertEqual((code, json.loads(out)["command"]), (2, None))
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_option_value_is_not_the_command(self):
+        code, out, _ = self.run_old("--format", "json", "--summary-file", "summary.md")
+        self.assertEqual((code, json.loads(out)["command"]), (2, None))
+
+    def test_unwritable_json_out(self):
+        (self.work / "taken").mkdir()
+        code, _, err = self.run_old("version", "--json-out", "taken")
+        self.assertEqual(code, 2)
+        self.assertIn("muster: error: cannot write --json-out taken", err)
+
+
 class UsageErrorTest(CliCase):
     def test_unknown_command(self):
         code, out, err = self.run_main("lint")
@@ -204,6 +270,66 @@ class UsageErrorTest(CliCase):
         self.assertEqual(self.run_main("version", "--format", "xml")[0], 2)
 
 
+class ArgumentScanTest(CliCase):
+    """The parsed --json-out is the destination; argv is read only when argparse fails."""
+
+    def test_value_that_looks_like_a_negative_number(self):
+        self.assertEqual(self.run_main("version", "--json-out", "-1")[0], 0)
+        self.assertEqual(self.read_json(self.work / "-1"), version_envelope())
+
+    def test_nothing_after_the_option_terminator_counts(self):
+        code, out, _ = self.run_main("version", "--", "--json-out=ignored.json", "--format=json")
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith("::error title=muster version::"), out)
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_help_exits_zero_before_any_output_check(self):
+        with contextlib.chdir(self.repo):
+            code, out, _ = self.run_main("version", "--help", "--json-out", "muster.toml")
+        self.assertEqual(code, 0)
+        self.assertIn("usage: muster version", out)
+        self.assertEqual(self.config.read_bytes(), b"")
+
+    def test_empty_json_out(self):
+        coverage = ["--repo", str(self.repo), "coverage", "--json-out="]
+        for argv in (["version", "--json-out", ""], ["version", "--json-out="], coverage):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_main(*argv, "--format", "json")
+                self.assertEqual(code, 2)
+                message = "--json-out: the file name is empty"
+                self.assertEqual(json.loads(out)["error"], {"kind": "usage", "message": message})
+                self.assertEqual(os.listdir(self.work), [])
+
+    def test_dash_is_no_json_out(self):
+        code, _, err = self.run_main("version", "--json-out", "-")
+        self.assertEqual(code, 2)
+        self.assertIn("--json-out: '-' is not a file; use --format json to print the envelope", err)
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_empty_summary_file(self):
+        self.config.write_bytes(b'[output]\ndir = "build"\n')
+        code, _, err = self.run_main("--repo", str(self.repo), "coverage", "--summary-file", "")
+        self.assertEqual(code, 2)
+        self.assertIn("--summary-file: the file name is empty", err)
+        self.assertFalse((self.repo / "build").exists())
+
+    def test_summary_file_on_a_usage_error_is_checked_against_the_config_file(self):
+        with contextlib.chdir(self.repo):
+            argv = ["version", "--bogus", "--summary-file", "muster.toml", "--json-out", "out.json"]
+            code, _, err = self.run_main(*argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--summary-file muster.toml is the config file", err)
+        self.assertEqual(self.config.read_bytes(), b"")
+        self.assertFalse((self.repo / "out.json").exists())
+
+    def test_parsed_json_out_is_checked_against_the_config_file(self):
+        with contextlib.chdir(self.repo):
+            code, _, err = self.run_main("version", "--json-out", "-1", "--json-out", "muster.toml")
+        self.assertEqual(code, 2)
+        self.assertIn("--json-out muster.toml is the config file", err)
+        self.assertEqual(self.config.read_bytes(), b"")
+
+
 class InternalErrorTest(CliCase):
     def test_bug_exits_three_with_envelope(self):
         with mock.patch.object(cli, "run_version", side_effect=RuntimeError("boom")):
@@ -248,6 +374,15 @@ class InternalErrorTest(CliCase):
         self.assertEqual(code, 3)
         env = json.loads(out)
         self.assertEqual((env["error"]["kind"], env["sections"]), ("internal", []))
+
+    def test_number_that_json_has_not_is_a_bug(self):
+        for value in (math.nan, math.inf):
+            with self.subTest(value=value):
+                self.behave = lambda args, cfg, rep: rep.data.update(ratio=value)
+                code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json")
+                self.assertEqual(code, 3)
+                env = json.loads(out)
+                self.assertEqual((env["error"]["kind"], env["sections"]), ("internal", []))
 
 
 class OutputCollisionTest(CliCase):
@@ -295,6 +430,55 @@ class OutputCollisionTest(CliCase):
         self.assertEqual(json.loads(out)["error"]["kind"], "usage")
         self.assertIn("cannot write --json-out taken", err)
         self.assertTrue((self.work / "taken").is_dir())
+
+
+class FailedRunOutputTest(CliCase):
+    """An output flagged as removed when the run fails goes on every exit 2 or 3 after the clash check."""
+
+    def setUp(self):
+        super().setUp()
+        self.kept = self.work / "kept.json"
+        self.kept.write_bytes(b"old\n")
+        self.behave = lambda args, cfg, rep: None
+        stand_in = cli.Analysis(
+            lambda args, cfg, rep: self.behave(args, cfg, rep),
+            "stand-in section",
+            outputs=lambda args, cfg: [("the kept file", self.kept, False, True)],
+        )
+        self.enterContext(mock.patch.dict(cli.ANALYSES, {"coverage": stand_in}))
+
+    def analyse(self, *options: str) -> int:
+        return self.run_main("--repo", str(self.repo), "coverage", *options)[0]
+
+    def test_kept_when_the_run_passes(self):
+        self.assertEqual(self.analyse(), 0)
+        self.assertTrue(self.kept.exists())
+
+    def test_removed_on_a_fatal_error_and_on_a_bug(self):
+        for error, code in ((FatalError("bad input"), 2), (RuntimeError("boom"), 3)):
+            with self.subTest(code=code):
+                self.kept.write_bytes(b"old\n")
+
+                def fail(args, cfg, rep, error=error):
+                    raise error
+
+                self.behave = fail
+                self.assertEqual(self.analyse(), code)
+                self.assertFalse(self.kept.exists())
+
+    def test_removed_when_the_json_out_cannot_be_cleared(self):
+        (self.work / "taken").mkdir()
+        self.assertEqual(self.analyse("--json-out", "taken"), 2)
+        self.assertFalse(self.kept.exists())
+
+    def test_kept_when_the_profile_cannot_be_read(self):
+        self.config.write_bytes(b"[coverage\n")
+        self.assertEqual(self.analyse(), 2)
+        self.assertTrue(self.kept.exists())
+
+    def test_kept_after_a_clash(self):
+        self.assertEqual(self.analyse("--json-out", str(self.kept)), 2)
+        self.assertEqual(self.kept.read_bytes(), b"old\n")
 
 
 class AnalysisTest(CliCase):
@@ -377,6 +561,18 @@ class AnalysisTest(CliCase):
         self.assertEqual(self.analyse("--github")[0], 0)
         self.assertEqual(summary.read_bytes(), b"## Coverage\n\n")
 
+    def test_output_dir_summary_is_removed_and_gets_the_failure_line(self):
+        def fail(args, cfg, rep):
+            raise FatalError("no report")
+
+        self.behave = fail
+        self.config.write_bytes(b"[output]\ndir = \"build/muster\"\n")
+        target = self.repo / "build" / "muster" / "coverage.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old report\n")
+        self.assertEqual(self.analyse()[0], 2)
+        self.assertEqual(target.read_bytes(), b"muster coverage: error: no report\n\n")
+
     def test_output_dir_is_overwritten(self):
         self.judge()
         self.config.write_bytes(b"[output]\ndir = \"build/muster\"\n")
@@ -421,6 +617,13 @@ class AnalysisTest(CliCase):
         code, out, _ = self.analyse("--format", "json")
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out)["error"], {"kind": "config", "message": "muster.toml: not found"})
+
+    def test_name_that_is_not_utf8_reaches_the_summary(self):
+        self.judge(md=("## Coverage", "- `src/bad" + chr(0xDCFF) + ".py`", "lone " + chr(0xD800)))
+        code, _, _ = self.analyse("--summary-file", "summary.md")
+        self.assertEqual(code, 0)
+        text = (self.work / "summary.md").read_bytes().decode("utf-8")
+        self.assertEqual(text, "## Coverage\n- `src/bad\N{REPLACEMENT CHARACTER}.py`\nlone ?\n\n")
 
     def test_config_error_writes_a_summary_line(self):
         self.config.write_bytes(b"bogus = 1\n")

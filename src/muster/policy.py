@@ -18,28 +18,21 @@ from pathlib import Path
 from muster import __version__
 from muster.config import Config, ConfigError, require
 from muster.gitio import records
-from muster.globs import check_globs
 from muster.paths import SourceSets, exists_exact, source_sets
 from muster.report import FatalError, Report, json_text, md_path, write_json
-from muster.zones import Classification, Names, Targets, classify, parse_date, target_violations, trim
+from muster.zones import Classification, Names, Targets, classify, target_violations, trim
 
 HELP = "classify the source files by the policy files and check the policy"
 SNAPSHOT_SCHEMA = 1
 REQUIRED = ("source.roots", "source.include", "zones.base", "zones.critical", "zones.standard")
-_FROM_CONFIG = "<policy.snapshot>"  # --snapshot without FILE
+POLICY_FILES = ("zones.critical", "zones.standard", "zones.exemptions", "mutation.targets")
+_FROM_CONFIG = object()  # --snapshot without FILE; no file name given on the command line is it
 
 
 class PolicyError(FatalError):
     """The policy files are missing, unreadable or break a rule."""
 
     kind = "policy"
-
-
-def _iso_date(text: str) -> date:
-    day = parse_date(text)
-    if day is None:
-        raise argparse.ArgumentTypeError(f"expected a date YYYY-MM-DD, got '{text}'")
-    return day
 
 
 def arguments(parser: argparse.ArgumentParser) -> None:
@@ -51,7 +44,6 @@ def arguments(parser: argparse.ArgumentParser) -> None:
         help="write the snapshot of the sources and the policy here (default: policy.snapshot of the profile)",
     )
     parser.add_argument("--zones-out", metavar="FILE", help="write the zone of every source file here")
-    parser.add_argument("--today", type=_iso_date, help=argparse.SUPPRESS)  # a fixed date, for tests
 
 
 def snapshot_path(args: argparse.Namespace, cfg: Config) -> Path | None:
@@ -59,7 +51,7 @@ def snapshot_path(args: argparse.Namespace, cfg: Config) -> Path | None:
     to the repository root; None without --snapshot."""
     if args.snapshot is None:
         return None
-    if args.snapshot != _FROM_CONFIG:
+    if args.snapshot is not _FROM_CONFIG:
         if not args.snapshot:
             raise FatalError("--snapshot: the file name is empty")
         return Path(args.snapshot)
@@ -70,22 +62,37 @@ def snapshot_path(args: argparse.Namespace, cfg: Config) -> Path | None:
 
 def _policy_files(cfg: Config) -> list[tuple[str, str]]:
     """(key, configured path) of every policy file the profile names."""
-    keys = ("zones.critical", "zones.standard", "zones.exemptions", "mutation.targets")
-    return [(key, cfg.get(key)) for key in keys if cfg.get(key) is not None]
+    return [(key, cfg.get(key)) for key in POLICY_FILES if cfg.get(key) is not None]
 
 
-def files(args: argparse.Namespace, cfg: Config) -> tuple[list[tuple[str, Path, bool]], list[tuple[str, Path]]]:
-    """The output files (label, path, removed before the check) and the input files (label, path)
-    of this run; the command line checks that no two of them are the same file."""
-    require(cfg, *REQUIRED)
-    outputs = []
+def inputs(cfg: Config) -> list[tuple[str, Path]]:
+    """The policy files the profile names (label, path). It never raises: the command line protects
+    them before this command can report any error."""
+    return [(f"the file of {key}", cfg.root / value) for key, value in _policy_files(cfg)]
+
+
+def outputs(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path, bool, bool]]:
+    """The output files (label, path, removed before the check, removed when the run fails)."""
+    files = []
     if args.zones_out is not None:
-        outputs.append((f"--zones-out {args.zones_out}", Path(args.zones_out), True))
+        files.append((f"--zones-out {args.zones_out}", Path(args.zones_out), True, False))
     snapshot = snapshot_path(args, cfg)
     if snapshot is not None:
-        outputs.append((f"the snapshot {snapshot}", snapshot, False))
-    inputs = [(f"the file of {key}", cfg.root / value) for key, value in _policy_files(cfg)]
-    return outputs, inputs
+        # Kept while the check runs, so that an unchanged snapshot keeps its created_epoch_ms.
+        files.append((f"the snapshot {snapshot}", snapshot, False, True))
+    return files
+
+
+def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
+    """The repository files no output may be: every walked source and test file and every
+    coverage.full_run_suites file. It never raises: the walk is kept in args.source_sets for run(),
+    which reports a folder that is missing or cannot be read."""
+    sets = args.source_sets = source_sets(cfg, defer=True)
+    files = [(f"the source file {path}", cfg.root / path) for path in sets.sources]
+    files += [(f"the test file {path}", cfg.root / path) for path in sorted(sets.tests)]
+    for i, suite in enumerate(cfg.get("coverage.full_run_suites", [])):
+        files.append((f"the file of coverage.full_run_suites[{i}].file", cfg.root / suite["file"]))
+    return files
 
 
 def utc_today(clock=time.time) -> date:
@@ -94,10 +101,12 @@ def utc_today(clock=time.time) -> date:
 
 
 def policy_sha256(critical: bytes, standard: bytes, exemptions: bytes, tables: dict) -> str:
-    """SHA-256 over the raw bytes of the three policy files in this order, then the canonical JSON of
-    the [source] and [zones] tables."""
+    """SHA-256 over the raw SHA-256 digests of the three policy files in this order (so a line moved
+    from one file to the next changes it), then the canonical JSON of the [source] and [zones]
+    tables. An exemption file that is not configured counts as empty."""
+    digests = b"".join(hashlib.sha256(content).digest() for content in (critical, standard, exemptions))
     canonical = json.dumps(tables, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(critical + standard + exemptions + canonical.encode("ascii")).hexdigest()
+    return hashlib.sha256(digests + canonical.encode("ascii")).hexdigest()
 
 
 def sources_sha256(sources: list[str]) -> str:
@@ -134,12 +143,9 @@ def _lines(name: str, raw: bytes) -> list[str]:
 
 def _check_profile(cfg: Config) -> None:
     """The parts of the profile that only this command can check."""
+    require(cfg, *REQUIRED)
     if cfg.mutation_targets is not None:
         require(cfg, "mutation.own_test")
-        try:
-            check_globs("mutation.own_test_forbidden", cfg.own_test_forbidden)
-        except ConfigError as exc:
-            raise ConfigError(f"{cfg.name}: {exc}") from None
     for i, suite in enumerate(cfg.get("coverage.full_run_suites", [])):
         if not exists_exact(cfg.root, suite["file"]):
             raise ConfigError(
@@ -148,11 +154,10 @@ def _check_profile(cfg: Config) -> None:
             )
 
 
-def _sets(cfg: Config) -> SourceSets:
-    try:
-        sets = source_sets(cfg)
-    except ConfigError as exc:
-        raise ConfigError(f"{cfg.name}: {exc}") from None
+def _sets(args: argparse.Namespace, cfg: Config) -> SourceSets:
+    sets = getattr(args, "source_sets", None) or source_sets(cfg, defer=True)
+    if sets.error is not None:
+        raise ConfigError(f"{cfg.name}: {sets.error}")
     if not sets.sources:
         raise ConfigError(f"{cfg.name}: no file under source.roots matches source.include")
     return sets
@@ -233,21 +238,10 @@ def _write_snapshot(target: Path, sources: list[str], policy_hash: str) -> None:
 
 
 def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
-    snapshot = snapshot_path(args, cfg)
-    try:
-        _run(args, cfg, rep, snapshot)
-    except BaseException:
-        if snapshot is not None:  # a failed check leaves no snapshot behind
-            try:
-                snapshot.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
-
-
-def _run(args: argparse.Namespace, cfg: Config, rep: Report, snapshot: Path | None) -> None:
+    """Classify the source files and check the policy files; the command line removes the snapshot
+    when the run fails."""
     _check_profile(cfg)
-    sets = _sets(cfg)
+    sets = _sets(args, cfg)
     raw = {key: _read(cfg, key) for key, _ in _policy_files(cfg)}
     lines = {key: _lines(cfg.get(key), data) for key, data in raw.items()}
     base = cfg.get("zones.base")
@@ -259,7 +253,7 @@ def _run(args: argparse.Namespace, cfg: Config, rep: Report, snapshot: Path | No
         sets.sources,
         base=base,
         names=names,
-        today=args.today or utc_today(),
+        today=utc_today(),
         max_days=cfg.exemption_max_days,
     )
     violations = list(classification.violations)
@@ -285,6 +279,7 @@ def _run(args: argparse.Namespace, cfg: Config, rep: Report, snapshot: Path | No
     _passed(rep, classification, targets)
     if args.zones_out is not None:
         _write_zones(Path(args.zones_out), zones_text(classification))
+    snapshot = snapshot_path(args, cfg)
     if snapshot is not None:
         tables = {"source": cfg.get("source"), "zones": cfg.get("zones")}
         parts = [raw.get(key, b"") for key in ("zones.critical", "zones.standard", "zones.exemptions")]

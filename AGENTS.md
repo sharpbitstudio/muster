@@ -26,7 +26,7 @@ Synthetic globs and relative paths also use folders whose names have more than o
 
 ## Own policy
 
-muster checks its own source tree with its own profile, `muster.toml`, and the lists in `policy/`. Every module under `src/muster/` is in a zone of `policy/critical.txt` or covered by `policy/standard.txt`; a new module is added to one of them in the same change. Check it before committing:
+muster checks its own source tree, every Python file under `src/`, with its own profile, `muster.toml`, and the lists in `policy/`. The check fails for a new package or folder under `src/` that no list covers: add it to `policy/critical.txt` or `policy/standard.txt` in the same change. A new module in `src/muster/` is standard, through `muster/*` in `policy/standard.txt`, unless it is added to a zone of `policy/critical.txt` by hand; that is done for code where a defect lets an invalid policy pass or breaks the contract with callers (the entry point, exit codes, the profile schema, the JSON envelope). Check it before committing:
 
 ```sh
 python -I src policy

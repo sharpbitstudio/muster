@@ -1,8 +1,9 @@
 # Critical zones of muster: code where a defect lets an invalid policy pass or breaks the contract
-# with the callers. One glob per line, relative to src/muster; a zone header opens each zone.
+# with the callers. One glob per line, relative to src; a zone header opens each zone.
 
-# Zone 1: the policy rules: zone grammar, classification, exemptions and mutation targets.
-{zones,globs,paths,policy}.py
+# Zone 1: the policy rules: zone grammar, line splitting, classification, exemptions and mutation targets.
+muster/{zones,globs,paths,policy,gitio}.py
 
-# Zone 2: the contract with the callers: exit codes, the profile schema and the JSON envelope.
-{cli,config,report}.py
+# Zone 2: the contract with the callers: entry point, exit codes, the profile schema and the JSON envelope.
+muster/{cli,config,report}.py
+__main__.py

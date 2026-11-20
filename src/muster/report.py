@@ -156,7 +156,9 @@ def envelope(
 
 
 def json_text(document: dict) -> str:
-    return json.dumps(document, indent=2, ensure_ascii=True) + "\n"
+    """Indented ASCII JSON with a final line feed. A NaN or an infinity is a ValueError: JSON has no
+    such numbers."""
+    return json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
 
 
 def write_json(path: Path, text: str) -> None:

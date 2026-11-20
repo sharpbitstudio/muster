@@ -4,16 +4,20 @@ Exit codes: 0 pass (violations and input errors in warn-only mode); 1 a violatio
 section, or an input error under strict or --fail-on-error; 2 a usage or configuration error,
 always; 3 an internal error (a bug), always.
 
---json-out and --format are read from argv before argparse runs, so that the envelope is written,
-and printed with --format json, on every exit, a usage error and a bug included. No output file may
-be the config file, an input of the command or another output; once that holds, the outputs that
-must not outlive a failed run are removed before the command does anything else.
+The envelope is written to --json-out, and printed with --format json, on every exit, a usage error
+and a bug included. When argparse fails, --json-out, --format and the summary file are read from
+argv the way argparse would have read them; otherwise the parsed values count. No output file (the
+envelope, the summary, the command's own outputs) may be the config file, an input of the command,
+a source or test file of the repository or another output: on such a clash nothing is removed or
+written. Once that holds, the outputs that must not outlive a failed run are removed before the
+command does anything else, and those removed when the run fails go on any exit 2 or 3.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import traceback
 from collections.abc import Callable
@@ -53,23 +57,29 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(message, self.format_usage())
 
 
-Outputs = list[tuple[str, Path, bool]]  # (label, path, removed before the command runs)
+# (label, path, removed before the command runs, removed when the run ends with exit 2 or 3)
+Outputs = list[tuple[str, Path, bool, bool]]
 Inputs = list[tuple[str, Path]]  # (label, path)
+Summary = tuple[str, Path, bool]  # (label, path, appended to)
 
 
 @dataclass(frozen=True)
 class Analysis:
-    """An analysis command: `run` judges one section into the Report; `arguments` adds its own options;
-    `files` names its own output and input files, once the profile is read."""
+    """An analysis command: `run` judges one section into the Report; `arguments` adds its own options.
+    Once the profile is read: `inputs` names the files the command reads and `protected` the other
+    repository files no output may be (neither may raise), and `outputs` names its own output files
+    (it may raise, after the envelope and the summary are known to be safe to write)."""
 
     run: Callable[[argparse.Namespace, Config, Report], None]
     help: str
     arguments: Callable[[argparse.ArgumentParser], None] = lambda parser: None
-    files: Callable[[argparse.Namespace, Config], tuple[Outputs, Inputs]] = lambda args, cfg: ([], [])
+    inputs: Callable[[Config], Inputs] = lambda cfg: []
+    outputs: Callable[[argparse.Namespace, Config], Outputs] = lambda args, cfg: []
+    protected: Callable[[argparse.Namespace, Config], Inputs] = lambda args, cfg: []
 
 
 ANALYSES: dict[str, Analysis] = {
-    "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.files),
+    "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.inputs, policy.outputs, policy.protected),
 }
 
 
@@ -125,22 +135,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _scan_option(argv: list[str], option: str) -> str | None:
-    """The value of the last `option VALUE` or `option=VALUE` in argv, as argparse would take it."""
+# What argparse takes as a negative number, and so as a value rather than an option.
+_NEGATIVE_NUMBER = re.compile(r"-\d+$|-\d*\.\d+$")
+
+
+def _options(argv: list[str]) -> list[str]:
+    """argv up to `--`: what follows it is never an option."""
+    return argv[: argv.index("--")] if "--" in argv else argv
+
+
+def _is_value(arg: str) -> bool:
+    """Whether argparse takes `arg`, after an option that needs a value, as that value."""
+    return not arg.startswith("-") or arg == "-" or bool(_NEGATIVE_NUMBER.match(arg)) or " " in arg
+
+
+def _scan_option(words: list[str], option: str) -> str | None:
+    """The value of the last `option VALUE` or `option=VALUE` in words, as argparse would take it."""
     value = None
-    for i, arg in enumerate(argv):
+    for i, arg in enumerate(words):
         if arg == option:
-            following = argv[i + 1] if i + 1 < len(argv) else None
-            value = following if following is not None and not following.startswith("-") else None
+            following = words[i + 1] if i + 1 < len(words) else None
+            value = following if following is not None and _is_value(following) else None
         elif arg.startswith(option + "="):
             value = arg.split("=", 1)[1]
     return value
 
 
-def _scan_command(argv: list[str]) -> str | None:
-    """The command named in argv, when it is a known one: the first word after the global options."""
+def _scan_command(words: list[str]) -> str | None:
+    """The command named in words, when it is a known one: the first word after the global options."""
     skip = False
-    for arg in argv:
+    for arg in words:
         if skip:
             skip = False
         elif arg in ("--repo", "--config"):
@@ -175,51 +199,115 @@ def _same_file(first: Path, second: Path) -> bool:
     return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
 
 
+def _index(files: Inputs) -> dict[str, str]:
+    """The resolved path (case-folded on Windows) of each file -> its label; each folder is resolved
+    once, so that a large set of files costs no call per file."""
+    folders: dict[Path, str] = {}
+    index: dict[str, str] = {}
+    for label, path in files:
+        folder = folders.get(path.parent)
+        if folder is None:
+            folder = folders[path.parent] = os.path.realpath(path.parent)
+        index.setdefault(os.path.normcase(os.path.join(folder, path.name)), label)
+    return index
+
+
 @dataclass
 class Invocation:
-    """What one run has learned so far; the envelope is built from it on every exit."""
+    """What one run has learned so far; the envelope is built from it on every exit. `json_out` and
+    `summary` are set only once they are known not to clash with an input."""
 
     argv: list[str]
     command: str | None
     fmt: str
-    json_out: str | None
+    json_out: str | None = None
+    summary: tuple[Path, bool] | None = None  # (path, appended to): where the failure line goes
+    summary_written: bool = False
+    remove_on_failure: list[Path] = field(default_factory=list)
     commit: str | None = None
     sections: list[Report] = field(default_factory=list)
 
 
-def _check_outputs(inv: Invocation, outputs: Outputs, inputs: Inputs) -> None:
-    """Refuse an output (--json-out included) that is an input or another output: exit 2, and nothing
-    is removed or written, the envelope included."""
-    named = [(f"--json-out {inv.json_out}", Path(inv.json_out))] if inv.json_out else []
-    named += [(label, path) for label, path, _ in outputs]
+def _refuse_clashes(inv: Invocation, named: Inputs, inputs: Inputs, protected: dict[str, str] | None = None) -> None:
+    """Refuse an output that is an input, a protected file or another output: exit 2, and nothing is
+    removed or written, the envelope and the summary included."""
     for i, (label, path) in enumerate(named):
         clash = next((f"is {other}" for other, file in inputs if _same_file(path, file)), None)
+        if clash is None and protected:
+            other = protected.get(os.path.normcase(os.path.realpath(path)))
+            clash = None if other is None else f"is {other}"
         if clash is None:
             clash = next((f"is the same file as {other}" for other, file in named[:i] if _same_file(path, file)), None)
         if clash is not None:
-            inv.json_out = None
+            inv.json_out, inv.summary, inv.remove_on_failure = None, None, []
             raise UsageError(f"{label} {clash}")
 
 
-def _clear_outputs(inv: Invocation, outputs: Outputs) -> None:
-    """Remove the old envelope and the outputs that must not outlive a failed run."""
-    named = [(f"--json-out {inv.json_out}", Path(inv.json_out), True)] if inv.json_out else []
-    for i, (label, path, remove) in enumerate(named + outputs):
-        if not remove:
-            continue
+def _named(json_out: str | None, summary: Summary | None) -> Inputs:
+    named = [(f"--json-out {json_out}", Path(json_out))] if json_out else []
+    return named + ([summary[:2]] if summary else [])
+
+
+def _arm(inv: Invocation, json_out: str | None, summary: Summary | None) -> None:
+    """From now on the envelope and the failure line go to these files."""
+    inv.json_out = json_out
+    inv.summary = None if summary is None else (summary[1], summary[2])
+
+
+def _clear(inv: Invocation, json_out: str | None, summary: Summary | None, outputs: Outputs) -> None:
+    """Remove the old envelope, an overwritten summary and the outputs that must not outlive a
+    failed run; a file that cannot be removed cannot be written either."""
+    files = [(f"--json-out {json_out}", Path(json_out), "envelope")] if json_out else []
+    if summary is not None and not summary[2]:
+        files.append((summary[0], summary[1], "summary"))
+    files += [(label, path, "output") for label, path, before, _ in outputs if before]
+    for label, path, kind in files:
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            if i == 0 and named:  # the envelope cannot be written either
+            if kind == "envelope":
                 inv.json_out = None
+            elif kind == "summary":
+                inv.summary = None
             raise UsageError(f"cannot write {label}: {exc.strerror or exc}") from None
 
 
-def _check_json_out_early(inv: Invocation) -> None:
-    """Before argparse only the config file is known: a --json-out that is the config file is refused."""
-    root = _repo_root(_scan_option(inv.argv, "--repo"))
-    profile = config_path(root, _scan_option(inv.argv, "--config") or DEFAULT_CONFIG)
-    _check_outputs(inv, [], [("the config file", profile)])
+def _file_option(option: str, value: str | None) -> str | None:
+    if value == "":
+        raise UsageError(f"{option}: the file name is empty")
+    if value == "-" and option == "--json-out":
+        raise UsageError("--json-out: '-' is not a file; use --format json to print the envelope")
+    return value
+
+
+def _option_summary(args: argparse.Namespace) -> Summary | None:
+    """The summary named on the command line: --summary-file, else $GITHUB_STEP_SUMMARY with --github."""
+    summary_file = _file_option("--summary-file", getattr(args, "summary_file", None))
+    if summary_file:
+        return f"--summary-file {summary_file}", Path(summary_file), True
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY") if getattr(args, "github", False) else None
+    return (f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True) if step_summary else None
+
+
+def _arm_scanned(inv: Invocation) -> None:
+    """argparse failed, so only the config file is known: the --json-out and the summary file read
+    from argv are refused when they are the config file; else the envelope and the line go there."""
+    words = _options(inv.argv)
+    json_out = _scan_option(words, "--json-out")
+    json_out = json_out if json_out not in ("", "-") else None
+    summary_file = _scan_option(words, "--summary-file")
+    summary = None
+    if summary_file:
+        summary = f"--summary-file {summary_file}", Path(summary_file), True
+    elif summary_file is None and "--github" in words and os.environ.get("GITHUB_STEP_SUMMARY"):
+        step_summary = os.environ["GITHUB_STEP_SUMMARY"]
+        summary = f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True
+    named = _named(json_out, summary)
+    if named:
+        root = _repo_root(_scan_option(words, "--repo"))
+        profile = config_path(root, _scan_option(words, "--config") or DEFAULT_CONFIG)
+        _refuse_clashes(inv, named, [("the config file", profile)])
+    _arm(inv, json_out, summary)
 
 
 def run_version(args: argparse.Namespace, inv: Invocation) -> int:
@@ -228,45 +316,66 @@ def run_version(args: argparse.Namespace, inv: Invocation) -> int:
     return EXIT_PASS
 
 
-def _write_summary(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
-    """Append to --summary-file (with --github: $GITHUB_STEP_SUMMARY); else overwrite
-    <[output].dir>/<command>.md when the profile sets that folder; else write nothing."""
-    summary = args.summary_file or (os.environ.get("GITHUB_STEP_SUMMARY") if args.github else None)
-    if summary:
-        target, append = Path(summary), True
-    elif cfg.output_dir is not None:
-        target, append = cfg.root / cfg.output_dir / f"{rep.name}.md", False
-    else:
+# A surrogate that no surrogate-escape decoding of a file name makes.
+_OTHER_SURROGATE = re.compile("[\ud800-\udc7f\udd00-\udfff]")
+
+
+def _markdown_text(text: str) -> str:
+    """Text that UTF-8 can encode: a name that is not valid UTF-8 on disk (decoded with surrogate
+    escapes) shows U+FFFD where its bad bytes were; any other lone surrogate becomes '?'."""
+    text = _OTHER_SURROGATE.sub("?", text)
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def _write_summary(inv: Invocation, rep: Report) -> None:
+    """Append to the summary file of the command line; overwrite <[output].dir>/<command>.md (append
+    once this run wrote there); without a summary file write nothing."""
+    if inv.summary is None:
         return
+    target, append = inv.summary
     try:
-        write_markdown(target, "\n".join(rep.md).rstrip("\n") + "\n\n", append=append)
+        text = _markdown_text("\n".join(rep.md).rstrip("\n") + "\n\n")
+        write_markdown(target, text, append=append or inv.summary_written)
     except OSError as exc:
         raise UsageError(f"cannot write the summary {target}: {exc.strerror or exc}") from None
+    inv.summary_written = True
 
 
-def run_analysis(args: argparse.Namespace, inv: Invocation, analysis: Analysis) -> int:
+def run_analysis(args: argparse.Namespace, inv: Invocation, analysis: Analysis, json_out: str | None) -> int:
     root = _repo_root(args.repo)
     inv.commit = _head_commit(root)
+    summary = _option_summary(args)
+    _refuse_clashes(inv, _named(json_out, summary), [("the config file", config_path(root, args.config))])
+    _arm(inv, json_out, summary)
     cfg = load(root, args.config)
-    outputs, inputs = analysis.files(args, cfg)
-    _check_outputs(inv, outputs, [("the config file", cfg.path), *inputs])
-    _clear_outputs(inv, outputs)
+    if summary is None and cfg.output_dir is not None:
+        target = cfg.root / cfg.output_dir / f"{args.command}.md"
+        summary = f"the summary {target}", target, False
+    named = _named(json_out, summary)
+    inputs = [("the config file", cfg.path), *analysis.inputs(cfg)]
+    protected = _index(analysis.protected(args, cfg))
+    _refuse_clashes(inv, named, inputs, protected)
+    _arm(inv, json_out, summary)
+    outputs = analysis.outputs(args, cfg)
+    _refuse_clashes(inv, named + [(label, path) for label, path, _, _ in outputs], inputs, protected)
+    inv.remove_on_failure = [path for _, path, _, on_failure in outputs if on_failure]
+    _clear(inv, json_out, summary, outputs)
     strict = args.strict or (args.strict_only is not None and args.command in args.strict_only)
     rep = Report(args.command, strict=strict, fail_on_error=args.fail_on_error)
     try:
         analysis.run(args, cfg, rep)
     except FatalError:
         if rep.violations:  # a fatal finding, such as an invalid policy: the section is reported too
-            _report_section(args, inv, cfg, rep, fatal=True)
+            _report_section(inv, rep, fatal=True)
         raise
-    _report_section(args, inv, cfg, rep)
+    _report_section(inv, rep)
     return EXIT_VIOLATION if (rep.violation and rep.strict) or (rep.error and rep.fail_on_error) else EXIT_PASS
 
 
-def _report_section(args: argparse.Namespace, inv: Invocation, cfg: Config, rep: Report, fatal: bool = False) -> None:
+def _report_section(inv: Invocation, rep: Report, fatal: bool = False) -> None:
     inv.sections.append(rep)
     try:
-        _write_summary(args, cfg, rep)
+        _write_summary(inv, rep)
     except UsageError as exc:
         if not fatal:
             raise
@@ -278,14 +387,44 @@ def _report_section(args: argparse.Namespace, inv: Invocation, cfg: Config, rep:
 
 
 def _run(inv: Invocation) -> int:
-    if inv.json_out:
-        _check_json_out_early(inv)
-    args = build_parser().parse_args(inv.argv)
+    try:
+        args = build_parser().parse_args(inv.argv)  # --help exits here, before any output is checked
+    except UsageError:
+        _arm_scanned(inv)
+        raise
     inv.command, inv.fmt = args.command, args.format
-    if args.command == "version":
-        _clear_outputs(inv, [])
-        return run_version(args, inv)
-    return run_analysis(args, inv, ANALYSES[args.command])
+    json_out = _file_option("--json-out", args.json_out)
+    if args.command != "version":
+        return run_analysis(args, inv, ANALYSES[args.command], json_out)
+    if json_out:
+        profile = config_path(_repo_root(args.repo), args.config)
+        _refuse_clashes(inv, _named(json_out, None), [("the config file", profile)])
+        _arm(inv, json_out, None)
+        _clear(inv, json_out, None, [])
+    return run_version(args, inv)
+
+
+def _remove_failed_outputs(inv: Invocation) -> None:
+    for path in inv.remove_on_failure:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"muster: error: cannot remove {path}: {exc.strerror or exc}", file=sys.stderr)
+
+
+def _write_failure_line(inv: Invocation, line: str) -> None:
+    """Best effort: the summary says the command failed. A summary of the command line is appended
+    to; <[output].dir>/<command>.md is overwritten unless this run already wrote there."""
+    if inv.summary is None:
+        return
+    target, append = inv.summary
+    if append:
+        _summary_crash_line([f"--summary-file={target}"], _markdown_text(line))
+        return
+    try:
+        write_markdown(target, _markdown_text(line) + "\n\n", append=inv.summary_written)
+    except Exception:  # noqa: BLE001 - the failure report itself must never raise
+        pass
 
 
 def _report_failure(inv: Invocation, message: str, usage: str) -> None:
@@ -296,7 +435,7 @@ def _report_failure(inv: Invocation, message: str, usage: str) -> None:
     if usage:
         sys.stderr.write(usage)
     print(f"{name}: error: {message}", file=sys.stderr)
-    _summary_crash_line(inv.argv, f"{name}: error: {one_line(message)}")
+    _write_failure_line(inv, f"{name}: error: {one_line(message)}")
 
 
 def _finish(inv: Invocation, code: int, error: tuple[str, str] | None, usage: str = "") -> int:
@@ -319,6 +458,7 @@ def _finish(inv: Invocation, code: int, error: tuple[str, str] | None, usage: st
                 code, error, usage = EXIT_USAGE, ("usage", message), ""
                 text = build()
     if code in (EXIT_USAGE, EXIT_INTERNAL):
+        _remove_failed_outputs(inv)
         _report_failure(inv, error[1], usage)
     if inv.fmt == "json":
         sys.stdout.write(text)
@@ -326,11 +466,11 @@ def _finish(inv: Invocation, code: int, error: tuple[str, str] | None, usage: st
 
 
 def _main(argv: list[str]) -> int:
+    words = _options(argv)
     inv = Invocation(
         argv=argv,
-        command=_scan_command(argv),
-        fmt="json" if _scan_option(argv, "--format") == "json" else "text",
-        json_out=_scan_option(argv, "--json-out"),
+        command=_scan_command(words),
+        fmt="json" if _scan_option(words, "--format") == "json" else "text",
     )
     usage = ""
     try:
