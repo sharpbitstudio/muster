@@ -516,19 +516,45 @@ jobs:
         run: python -m unittest discover -s tests -t . -v
 
   # The one check the ruleset requires for the unit tests: its name stays
-  # the same when the matrix changes.
+  # the same when the matrix changes. It also reads the conclusion of each
+  # test job of the run, since a job cancelled before any runner took it
+  # leaves needs.test.result at success.
   tests:
     if: always()
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Every test job passed
         env:
           RESULT: ${{ needs.test.result }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -eu
           if [ "$RESULT" != success ]; then
             echo "::error::test jobs: $RESULT"
+            exit 1
+          fi
+          # The latest attempt of each job, so a re-run of the failed jobs
+          # counts the jobs that passed in an earlier attempt; one conclusion
+          # per line, counted here, so every page counts.
+          conclusions="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | select(.name | startswith("test (")) | .conclusion')"
+          total=0
+          passed=0
+          if [ -n "$conclusions" ]; then
+            while IFS= read -r conclusion; do
+              total=$((total + 1))
+              if [ "$conclusion" = success ]; then
+                passed=$((passed + 1))
+              fi
+            done <<< "$conclusions"
+          fi
+          if [ "$total" -eq 0 ] || [ "$passed" -ne "$total" ]; then
+            echo "::error::test jobs: $passed of $total succeeded"
             exit 1
           fi
 

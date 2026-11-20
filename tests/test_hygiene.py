@@ -176,6 +176,8 @@ class UserNameTest(unittest.TestCase):
 
     def test_longer_property_name_is_fine(self):
         self.assertEqual(categories('<property name="user.name.x" value="y"/>'), [])
+        self.assertEqual(categories('<property name="user.names" value="y"/>'), [])
+        self.assertEqual(categories('<property name="user.name-x" value="y"/>'), [])
 
     def test_prose_is_fine(self):
         self.assertEqual(categories("no fixture has a user.name property"), [])
@@ -197,6 +199,14 @@ class ReportNameOutputTest(unittest.TestCase):
     def test_commit_message(self):
         text = "Add a report\n\nIt has <testsuite " + attr("hostname", HOST) + ">\n"
         self.assertEqual(categories(text, message=True), ["hostname"])
+
+    def test_commit_message_sessioninfo(self):
+        text = "Add a report\n\nIt has <" + "sessioninfo " + attr("id", HOST + "-1a2b3c") + "/>\n"
+        self.assertEqual(categories(text, message=True), ["sessioninfo"])
+
+    def test_commit_message_user_name(self):
+        text = "Add a report\n\nIt has <property " + attr("name", "user.name") + ' value="' + USER + '"/>\n'
+        self.assertEqual(categories(text, message=True), ["user-name"])
 
 
 class RootHomeTest(unittest.TestCase):
