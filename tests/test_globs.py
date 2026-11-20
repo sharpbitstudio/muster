@@ -2,8 +2,7 @@
 
 import unittest
 
-from muster.config import ConfigError
-from muster.globs import check_globs, compile_glob, matches, matches_any
+from muster.globs import alternatives, matches, matches_any
 
 
 class MatchTest(unittest.TestCase):
@@ -68,9 +67,9 @@ class MatchTest(unittest.TestCase):
 
 class MalformedGlobTest(unittest.TestCase):
     def assertRejected(self, glob, reason):
-        with self.assertRaises(ConfigError) as caught:
-            compile_glob("source.include[0]", glob)
-        self.assertEqual(str(caught.exception), f'source.include[0]: bad glob "{glob}": {reason}')
+        with self.assertRaises(ValueError) as caught:
+            alternatives(glob)
+        self.assertEqual(str(caught.exception), reason)
 
     def test_double_star_inside_a_segment(self):
         self.assertRejected("src/**.py", "'**' must be a whole path segment")
@@ -83,11 +82,10 @@ class MalformedGlobTest(unittest.TestCase):
         self.assertRejected("src/}app{/tool.py", "a '}' without its '{'")
         self.assertRejected("src/{app,{lib}}/tool.py", "nested braces")
 
-    def test_check_globs_names_the_item(self):
-        check_globs("source.exclude", ["**/*.md", "docs/**"])
-        with self.assertRaises(ConfigError) as caught:
-            check_globs("source.exclude", ["**/*.md", "docs/**.md"])
-        self.assertTrue(str(caught.exception).startswith('source.exclude[1]: bad glob "docs/**.md"'))
+    def test_alternatives_left_to_right(self):
+        self.assertEqual(alternatives("{src,lib}/*.{py,pyi}"), ["src/*.py", "src/*.pyi", "lib/*.py", "lib/*.pyi"])
+        self.assertEqual(alternatives("src/{,app/}main.py"), ["src/main.py", "src/app/main.py"])
+        self.assertEqual(alternatives("**/*.py"), ["**/*.py"])
 
 
 if __name__ == "__main__":

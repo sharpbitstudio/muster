@@ -2,14 +2,15 @@
 
 The checker knows every key of schema v1: an unknown key at any level, a value of the wrong type or
 a value out of range is a configuration error (exit 2). No key is required here; each command names
-the keys it needs with require(). Every path and glob is relative to the repository root, in POSIX
-form. There is no built-in default path.
+the keys it needs with require(). Every path and glob is relative to the repository root, in
+canonical POSIX form; every glob is well-formed. There is no built-in default path.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import tomllib
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from muster.globs import alternatives
 from muster.report import FatalError
 
 SCHEMA_VERSION = 1
@@ -61,6 +63,14 @@ def _kind(value: Any) -> str:
     return "a date or time"
 
 
+def _shown(value: Any) -> str:
+    """A number as a message shows it; an integer too long for a decimal string is shown in hex."""
+    try:
+        return str(value)
+    except ValueError:  # more digits than int-to-str conversion allows
+        return hex(value)
+
+
 def _expect(key: str, value: Any, ok: bool, expected: str) -> None:
     if not ok:
         raise ConfigError(f"{key}: expected {expected}, got {_kind(value)}")
@@ -74,24 +84,25 @@ def integer(minimum: int | None = None) -> Check:
     def check(key: str, value: Any) -> None:
         _expect(key, value, _is_int(value), "an integer")
         if minimum is not None and value < minimum:
-            raise ConfigError(f"{key}: must be {minimum} or more, got {value}")
+            raise ConfigError(f"{key}: must be {minimum} or more, got {_shown(value)}")
 
     return check
 
 
 def number(low: float, high: float | None = None, *, above: bool = False) -> Check:
-    """A float or an integer, finite, in [low, high], or above low when `above`."""
+    """A float or an integer, finite, in [low, high], or above low when `above`. An integer is
+    compared exactly, however large: it is never converted to a float."""
 
     def check(key: str, value: Any) -> None:
         _expect(key, value, _is_int(value) or isinstance(value, float), "a number")
-        if not math.isfinite(value):
+        if isinstance(value, float) and not math.isfinite(value):
             raise ConfigError(f"{key}: must be a finite number, got {value}")
         if above and value <= low:
-            raise ConfigError(f"{key}: must be greater than {low:g}, got {value}")
+            raise ConfigError(f"{key}: must be greater than {low:g}, got {_shown(value)}")
         if not above and value < low:
-            raise ConfigError(f"{key}: must be {low:g} or more, got {value}")
+            raise ConfigError(f"{key}: must be {low:g} or more, got {_shown(value)}")
         if high is not None and value > high:
-            raise ConfigError(f"{key}: must be {high:g} or less, got {value}")
+            raise ConfigError(f"{key}: must be {high:g} or less, got {_shown(value)}")
 
     return check
 
@@ -107,31 +118,83 @@ def string(choices: tuple[str, ...] = (), pattern: re.Pattern[str] | None = None
     return check
 
 
+_NOT_RELATIVE = "must be a path relative to the repository root with / separators"
+
+
+def _has_control(value: str) -> bool:
+    return any(ch < " " or ch == "\x7f" for ch in value)
+
+
+def _path_problem(value: str, allow_empty: bool = False) -> str | None:
+    """What keeps `value` from being a canonical repository-relative path, or None."""
+    if value == "":
+        return None if allow_empty else "is empty"
+    segments = value.split("/")
+    return (
+        "has a control character" if _has_control(value)
+        else "starts with /" if value.startswith("/")
+        else "has a backslash" if "\\" in value
+        else "starts with a drive" if _DRIVE.match(value)
+        else "has a .. segment" if ".." in segments
+        else "has a . segment" if "." in segments
+        else "ends with /" if value.endswith("/")
+        else "has an empty segment" if "" in segments
+        else None
+    )
+
+
 def path(*, allow_empty: bool = False) -> Check:
-    """A path or a glob relative to the repository root: forward slashes, no leading slash, no drive,
-    no `..` segment."""
+    """A path relative to the repository root in canonical form: forward slashes, no leading or
+    trailing slash, no drive, no empty, `.` or `..` segment, no control character."""
 
     def check(key: str, value: Any) -> None:
         _expect(key, value, isinstance(value, str), "a string")
-        problem = (
-            "is empty" if value == "" and not allow_empty
-            else "starts with /" if value.startswith("/")
-            else "has a backslash" if "\\" in value
-            else "starts with a drive" if _DRIVE.match(value)
-            else "has a .. segment" if ".." in value.split("/")
-            else None
-        )
+        problem = _path_problem(value, allow_empty)
         if problem:
-            raise ConfigError(f"{key}: must be a path relative to the repository root with / separators; it {problem}")
+            raise ConfigError(f"{key}: {_NOT_RELATIVE}; it {problem}")
 
     return check
+
+
+def _alternatives(key: str, value: str) -> list[str]:
+    try:
+        return alternatives(value)
+    except ValueError as exc:
+        raise ConfigError(f"{key}: bad glob {json.dumps(value)}: {exc}") from None
+
+
+def glob(key: str, value: Any) -> None:
+    """A glob of repository-relative paths: well-formed, and the glob and each of its alternatives
+    pass the rules of path()."""
+    _PATH(key, value)
+    for alternative in _alternatives(key, value):
+        problem = _path_problem(alternative)
+        if problem:
+            raise ConfigError(f"{key}: {_NOT_RELATIVE}; its alternative {json.dumps(alternative)} {problem}")
+
+
+def name_glob(key: str, value: Any) -> None:
+    """A well-formed glob of file names, without control characters."""
+    _expect(key, value, isinstance(value, str), "a string")
+    if _has_control(value):
+        raise ConfigError(f"{key}: has a control character")
+    _alternatives(key, value)
+
+
+def file_name_template(key: str, value: Any) -> None:
+    """The name of a file, with {stem} (and maybe {ext}) in it: no folder, so no / and no backslash."""
+    _expect(key, value, isinstance(value, str), "a string")
+    if "{stem}" not in value:
+        raise ConfigError(f"{key}: must contain {{stem}}")
+    if "/" in value or "\\" in value or _has_control(value):
+        raise ConfigError(f"{key}: must be a file name, without / or \\ or a control character")
 
 
 def regex(key: str, value: Any) -> None:
     _expect(key, value, isinstance(value, str), "a string")
     try:
         re.compile(value)
-    except re.error as exc:
+    except (re.error, OverflowError, RecursionError) as exc:  # also a huge repeat count, a deep nesting
         raise ConfigError(f"{key}: not a valid regular expression: {exc}") from None
 
 
@@ -175,11 +238,12 @@ def _check_table(prefix: str, value: dict, schema: dict[str, Check], required: t
 def _schema_version(key: str, value: Any) -> None:
     integer()(key, value)
     if value != SCHEMA_VERSION:
-        raise ConfigError(f"{key}: unsupported schema {value}; this muster reads schema {SCHEMA_VERSION}")
+        raise ConfigError(f"{key}: unsupported schema {_shown(value)}; this muster reads schema {SCHEMA_VERSION}")
 
 
 _PATH = path()
 _PATHS = array(path())
+_GLOBS = array(glob)
 _FRACTION = number(0, 1)
 _POSITIVE = number(0, above=True)
 _COUNT = integer(0)
@@ -192,9 +256,9 @@ SCHEMA: dict[str, Check] = {
         {
             "roots": array(path(), non_empty=True),
             "tests": _PATHS,
-            "include": array(path(), non_empty=True),
-            "exclude": _PATHS,
-            "generated": _PATHS,
+            "include": array(glob, non_empty=True),
+            "exclude": _GLOBS,
+            "generated": _GLOBS,
         }
     ),
     "zones": table(
@@ -216,7 +280,7 @@ SCHEMA: dict[str, Check] = {
             "full_run_suites": tables({"name": string(), "file": _PATH}, required=("name", "file")),
         }
     ),
-    "tests": table({"format": string(choices=("junit",)), "results": _PATH}),
+    "tests": table({"format": string(choices=("junit",)), "results": glob}),
     "duration": table(
         {
             "source": string(choices=("task-json", "junit-span")),
@@ -228,8 +292,8 @@ SCHEMA: dict[str, Check] = {
     ),
     "loc": table(
         {
-            "exclude": _PATHS,
-            "test_support": _PATHS,
+            "exclude": _GLOBS,
+            "test_support": _GLOBS,
             "budget_ratio": _POSITIVE,
             "budget_grace_lines": _COUNT,
             "budget_trailer": string(),
@@ -242,8 +306,8 @@ SCHEMA: dict[str, Check] = {
             "targets": _PATH,
             "threshold": _FRACTION,
             "target": _FRACTION,
-            "own_test": string(),
-            "own_test_forbidden": _STRINGS,
+            "own_test": file_name_template,
+            "own_test_forbidden": array(name_glob),
             "tool_versions": table({"file": _PATH, "keys": _STRINGS}),
             "known_variation": tables(
                 {"class": string(), "method": string(), "line": _COUNT, "mutator": string()},
@@ -336,11 +400,31 @@ def require(cfg: Config, *keys: str) -> None:
             raise ConfigError(f"{cfg.name}: missing key {key}")
 
 
+def _exact_case(root: Path, file: Path) -> bool:
+    """Whether every part of `file` below `root` (only its name, outside the root) has exactly that
+    name on disk: Windows would open the file under another case too."""
+    try:
+        current, parts = root, file.relative_to(root).parts
+    except ValueError:
+        current, parts = file.parent, (file.name,)
+    for part in parts:
+        if part not in (".", ".."):
+            try:
+                if part not in os.listdir(current):
+                    return False
+            except OSError:
+                return True  # reading the file says what is wrong
+        current = current / part
+    return True
+
+
 def load(root: Path, value: str = DEFAULT_CONFIG) -> Config:
     """Read, parse and check the profile. Every failure is a ConfigError that names the file."""
     file = config_path(root, value)
     name = _display(root, file)
     try:
+        if not _exact_case(root, file):
+            raise FileNotFoundError(file)
         raw = file.read_bytes()
     except FileNotFoundError:
         raise ConfigError(f"{name}: not found") from None
@@ -352,8 +436,10 @@ def load(root: Path, value: str = DEFAULT_CONFIG) -> Config:
         raise ConfigError(f"{name}: not valid UTF-8 (byte {exc.start})") from None
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+    except ValueError as exc:  # TOMLDecodeError, or an integer with more digits than Python converts
         raise ConfigError(f"{name}: invalid TOML: {exc}") from None
+    except RecursionError:
+        raise ConfigError(f"{name}: invalid TOML: nested too deeply") from None
     try:
         validate(data)
     except ConfigError as exc:

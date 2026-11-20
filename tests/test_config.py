@@ -406,8 +406,16 @@ class PathTest(ValidateCase):
         ("app/../other", "has a .. segment"),
         ("..", "has a .. segment"),
         ("app/src/..", "has a .. segment"),
+        ("./app", "has a . segment"),
+        ("app/./src", "has a . segment"),
+        (".", "has a . segment"),
+        ("app/src/", "ends with /"),
+        ("app//src", "has an empty segment"),
+        ("app/" + chr(0) + "src", "has a control character"),
+        ("app/src" + chr(0x1F), "has a control character"),
+        ("app/" + chr(0x7F), "has a control character"),
     ]
-    GOOD = ["app/src/main", "**/*.java", "app/release..notes/x", "./app", "TEST-*.xml"]
+    GOOD = ["app/src/main", "**/*.java", "app/release..notes/x", "app/.hidden/x", "TEST-*.xml"]
 
     def message(self, key: str, problem: str) -> str:
         return f"{shown(key)}: must be a path relative to the repository root with / separators; it {problem}"
@@ -439,6 +447,7 @@ class PathTest(ValidateCase):
 
     def test_empty_zones_base_is_the_repository_root(self):
         validate(doc("zones.base", ""))
+        self.assertEqual(self.error(doc("zones.base", ".")), self.message("zones.base", "has a . segment"))
 
     def test_roots_and_include_not_empty(self):
         self.assertEqual(self.error(doc("source.roots", [])), "source.roots: must not be empty")
@@ -449,6 +458,88 @@ class PathTest(ValidateCase):
             if key != "source.include":
                 with self.subTest(key=key):
                     validate(doc(key, []))
+
+
+GLOB_KEYS = ["source.include", "source.exclude", "source.generated", "loc.exclude", "loc.test_support"]
+
+
+class GlobTest(ValidateCase):
+    def test_malformed_glob_is_rejected_when_the_profile_is_read(self):
+        cases = [
+            ("src/{", "a '{' without its '}'"),
+            ("src/}x", "a '}' without its '{'"),
+            ("src/{a,{b}}", "nested braces"),
+            ("**.java", "'**' must be a whole path segment"),
+        ]
+        for key in GLOB_KEYS:
+            for glob, reason in cases:
+                with self.subTest(key=key, glob=glob):
+                    self.assertEqual(self.error(doc(key, ["**/*.py", glob])), f'{key}[1]: bad glob "{glob}": {reason}')
+        self.assertEqual(
+            self.error(doc("tests.results", "build/**.xml")),
+            "tests.results: bad glob \"build/**.xml\": '**' must be a whole path segment",
+        )
+
+    def test_every_alternative_is_a_relative_path(self):
+        prefix = "must be a path relative to the repository root with / separators; its alternative"
+        cases = [
+            ("{../private.py,**/*.py}", '"../private.py" has a .. segment'),
+            ("{src,/work}/*.py", '"/work/*.py" starts with /'),
+            ("src/{main,}", '"src/" ends with /'),
+            ("{,src/**}", '"" is empty'),
+            ("{./src,lib}/*.py", '"./src/*.py" has a . segment'),
+        ]
+        for key in GLOB_KEYS:
+            for glob, problem in cases:
+                with self.subTest(key=key, glob=glob):
+                    self.assertEqual(self.error(doc(key, [glob])), f"{key}[0]: {prefix} {problem}")
+        validate(doc("source.include", ["{src,lib}/**/*.{py,pyi}", "src/{,app/}main.py"]))
+
+    def test_own_test_forbidden_is_a_glob_of_file_names(self):
+        validate(doc("mutation.own_test_forbidden", ["*IntegrationTest*", "{Slow,Live}*", "dir/../*Test*"]))
+        message = self.error(doc("mutation.own_test_forbidden", ["*Test*", "{Integration"]))
+        self.assertEqual(message, "mutation.own_test_forbidden[1]: bad glob \"{Integration\": a '{' without its '}'")
+        message = self.error(doc("mutation.own_test_forbidden", ["*" + chr(0) + "*"]))
+        self.assertEqual(message, "mutation.own_test_forbidden[0]: has a control character")
+
+
+class OwnTestTemplateTest(ValidateCase):
+    def test_a_file_name_with_the_stem(self):
+        for value in ("{stem}Test{ext}", "test_{stem}{ext}", "{stem}.spec.ts"):
+            with self.subTest(value=value):
+                validate(doc("mutation.own_test", value))
+
+    def test_stem_is_required(self):
+        self.assertEqual(self.error(doc("mutation.own_test", "Test{ext}")), "mutation.own_test: must contain {stem}")
+
+    def test_no_folder(self):
+        message = "mutation.own_test: must be a file name, without / or \\ or a control character"
+        for value in ("support/{stem}Test{ext}", "support\\{stem}Test{ext}", "../{stem}Test{ext}"):
+            with self.subTest(value=value):
+                self.assertEqual(self.error(doc("mutation.own_test", value)), message)
+
+
+class NeverInternalErrorTest(ValidateCase):
+    """A value Python cannot handle the plain way is a configuration error, never a crash."""
+
+    def test_huge_integer_where_a_number_is_expected(self):
+        huge = 16**5000 - 1  # more digits than int-to-str conversion allows, more than a float holds
+        self.assertEqual(
+            self.error(doc("coverage.floor.line", huge)), f"coverage.floor.line: must be 1 or less, got {hex(huge)}"
+        )
+        self.assertEqual(
+            self.error(doc("duration.warn_s", -(10**400))), f"duration.warn_s: must be greater than 0, got {-(10**400)}"
+        )
+        validate(doc("duration.warn_s", 10**400))
+        self.assertIn("unsupported schema 0xfff", self.error({"schema": huge}))
+
+    def test_regular_expression_that_overflows(self):
+        for pattern in ("x{4294967296}", "(" * 2000 + ")" * 2000):
+            with self.subTest(pattern=pattern[:20]):
+                message = self.error(doc("language[].skip_patterns", [pattern]))
+                self.assertTrue(
+                    message.startswith("language[0].skip_patterns[0]: not a valid regular expression: "), message
+                )
 
 
 class LoadTest(unittest.TestCase):
@@ -484,6 +575,40 @@ class LoadTest(unittest.TestCase):
         with self.assertRaises(tomllib.TOMLDecodeError) as ctx:
             tomllib.loads(text)
         self.assertEqual(str(self.error()), f"muster.toml: invalid TOML: {ctx.exception}")
+
+    def test_toml_that_python_cannot_hold_is_invalid_toml(self):
+        cases = [
+            (b"schema = " + b"1" * 5000 + b"\n", "muster.toml: invalid TOML: "),
+            (b"x = " + b"[" * 5000 + b"]" * 5000 + b"\n", "muster.toml: invalid TOML: "),
+            (
+                b"[coverage.floor]\nline = 0x" + b"f" * 5000 + b"\n",
+                "muster.toml: coverage.floor.line: must be 1 or less, got 0xfff",
+            ),
+        ]
+        for text, prefix in cases:
+            with self.subTest(text=text[:20]):
+                self.write("muster.toml", text)
+                message = str(self.error())
+                self.assertTrue(message.startswith(prefix), message[:200])
+
+    def test_escaped_control_character_in_a_path(self):
+        self.write("muster.toml", b'[policy]\nsnapshot = "build/snap\\u0000shot.json"\n')
+        self.assertEqual(
+            str(self.error()),
+            "muster.toml: policy.snapshot: must be a path relative to the repository root with / separators;"
+            " it has a control character",
+        )
+
+    def test_file_name_in_another_case_is_not_found(self):
+        self.write("muster.toml", b"schema = 1\n")
+        self.write("profile/muster.toml", b"schema = 1\n")
+        self.assertEqual(str(self.error("MUSTER.TOML")), "MUSTER.TOML: not found")
+        self.assertEqual(str(self.error("Profile/muster.toml")), "Profile/muster.toml: not found")
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "elsewhere.toml"
+        outside.write_bytes(b"schema = 1\n")
+        other_case = outside.with_name("ELSEWHERE.toml")
+        self.assertEqual(str(self.error(str(other_case))), f"{other_case}: not found")
+        self.assertEqual(load(self.root, "profile/../muster.toml").name, "profile/../muster.toml")
 
     def test_invalid_value_names_the_file(self):
         self.write("muster.toml", b"[zones]\nexemption_max_days = -1\n")

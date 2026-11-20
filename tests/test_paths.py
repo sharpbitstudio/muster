@@ -4,12 +4,13 @@ Every tree is built in a temporary folder.
 """
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from muster.config import Config, ConfigError
-from muster.paths import exists_exact, normalize, root_of, source_sets, walk
+from muster.paths import exists_exact, is_link, normalize, root_of, source_sets, walk
 
 
 class TreeCase(unittest.TestCase):
@@ -65,6 +66,29 @@ class WalkTest(TreeCase):
             self.skipTest("cannot create a symbolic link here")
         self.assertEqual(walk(self.root, "source.roots", ["src"]), ["src/main.py"])
 
+    def junction(self, target: str, link: str) -> None:
+        _winapi = __import__("_winapi")  # Windows only; a junction needs no privilege
+        _winapi.CreateJunction(str(self.root / target), str(self.root / link))
+
+    @unittest.skipUnless(sys.platform == "win32", "junctions exist only on Windows")
+    def test_junction_below_a_root_is_not_followed(self):
+        self.make("src/main.py", "elsewhere/other.py", "elsewhere/deeper/more.py")
+        self.junction("elsewhere", "src/linked")
+        self.assertTrue(is_link(str(self.root / "src" / "linked")))
+        self.assertEqual(walk(self.root, "source.roots", ["src"]), ["src/main.py"])
+
+    @unittest.skipUnless(sys.platform == "win32", "junctions exist only on Windows")
+    def test_root_that_is_a_junction_is_walked(self):
+        self.make("elsewhere/other.py")
+        self.junction("elsewhere", "linked")
+        self.assertEqual(walk(self.root, "source.roots", ["linked"]), ["linked/other.py"])
+
+    def test_plain_folder_and_file_are_no_links(self):
+        self.make("src/main.py")
+        self.assertFalse(is_link(str(self.root / "src")))
+        self.assertFalse(is_link(str(self.root / "src" / "main.py")))
+        self.assertFalse(is_link(str(self.root / "gone")))
+
 
 class SourceSetsTest(TreeCase):
     def test_include_exclude_generated(self):
@@ -107,11 +131,14 @@ class SourceSetsTest(TreeCase):
         self.make("src/Tool.PY", "src/main.py")
         self.assertEqual(source_sets(self.config(roots=["src"], include=["**/*.py"])).sources, ["src/main.py"])
 
-    def test_bad_glob(self):
-        self.make("src/main.py")
-        with self.assertRaises(ConfigError) as caught:
-            source_sets(self.config(roots=["src"], include=["**/*.py"], generated=["src/{gen"]))
-        self.assertIn("source.generated[0]: bad glob", str(caught.exception))
+    def test_missing_folder_deferred(self):
+        self.make("src/main.py", "tests/test_main.py")
+        sets = source_sets(self.config(roots=["gone", "src"], tests=["tests"], include=["**/*.py"]), defer=True)
+        self.assertEqual((sets.sources, sets.tests), (["src/main.py"], frozenset({"tests/test_main.py"})))
+        self.assertEqual(str(sets.error), "source.roots[0]: folder gone does not exist")
+        with self.assertRaises(ConfigError):
+            source_sets(self.config(roots=["gone", "src"], include=["**/*.py"]))
+        self.assertIsNone(source_sets(self.config(roots=["src"], include=["**/*.py"]), defer=True).error)
 
 
 class ExistsExactTest(TreeCase):

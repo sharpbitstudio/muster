@@ -2,19 +2,17 @@
 
 `**` as a whole segment matches zero or more segments, `*` matches within a segment, `{a,b}` is an
 alternation (not nested), and every other character is literal. Matching is case-sensitive and
-covers the whole path. The zone files have their own, stricter grammar (see muster.zones).
+covers the whole path. The zone files have their own, stricter grammar (see muster.zones). The
+profile is checked when it is read (muster.config), so a glob matched here is well-formed.
 """
 
 from __future__ import annotations
 
 import functools
-import json
 import re
 
-from muster.config import ConfigError
 
-
-def _alternatives(glob: str) -> list[str]:
+def _expand(glob: str) -> list[str]:
     """Every alternative of `glob` with each `{a,b}` group expanded, left to right."""
     out = [""]
     rest = glob
@@ -48,23 +46,18 @@ def _regex(alternative: str) -> str:
     return "".join(parts)
 
 
+def alternatives(glob: str) -> list[str]:
+    """Every alternative of `glob`, left to right. A malformed glob (bad braces, or a `**` that is
+    not a whole segment) is a ValueError that says what is wrong."""
+    expanded = _expand(glob)
+    for alternative in expanded:
+        _regex(alternative)
+    return expanded
+
+
 @functools.lru_cache(maxsize=None)
 def _compile(glob: str) -> re.Pattern[str]:
-    return re.compile("|".join(f"(?:{_regex(alt)})" for alt in _alternatives(glob)), re.DOTALL)
-
-
-def compile_glob(key: str, glob: str) -> re.Pattern[str]:
-    """The compiled glob; a malformed one is a ConfigError naming the key and the glob."""
-    try:
-        return _compile(glob)
-    except ValueError as exc:
-        raise ConfigError(f"{key}: bad glob {json.dumps(glob)}: {exc}") from None
-
-
-def check_globs(key: str, globs: list[str]) -> None:
-    """Raises ConfigError for the first malformed glob of a list."""
-    for i, glob in enumerate(globs):
-        compile_glob(f"{key}[{i}]", glob)
+    return re.compile("|".join(f"(?:{_regex(alt)})" for alt in _expand(glob)), re.DOTALL)
 
 
 def matches(glob: str, path: str) -> bool:
