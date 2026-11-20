@@ -26,10 +26,11 @@ Synthetic globs and relative paths also use folders whose names have more than o
 
 ## Checks
 
-CI runs three checks:
+CI runs four checks:
 
 - **gitleaks**, on every push and every pull request: over every fetched ref, every object and the working tree;
 - **hygiene**, `python tools/hygiene.py`, on every push and every pull request: over the tree and over the commits of the change; run it locally before committing, and with `--range origin/main..HEAD` before pushing;
+- **tests**, on every push and every pull request: the unit tests on Linux and Windows for each supported Python version from 3.11 on; the job `tests` passes only when every combination passed;
 - **identity**, on pushes to branches other than `main` and on pull requests from branches of this repository: every commit must carry the project's commit identity.
 
 ## Identity
