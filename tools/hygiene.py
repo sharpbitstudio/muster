@@ -273,7 +273,9 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # allowed, and an opening quote, single or double, also escaped by a
 # backslash as in a Python or JSON string. A fine value must be closed by
 # the same quote, escaped the same way (XML_CLOSE), so any other value,
-# unclosed or closed otherwise, counts. This file does not match the
+# unclosed or closed otherwise, counts. The same shape outside XML, such as
+# an assignment in TOML or in a shell script, counts too, and so does a
+# placeholder value such as one in braces. This file does not match the
 # patterns itself: no attribute name in it is followed by "=" and a quote,
 # and the sessioninfo element name never comes right after a "<".
 def xml_attr(name: str) -> str:
