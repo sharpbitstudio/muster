@@ -1,15 +1,28 @@
-"""Tests of muster.report: annotations, the verdict state and the Markdown summary.
+"""Tests of muster.report: annotations, the verdict state, the Markdown summary and the JSON
+envelope.
 
 Non-ASCII and control characters are written as escapes.
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from muster import report
-from muster.report import Report, cap_markdown, escape_data, escape_property, md_path, one_line, write_markdown
+from muster import __version__, report
+from muster.report import (
+    Report,
+    cap_markdown,
+    envelope,
+    escape_data,
+    escape_property,
+    json_text,
+    md_path,
+    one_line,
+    write_json,
+    write_markdown,
+)
 
 NOTICE = "\n\n_Report truncated: the step summary is capped at ~900 KiB._\n"
 NOTICE_BYTES = len(NOTICE.encode("utf-8"))
@@ -196,6 +209,193 @@ class ReportErroredTest(unittest.TestCase):
         rep.violated("Floor", "below")
         rep.errored("Input", "missing")
         self.assertTrue(rep.violation)
+
+
+class ReportListsTest(unittest.TestCase):
+    def test_violated_keeps_messages(self):
+        rep = Report("coverage")
+        rep.violated("Floor", "line below")
+        rep.violated("Delta", "branch below")
+        self.assertEqual(rep.violations, ["line below", "branch below"])
+        self.assertEqual(rep.errors, [])
+
+    def test_errored_keeps_messages(self):
+        rep = Report("coverage", strict=True)
+        rep.errored("Input", "missing report")
+        self.assertEqual(rep.errors, ["missing report"])
+        self.assertEqual(rep.violations, [])
+
+    def test_warned_only_by_warning_or_error_annotations(self):
+        rep = Report("coverage")
+        rep.annotate("notice", "Info", "fine")
+        self.assertFalse(rep.warned)
+        rep.annotate("warning", "Slow", "close to the budget")
+        self.assertTrue(rep.warned)
+
+    def test_evaluated_by_default(self):
+        self.assertTrue(Report("coverage").evaluated)
+
+
+class SectionVerdictTest(unittest.TestCase):
+    def test_errors_give_error(self):
+        rep = Report("coverage")
+        rep.errored("Input", "missing")
+        self.assertEqual(rep.section_verdict(), "error")
+
+    def test_exit_two_or_three_gives_error(self):
+        for code in (2, 3):
+            with self.subTest(code=code):
+                self.assertEqual(Report("coverage").section_verdict(code), "error")
+
+    def test_errors_win_over_not_evaluated(self):
+        rep = Report("coverage", evaluated=False)
+        rep.errored("Input", "missing")
+        self.assertEqual(rep.section_verdict(), "error")
+
+    def test_not_evaluated(self):
+        self.assertEqual(Report("coverage", evaluated=False).section_verdict(), "not-evaluated")
+
+    def test_not_evaluated_wins_over_a_strict_violation(self):
+        rep = Report("coverage", strict=True, evaluated=False)
+        rep.violated("Delta", "no merge base")
+        self.assertEqual(rep.section_verdict(), "not-evaluated")
+        self.assertTrue(rep.violation)
+
+    def test_strict_violation_fails(self):
+        rep = Report("coverage", strict=True)
+        rep.violated("Floor", "below")
+        self.assertEqual(rep.section_verdict(), "fail")
+
+    def test_violation_without_strict_warns(self):
+        rep = Report("coverage")
+        rep.violated("Floor", "below")
+        self.assertEqual(rep.section_verdict(), "warn")
+
+    def test_warning_annotation_warns(self):
+        rep = Report("duration", strict=True)
+        rep.annotate("warning", "Duration", "above the warning threshold")
+        self.assertFalse(rep.violation)
+        self.assertEqual(rep.section_verdict(), "warn")
+
+    def test_error_annotation_warns(self):
+        rep = Report("duration")
+        rep.annotate("error", "Duration", "above the error threshold")
+        self.assertEqual(rep.section_verdict(), "warn")
+
+    def test_notice_annotation_passes(self):
+        rep = Report("loc")
+        rep.annotate("notice", "Budget", "within budget")
+        self.assertEqual(rep.section_verdict(), "pass")
+
+    def test_pass(self):
+        self.assertEqual(Report("coverage").section_verdict(0), "pass")
+        self.assertEqual(Report("coverage").section_verdict(1), "pass")
+
+
+class SectionTest(unittest.TestCase):
+    def test_shape(self):
+        rep = Report("coverage", strict=True, verdict="coverage: FAIL", data={"line": 0.5})
+        rep.violated("Floor", "line 50% below 80%")
+        self.assertEqual(
+            rep.section(),
+            {
+                "name": "coverage",
+                "strict": True,
+                "violation": True,
+                "verdict": "fail",
+                "verdict_text": "coverage: FAIL",
+                "violations": ["line 50% below 80%"],
+                "errors": [],
+                "data": {"line": 0.5},
+            },
+        )
+
+    def test_exit_code_reaches_the_verdict(self):
+        self.assertEqual(Report("coverage").section(3)["verdict"], "error")
+
+
+def section(name: str, verdict: str) -> Report:
+    """A Report whose state gives the wanted verdict."""
+    rep = Report(name, strict=verdict == "fail", evaluated=verdict != "not-evaluated")
+    if verdict in ("fail", "warn"):
+        rep.violated("Gate", "below")
+    elif verdict == "error":
+        rep.errored("Input", "missing")
+    return rep
+
+
+class EnvelopeTest(unittest.TestCase):
+    def test_shape_without_sections(self):
+        self.assertEqual(
+            envelope("version", exit_code=0),
+            {
+                "schema_version": 1,
+                "tool": {"name": "muster", "version": __version__},
+                "command": "version",
+                "commit": None,
+                "base": None,
+                "verdict": "pass",
+                "exit_code": 0,
+                "error": None,
+                "sections": [],
+                "flags": [],
+            },
+        )
+
+    def test_commit_sections_and_error(self):
+        rep = section("coverage", "warn")
+        env = envelope("coverage", exit_code=2, commit="ab" * 20, sections=[rep], error=("config", "bad key"))
+        self.assertEqual(env["commit"], "ab" * 20)
+        self.assertEqual(env["error"], {"kind": "config", "message": "bad key"})
+        self.assertEqual(env["verdict"], "error")
+        self.assertEqual(env["sections"], [rep.section(2)])
+        self.assertEqual(env["sections"][0]["verdict"], "error")
+
+    def test_single_section_verdict(self):
+        for verdict in ("pass", "warn", "fail", "not-evaluated", "error"):
+            with self.subTest(verdict=verdict):
+                env = envelope("coverage", exit_code=0, sections=[section("coverage", verdict)])
+                self.assertEqual(env["verdict"], verdict)
+
+    def test_worst_of_several_sections(self):
+        order = ["pass", "not-evaluated", "warn", "fail", "error"]
+        for i, worse in enumerate(order):
+            for better in order[:i]:
+                with self.subTest(worse=worse, better=better):
+                    sections = [section("loc", better), section("coverage", worse), section("tests", better)]
+                    self.assertEqual(envelope("check", exit_code=0, sections=sections)["verdict"], worse)
+
+    def test_exit_two_or_three_is_error(self):
+        for code in (2, 3):
+            with self.subTest(code=code):
+                self.assertEqual(envelope("version", exit_code=code)["verdict"], "error")
+
+    def test_error_set_is_error(self):
+        env = envelope("coverage", exit_code=0, sections=[section("coverage", "pass")], error=("usage", "x"))
+        self.assertEqual(env["verdict"], "error")
+
+
+class JsonTextTest(unittest.TestCase):
+    def test_indent_ascii_and_final_newline(self):
+        text = json_text({"name": "caf" + E_ACUTE, "list": [1]})
+        self.assertEqual(text, '{\n  "name": "caf\\u00e9",\n  "list": [\n    1\n  ]\n}\n')
+        self.assertEqual(json.loads(text), {"name": "caf" + E_ACUTE, "list": [1]})
+
+
+class WriteJsonTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_replaces_file_with_lf_text(self):
+        path = self.root / "out.json"
+        path.write_bytes(b"old content that is longer\r\n")
+        write_json(path, '{\n  "a": 1\n}\n')
+        self.assertEqual(path.read_bytes(), b'{\n  "a": 1\n}\n')
+
+    def test_creates_parent_folders(self):
+        path = self.root / "nested" / "out.json"
+        write_json(path, "{}\n")
+        self.assertEqual(path.read_bytes(), b"{}\n")
 
 
 if __name__ == "__main__":
