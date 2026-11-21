@@ -18,10 +18,11 @@ MINIMUM = (3, 11)
 NEGATIVE_NUMBER = re.compile(r"-\d+$|-\d*\.\d+$")
 # The commands and every option string of the command line, at every level (tests keep them equal
 # to those of muster.cli).
-COMMANDS = ("version", "policy")
+COMMANDS = ("version", "policy", "coverage")
 OPTIONS = (
     "-h", "--help", "--repo", "--config", "--format", "--json-out", "--strict", "--strict-only",
-    "--fail-on-error", "--summary-file", "--github", "--snapshot", "--zones-out",
+    "--fail-on-error", "--summary-file", "--github", "--snapshot", "--zones-out", "--base", "--diff-file",
+    "--no-freshness", "--today",
 )
 # The options before the command word; each takes a value.
 GLOBAL_OPTIONS = ("--repo", "--config")

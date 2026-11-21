@@ -360,28 +360,30 @@ def _snapshot_problem(document: object) -> str | None:
     return None
 
 
-def read_snapshot(path: Path) -> dict:
+def read_snapshot(path: Path, *, name: str | None = None) -> dict:
     """The snapshot in `path`, checked against the shape that --snapshot writes; a key it does not
     know is allowed. A missing file raises FileNotFoundError, for the caller to judge; any other
     problem (unreadable, not UTF-8, not JSON, NaN or an infinity, nested too deeply, a missing key,
-    a value of the wrong type, another schema) is a ReportError that names the file."""
+    a value of the wrong type, another schema) is a ReportError that names the file: `name`, by
+    default the path."""
+    name = str(path) if name is None else name
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise ReportError(f"{path}: cannot read the snapshot: {exc.strerror or exc}") from None
+        raise ReportError(f"{name}: cannot read the snapshot: {exc.strerror or exc}") from None
     try:
         document = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
     except UnicodeDecodeError as exc:
-        raise ReportError(f"{path}: the snapshot is not valid UTF-8 (byte {exc.start})") from None
+        raise ReportError(f"{name}: the snapshot is not valid UTF-8 (byte {exc.start})") from None
     except ValueError as exc:
-        raise ReportError(f"{path}: the snapshot is not valid JSON: {exc}") from None
+        raise ReportError(f"{name}: the snapshot is not valid JSON: {exc}") from None
     except RecursionError:
-        raise ReportError(f"{path}: the snapshot is nested too deeply") from None
+        raise ReportError(f"{name}: the snapshot is nested too deeply") from None
     problem = _snapshot_problem(document)
     if problem:
-        raise ReportError(f"{path}: not a snapshot: {problem}")
+        raise ReportError(f"{name}: not a snapshot: {problem}")
     return document
 
 

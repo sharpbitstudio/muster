@@ -1,6 +1,6 @@
 # Testing policy
 
-This is the policy muster checks. It is the same for every repository; each repository fits it to its own code through its profile (point 12). Where a point names a threshold, the value comes from that profile.
+This is the policy muster checks. It is the same for every repository; each repository fits it to its own code through its profile (point 12). Where a point names a threshold, the profile sets its value; where the profile does not, the default named in that point applies.
 
 ## 1. Test a behaviour once, at the lowest level that can see it
 
@@ -19,10 +19,10 @@ Each source file belongs to a critical zone or to a standard package. The zones 
 
 ## 4. A global floor and a delta gate on critical lines
 
-Coverage is a floor for critical zones, never a goal of its own.
+Coverage is a floor for critical zones, never a goal of its own. By default the floor is 80% line and 65% branch coverage, and the delta gate 80% line and 80% branch coverage; the profile changes them.
 
 - **Floor:** line and branch coverage of the whole code base stays above a global minimum.
-- **Delta:** lines changed in critical files since the merge base must be covered above a stricter threshold. Standard packages have no delta gate.
+- **Delta:** lines changed in critical files since the merge base must be covered above a threshold of its own. Standard packages have no delta gate.
 - **Exemptions:** an exemption names exactly one source file, which must be critical, with a reason and an expiry date at most 30 days ahead. An expired exemption fails the check on its own, without any code change. The fix is to extend it, with a new reason, or to remove it.
 
 ## 5. A duration budget with warn and error thresholds
