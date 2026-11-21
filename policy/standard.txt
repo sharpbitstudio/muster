@@ -1,2 +1,3 @@
 # Standard packages of muster, relative to src: every other module of the muster package.
 muster/*
+muster/adapters/*

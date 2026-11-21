@@ -1,0 +1,498 @@
+"""Tests of muster.adapters: the source resolver and the JaCoCo, JUnit and timing adapters.
+
+Every tree and every report is built in a temporary folder. Non-ASCII and control characters are
+built at run time with chr().
+"""
+
+import datetime as dt
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+from muster.adapters import SourceResolver, jacoco, junit, timing
+from muster.config import ConfigError
+from muster.report import ReportError
+
+MAIN = "src/main/java"
+EXTRA = "gen/main/java"
+ENGINE = "org/example/app/billing/internal/ledger/Engine.java"
+TOKEN = "org/example/app/auth/Token.java"
+PARSER = "org/example/app/codec/KeyParser.java"
+DISPATCHER = "org/example/app/queue/Dispatcher.java"
+UTC = dt.timezone.utc
+
+
+def jacoco_xml(body: str, sessions: str = '<sessioninfo id="localhost-1a2b" start="1000" dump="5000"/>') -> str:
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n<report name="app">{sessions}{body}</report>\n'
+
+
+def sourcefile(name: str, inner: str = "") -> str:
+    return f'<sourcefile name="{name}">{inner}</sourcefile>'
+
+
+def package(name: str, *files: str) -> str:
+    return f'<package name="{name}">{"".join(files)}</package>'
+
+
+class AdapterCase(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+
+    def make(self, *paths: str) -> None:
+        for path in paths:
+            self.write(path, "")
+
+    def write(self, path: str, content: str | bytes) -> Path:
+        file = self.root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            file.write_bytes(content)
+        else:
+            file.write_text(content, encoding="utf-8", newline="\n")
+        return file
+
+    def resolver(self, roots: list[str], classified: list[str] | None = None) -> SourceResolver:
+        return SourceResolver(self.root, roots, frozenset(classified or []))
+
+    def assertNamedOnly(self, message: str, name: str) -> None:
+        """The message names the file by the given name, not by its absolute path."""
+        self.assertIn(name, message)
+        self.assertNotIn(self.root.as_posix(), message)
+        self.assertNotIn(str(self.root), message)
+
+
+class SourceResolverTest(AdapterCase):
+    def test_one_root(self):
+        self.make(f"{MAIN}/{TOKEN}", f"{MAIN}/{ENGINE}")
+        resolver = self.resolver([MAIN])
+        self.assertEqual(resolver.resolve(TOKEN), [f"{MAIN}/{TOKEN}"])
+        self.assertEqual(resolver.resolve(ENGINE), [f"{MAIN}/{ENGINE}"])
+
+    def test_two_roots(self):
+        self.make(f"{MAIN}/{TOKEN}", f"{EXTRA}/{PARSER}")
+        resolver = self.resolver([MAIN, EXTRA])
+        self.assertEqual(resolver.resolve(TOKEN), [f"{MAIN}/{TOKEN}"])
+        self.assertEqual(resolver.resolve(PARSER), [f"{EXTRA}/{PARSER}"])
+
+    def test_name_under_two_roots(self):
+        self.make(f"{MAIN}/{TOKEN}", f"{EXTRA}/{TOKEN}")
+        resolver = self.resolver([MAIN, EXTRA])
+        self.assertEqual(resolver.resolve(TOKEN), [f"{EXTRA}/{TOKEN}", f"{MAIN}/{TOKEN}"])
+
+    def test_the_same_root_twice_is_one_path(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        self.assertEqual(self.resolver([MAIN, f"./{MAIN}/"]).resolve(TOKEN), [f"{MAIN}/{TOKEN}"])
+
+    def test_name_under_no_root(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        self.assertEqual(self.resolver([MAIN]).resolve(DISPATCHER), [])
+
+    def test_exact_case(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        resolver = self.resolver([MAIN])
+        self.assertEqual(resolver.resolve(TOKEN.replace("Token", "token")), [])
+        self.assertEqual(resolver.resolve(TOKEN.replace("auth", "Auth")), [])
+
+    def test_missing_root_is_a_config_error(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        with self.assertRaises(ConfigError) as caught:
+            self.resolver([MAIN, EXTRA])
+        self.assertIn(EXTRA, str(caught.exception))
+
+
+class JacocoLoadTest(AdapterCase):
+    def setUp(self):
+        super().setUp()
+        self.make(f"{MAIN}/{ENGINE}", f"{MAIN}/{TOKEN}", f"{MAIN}/Launcher.java", f"{MAIN}/{PARSER}")
+        self.classified = [f"{MAIN}/{ENGINE}", f"{MAIN}/{TOKEN}", f"{MAIN}/Launcher.java"]
+
+    def load(self, xml: str, roots: list[str] | None = None) -> jacoco.CoverageReport:
+        path = self.write("build/reports/jacoco.xml", xml)
+        return jacoco.load(path, self.resolver(roots or [MAIN], self.classified))
+
+    def test_valid_report(self):
+        engine = sourcefile(
+            "Engine.java",
+            '<line nr="3" mi="0" ci="4" mb="0" cb="0"/>'
+            '<line nr="7" mi="2" ci="1" mb="1" cb="1"/>'
+            '<counter type="INSTRUCTION" missed="2" covered="5"/>'
+            '<counter type="LINE" missed="1" covered="1"/>'
+            '<counter type="BRANCH" missed="1" covered="1"/>',
+        )
+        token = sourcefile("Token.java", '<line nr="1" mi="1" ci="0" mb="0" cb="0"/>')
+        launcher = sourcefile("Launcher.java", '<counter type="LINE" missed="0" covered="2"/>')
+        sessions = (
+            '<sessioninfo id="localhost-1a2b" start="1000" dump="5000"/>'
+            '<sessioninfo id="localhost-3c4d" start="6000" dump="9000"/>'
+        )
+        body = (
+            '<group name="app">'
+            + package("org/example/app/billing/internal/ledger", engine)
+            + "</group>"
+            + package("org/example/app/auth", token)
+            + package("", launcher)
+            + package("org/example/app/codec", sourcefile("KeyParser.java"))
+            + package("org/example/app/queue", sourcefile("Dispatcher.java"))
+        )
+        report = self.load(jacoco_xml(body, sessions))
+        self.assertEqual(report.sessions, [(1000, 5000), (6000, 9000)])
+        self.assertEqual(report.sourcefiles, 5)
+        self.assertEqual(report.unresolved, [DISPATCHER])
+        self.assertEqual(report.excluded, [f"{MAIN}/{PARSER}"])
+        self.assertEqual(sorted(report.files), [f"{MAIN}/Launcher.java", f"{MAIN}/{TOKEN}", f"{MAIN}/{ENGINE}"])
+        self.assertEqual(
+            report.files[f"{MAIN}/{ENGINE}"],
+            jacoco.FileCoverage({3: (0, 4, 0, 0), 7: (2, 1, 1, 1)}, (1, 1), (1, 1)),
+        )
+        self.assertEqual(report.files[f"{MAIN}/{TOKEN}"], jacoco.FileCoverage({1: (1, 0, 0, 0)}, (0, 0), (0, 0)))
+        self.assertEqual(report.files[f"{MAIN}/Launcher.java"], jacoco.FileCoverage({}, (0, 2), (0, 0)))
+
+    def test_counters_are_kept_as_given(self):
+        # The LINE counter says 5 missed, 9 covered; the single <line> says otherwise. Both are kept.
+        token = sourcefile(
+            "Token.java",
+            '<line nr="4" mi="3" ci="0" mb="2" cb="0"/>'
+            '<counter type="LINE" missed="5" covered="9"/>'
+            '<counter type="BRANCH" missed="0" covered="6"/>',
+        )
+        coverage = self.load(jacoco_xml(package("org/example/app/auth", token))).files[f"{MAIN}/{TOKEN}"]
+        self.assertEqual(coverage.lines, {4: (3, 0, 2, 0)})
+        self.assertEqual(coverage.line, (5, 9))
+        self.assertEqual(coverage.branch, (0, 6))
+
+    def test_report_without_sourcefiles(self):
+        report = self.load(jacoco_xml(package("org/example/app/auth")))
+        self.assertEqual(report.sourcefiles, 0)
+        self.assertEqual(report.files, {})
+        self.assertEqual((report.unresolved, report.excluded), ([], []))
+        self.assertEqual(report.sessions, [(1000, 5000)])
+
+    def test_name_under_two_roots_is_a_config_error(self):
+        self.make(f"{EXTRA}/{TOKEN}")
+        with self.assertRaises(ConfigError) as caught:
+            self.load(jacoco_xml(package("org/example/app/auth", sourcefile("Token.java"))), [MAIN, EXTRA])
+        message = str(caught.exception)
+        for part in (TOKEN, f"{MAIN}/{TOKEN}", f"{EXTRA}/{TOKEN}"):
+            self.assertIn(part, message)
+
+    def test_name_in_another_case_is_unresolved(self):
+        report = self.load(jacoco_xml(package("org/example/app/auth", sourcefile("token.java"))))
+        self.assertEqual(report.unresolved, ["org/example/app/auth/token.java"])
+        self.assertEqual(report.files, {})
+
+
+class JacocoBrokenTest(AdapterCase):
+    def test_broken_inputs(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        resolver = self.resolver([MAIN], [f"{MAIN}/{TOKEN}"])
+
+        def token(inner: str) -> str:
+            return jacoco_xml(package("org/example/app/auth", sourcefile("Token.java", inner)))
+
+        def named(folder: str) -> str:
+            return jacoco_xml(package(folder, sourcefile("Token.java")))
+
+        cases = {
+            "not XML": "<report><package",
+            "empty file": "",
+            "not a report": '<testsuite name="app"/>',
+            "unknown encoding": '<?xml version="1.0" encoding="no-such-codec"?><report/>',
+            "counter missed -1": token('<counter type="LINE" missed="-1" covered="0"/>'),
+            "counter covered 1.5": token('<counter type="LINE" missed="0" covered="1.5"/>'),
+            "counter covered +3": token('<counter type="BRANCH" missed="0" covered="+3"/>'),
+            "counter covered with spaces": token('<counter type="LINE" missed="0" covered=" 3"/>'),
+            "counter covered missing": token('<counter type="LINE" missed="0"/>'),
+            "counter twice": token('<counter type="LINE" missed="0" covered="1"/>' * 2),
+            "line nr missing": token('<line mi="0" ci="1" mb="0" cb="0"/>'),
+            "line ci non-ASCII digit": token(f'<line nr="1" mi="0" ci="{chr(0x0663)}" mb="0" cb="0"/>'),
+            "line twice": token('<line nr="1" mi="0" ci="1" mb="0" cb="0"/>' * 2),
+            "session start missing": jacoco_xml("", '<sessioninfo id="localhost-1a2b" dump="5000"/>'),
+            "session dump x": jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="1000" dump="x"/>'),
+            "session start 1_0": jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="1_0" dump="20"/>'),
+            "package name missing": jacoco_xml(f"<package>{sourcefile('Token.java')}</package>"),
+            "package empty segment": named("org//example/app/auth"),
+            "package dot segment": named("org/./example/app/auth"),
+            "package dotdot segment": named("org/../example/app/auth"),
+            "package trailing slash": named("org/example/app/auth/"),
+            "package backslash": named("org\\example\\app\\auth"),
+            "package leading slash": named("/org/example/app/auth"),
+            "package NUL reference": named("org/example&#0;/app/auth"),
+            "package raw NUL": named(f"org/example{chr(0)}/app/auth"),
+            "sourcefile name missing": jacoco_xml(package("org/example/app/auth", "<sourcefile/>")),
+            "sourcefile empty": jacoco_xml(package("org/example/app/auth", sourcefile(""))),
+            "sourcefile with slash": jacoco_xml(package("org/example/app", sourcefile("auth/Token.java"))),
+            "sourcefile dotdot": jacoco_xml(package("org/example/app/auth", sourcefile(".."))),
+            "sourcefile dot": jacoco_xml(package("org/example/app/auth", sourcefile("."))),
+            "sourcefile backslash": jacoco_xml(package("org/example/app", sourcefile("auth\\Token.java"))),
+            "the same name twice": jacoco_xml(
+                package("org/example/app/auth", sourcefile("Token.java"))
+                + '<group name="more">'
+                + package("org/example/app/auth", sourcefile("Token.java"))
+                + "</group>"
+            ),
+        }
+        for case, content in cases.items():
+            with self.subTest(case):
+                path = self.write("build/reports/jacoco.xml", content)
+                with self.assertRaises(ReportError) as caught:
+                    jacoco.load(path, resolver)
+                self.assertIn(path.as_posix(), str(caught.exception))
+
+    def test_a_folder_instead_of_a_file(self):
+        folder = self.root / "build" / "jacoco.xml"
+        folder.mkdir(parents=True)
+        (self.root / MAIN).mkdir(parents=True)
+        with self.assertRaises(ReportError) as caught:
+            jacoco.load(folder, self.resolver([MAIN]))
+        self.assertIn(folder.as_posix(), str(caught.exception))
+
+    def test_messages_name_the_attribute(self):
+        (self.root / MAIN).mkdir(parents=True)
+        token = sourcefile("Token.java", '<line nr="1" mi="0" ci="1" mb="0"/>')
+        path = self.write("jacoco.xml", jacoco_xml(package("org/example/app/auth", token)))
+        with self.assertRaises(ReportError) as caught:
+            jacoco.load(path, self.resolver([MAIN]))
+        self.assertIn("cb", str(caught.exception))
+
+    def test_given_name_replaces_the_path(self):
+        (self.root / MAIN).mkdir(parents=True)
+        path = self.write("build/reports/jacoco.xml", jacoco_xml(package("org/example/app/auth", sourcefile(".."))))
+        with self.assertRaises(ReportError) as caught:
+            jacoco.load(path, self.resolver([MAIN]), name="build/reports/jacoco.xml")
+        self.assertNamedOnly(str(caught.exception), "build/reports/jacoco.xml")
+
+
+class JacocoSessionsTest(AdapterCase):
+    def test_valid(self):
+        sessions = (
+            '<sessioninfo id="localhost-1a2b" start="1700000000000" dump="1700000060000"/>'
+            '<sessioninfo id="localhost-3c4d" start="-5" dump="0"/>'
+        )
+        path = self.write("jacoco.xml", jacoco_xml(package("org/example/app/auth", sourcefile("Token.java")), sessions))
+        self.assertEqual(jacoco.read_sessions(path), [(1700000000000, 1700000060000), (-5, 0)])
+
+    def test_no_sessions(self):
+        self.assertEqual(jacoco.read_sessions(self.write("jacoco.xml", jacoco_xml("", ""))), [])
+
+    def test_sources_are_not_resolved(self):
+        path = self.write("jacoco.xml", jacoco_xml(package("org/example/app", sourcefile("auth/Token.java"))))
+        self.assertEqual(jacoco.read_sessions(path), [(1000, 5000)])
+
+    def test_missing_attribute(self):
+        path = self.write("jacoco.xml", jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="1000"/>'))
+        with self.assertRaises(ReportError) as caught:
+            jacoco.read_sessions(path)
+        self.assertIn(path.as_posix(), str(caught.exception))
+        self.assertIn("dump", str(caught.exception))
+
+    def test_not_xml(self):
+        path = self.write("jacoco.xml", "<report")
+        with self.assertRaises(ReportError) as caught:
+            jacoco.read_sessions(path)
+        self.assertIn(path.as_posix(), str(caught.exception))
+
+    def test_given_name_replaces_the_path(self):
+        path = self.write("build/reports/jacoco.xml", jacoco_xml("", '<sessioninfo id="localhost-1a2b" dump="1"/>'))
+        with self.assertRaises(ReportError) as caught:
+            jacoco.read_sessions(path, name="build/reports/jacoco.xml")
+        self.assertNamedOnly(str(caught.exception), "build/reports/jacoco.xml")
+
+
+def suite_xml(name: str, timestamp: str | None, time: str | None = "1.5") -> str:
+    attributes = f'name="{name}" tests="1" hostname="localhost"'
+    if timestamp is not None:
+        attributes += f' timestamp="{timestamp}"'
+    if time is not None:
+        attributes += f' time="{time}"'
+    return f'<testsuite {attributes}><testcase name="works" time="0.1"/></testsuite>'
+
+
+class TimestampTest(unittest.TestCase):
+    def test_naive_is_utc(self):
+        self.assertEqual(junit.parse_timestamp("2026-11-10T08:15:30"), dt.datetime(2026, 11, 10, 8, 15, 30, tzinfo=UTC))
+
+    def test_fraction_with_z(self):
+        self.assertEqual(
+            junit.parse_timestamp("2026-11-10T08:15:30.250Z"),
+            dt.datetime(2026, 11, 10, 8, 15, 30, 250000, tzinfo=UTC),
+        )
+
+    def test_offset_is_the_same_instant(self):
+        value = junit.parse_timestamp("2026-11-10T10:15:30+02:00")
+        self.assertEqual(value, dt.datetime(2026, 11, 10, 8, 15, 30, tzinfo=UTC))
+        self.assertEqual(value.astimezone(UTC).hour, 8)
+
+    def test_other_formats_raise(self):
+        for text in ("10.11.2026", "2026-11-10", "2026-11-10 08:15:30", ""):
+            with self.subTest(text), self.assertRaises(ValueError):
+                junit.parse_timestamp(text)
+
+
+class JunitSuitesTest(AdapterCase):
+    PLAIN = "build/test-results/test/TEST-org.example.app.auth.TokenTest.xml"
+    WRAPPED = "build/test-results/test/TEST-all.xml"
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.PLAIN, suite_xml("org.example.app.auth.TokenTest", "2026-11-10T08:00:00", "2.5"))
+        self.write(
+            self.WRAPPED,
+            "<testsuites>"
+            + suite_xml("org.example.app.codec.KeyParserTest", "2026-11-10T08:00:01.500Z", "10")
+            + suite_xml("org.example.app.queue.DispatcherTest", None)
+            + suite_xml("org.example.app.billing.EngineTest", "2026-11-10T09:59:59+02:00", None)
+            + "</testsuites>",
+        )
+
+    def test_read_suites(self):
+        suites = junit.read_suites(self.root, [self.PLAIN, self.WRAPPED])
+        self.assertEqual(
+            [(s.name, s.file, s.start, s.seconds) for s in suites],
+            [
+                ("org.example.app.auth.TokenTest", self.PLAIN, dt.datetime(2026, 11, 10, 8, 0, 0, tzinfo=UTC), 2.5),
+                (
+                    "org.example.app.codec.KeyParserTest",
+                    self.WRAPPED,
+                    dt.datetime(2026, 11, 10, 8, 0, 1, 500000, tzinfo=UTC),
+                    10.0,
+                ),
+                (
+                    "org.example.app.billing.EngineTest",
+                    self.WRAPPED,
+                    dt.datetime(2026, 11, 10, 7, 59, 59, tzinfo=UTC),
+                    0.0,
+                ),
+            ],
+        )
+        self.assertEqual(suites[1].end, dt.datetime(2026, 11, 10, 8, 0, 11, 500000, tzinfo=UTC))
+
+    def test_span(self):
+        suites = junit.read_suites(self.root, [self.PLAIN, self.WRAPPED])
+        self.assertEqual(
+            junit.span(suites),
+            (
+                dt.datetime(2026, 11, 10, 7, 59, 59, tzinfo=UTC),
+                dt.datetime(2026, 11, 10, 8, 0, 11, 500000, tzinfo=UTC),
+                3,
+            ),
+        )
+
+    def test_span_of_no_suites(self):
+        self.assertIsNone(junit.span([]))
+
+    def test_suite_without_name(self):
+        self.write("results.xml", '<testsuite timestamp="2026-11-10T08:00:00"/>')
+        (suite,) = junit.read_suites(self.root, ["results.xml"])
+        self.assertEqual((suite.name, suite.seconds), ("", 0.0))
+
+    def test_time_forms(self):
+        for text, seconds in (("0", 0.0), ("1.5", 1.5), (".5", 0.5), ("2e-3", 0.002), ("3.", 3.0), ("1E2", 100.0)):
+            with self.subTest(text):
+                self.write("results.xml", suite_xml("org.example.app.auth.TokenTest", "2026-11-10T08:00:00", text))
+                (suite,) = junit.read_suites(self.root, ["results.xml"])
+                self.assertEqual(suite.seconds, seconds)
+
+    def test_broken_inputs(self):
+        def timed(text: str) -> str:
+            return suite_xml("org.example.app.auth.TokenTest", "2026-11-10T08:00:00", text)
+
+        cases = {
+            "not XML": "<testsuite",
+            "bad timestamp": suite_xml("org.example.app.auth.TokenTest", "10.11.2026"),
+            "timestamp out of range": suite_xml("org.example.app.auth.TokenTest", "2026-13-10T08:00:00"),
+            "time nan": timed("nan"),
+            "time inf": timed("inf"),
+            "time -1": timed("-1"),
+            "time 1_0": timed("1_0"),
+            "time abc": timed("abc"),
+            "time 1,5": timed("1,5"),
+            "time with a space": timed(" 1"),
+            "time empty": timed(""),
+            "time +1": timed("+1"),
+            "time overflows": timed("1e999"),
+            "time past the last date": timed("1e300"),
+            "time non-ASCII digit": timed(chr(0x0663)),
+        }
+        for case, content in cases.items():
+            with self.subTest(case):
+                self.write("results.xml", content)
+                with self.assertRaises(ReportError) as caught:
+                    junit.read_suites(self.root, [self.PLAIN, "results.xml"])
+                self.assertIn("results.xml", str(caught.exception))
+
+
+class TimingTest(AdapterCase):
+    RECORD = {"task": ":app:test", "start_ms": 1000, "end_ms": 9000, "outcome": "success", "failure": None}
+
+    def record(self, content: dict | str | bytes) -> Path:
+        if isinstance(content, dict):
+            content = json.dumps(content)
+        return self.write("build/timing.json", content)
+
+    def test_valid_record(self):
+        record = timing.load(self.record(dict(self.RECORD, extra=[1, 2])), ":app:test")
+        self.assertEqual(record, timing.TimingRecord(":app:test", 1000, 9000, "success", None))
+
+    def test_data_has_exactly_the_five_fields(self):
+        record = timing.load(self.record(dict(self.RECORD, extra={"key": "value"})))
+        self.assertEqual(record.data(), self.RECORD)
+
+    def test_optional_fields(self):
+        record = timing.load(self.record({"start_ms": 5, "end_ms": 5, "task": None}))
+        self.assertEqual(record, timing.TimingRecord(None, 5, 5, None, None))
+
+    def test_failure_text(self):
+        record = timing.load(self.record(dict(self.RECORD, outcome="failed", failure="2 tests failed")))
+        self.assertEqual((record.outcome, record.failure), ("failed", "2 tests failed"))
+
+    def test_broken_inputs(self):
+        def changed(**fields) -> dict:
+            return {key: value for key, value in dict(self.RECORD, **fields).items() if value is not ...}
+
+        cases = {
+            "not JSON": ("{", None, None),
+            "not UTF-8": (b'{"start_ms": 1, "end_ms": 2, "task": "\xff"}', None, None),
+            "NaN": ('{"start_ms": NaN, "end_ms": 2}', None, None),
+            "Infinity": ('{"start_ms": 1, "end_ms": Infinity}', None, None),
+            "-Infinity": ('{"start_ms": -Infinity, "end_ms": 2}', None, None),
+            "nested too deeply": ("[" * 100000 + "]" * 100000, None, None),
+            "top level a list": ("[]", None, None),
+            "start_ms missing": (changed(start_ms=...), None, "start_ms"),
+            "start_ms a bool": (changed(start_ms=True), None, "start_ms"),
+            "start_ms a float": (changed(start_ms=1000.0), None, "start_ms"),
+            "start_ms null": (changed(start_ms=None), None, "start_ms"),
+            "end_ms a string": (changed(end_ms="9000"), None, "end_ms"),
+            "end_ms before start_ms": (changed(end_ms=999), None, "end_ms"),
+            "outcome a number": (changed(outcome=1), None, "outcome"),
+            "failure a list": (changed(failure=["boom"]), None, "failure"),
+            "task a bool": (changed(task=False), None, "task"),
+            "another task": (changed(task=":lib:test"), ":app:test", ":lib:test"),
+            "task missing": (changed(task=...), ":app:test", "no task"),
+        }
+        for case, (content, task, part) in cases.items():
+            with self.subTest(case):
+                path = self.record(content)
+                with self.assertRaises(ReportError) as caught:
+                    timing.load(path, task)
+                self.assertIn(path.as_posix(), str(caught.exception))
+                if part is not None:
+                    self.assertIn(part, str(caught.exception))
+
+    def test_a_record_of_another_task_names_both(self):
+        path = self.record(dict(self.RECORD, task=":lib:test"))
+        with self.assertRaises(ReportError) as caught:
+            timing.load(path, ":app:test")
+        self.assertIn(":lib:test", str(caught.exception))
+        self.assertIn(":app:test", str(caught.exception))
+
+    def test_given_name_replaces_the_path(self):
+        path = self.record(dict(self.RECORD, end_ms=1))
+        with self.assertRaises(ReportError) as caught:
+            timing.load(path, name="build/timing.json")
+        self.assertNamedOnly(str(caught.exception), "build/timing.json")
+
+
+if __name__ == "__main__":
+    unittest.main()
