@@ -18,9 +18,19 @@ from pathlib import Path
 from unittest import mock
 
 from muster import __version__, cli
-from muster.config import Config, load
-from muster.policy import outputs, policy_sha256, protected, sources_sha256
-from muster.report import FatalError
+from muster.config import Config, ConfigError, load
+from muster.policy import (
+    PolicyError,
+    check_policy,
+    outputs,
+    policy_hash,
+    policy_sha256,
+    protected,
+    read_snapshot,
+    report_invalid,
+    sources_sha256,
+)
+from muster.report import FatalError, Report, ReportError
 
 BASE = "src/main/java/org/example/app"
 TESTS = "src/test/java/org/example/app"
@@ -492,6 +502,25 @@ class SnapshotTest(PolicyCase):
         del tables["zones"]["exemptions"]
         expected = policy_sha256(CRITICAL, STANDARD, b"", tables)
         self.assertEqual(self.read_json(self.snapshot)["policy_sha256"], expected)
+
+    def test_prior_snapshot_with_equal_hashes_but_a_broken_shape_is_written_anew(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        before = self.read_json(self.snapshot)
+        self.snapshot.write_bytes(json.dumps({**before, "created_epoch_ms": "1"}).encode("ascii"))
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        after = self.read_json(self.snapshot)
+        self.assertIsInstance(after["created_epoch_ms"], int)
+        self.assertEqual(
+            (after["sources_sha256"], after["policy_sha256"]), (before["sources_sha256"], before["policy_sha256"])
+        )
+
+    def test_prior_snapshot_with_an_unknown_key_is_left(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        document = {**self.read_json(self.snapshot), "created_epoch_ms": 1, "later": {"added": True}}
+        self.snapshot.write_bytes((json.dumps(document, indent=2) + "\n").encode("ascii"))
+        before = self.snapshot.read_bytes()
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertEqual(self.snapshot.read_bytes(), before)
 
     def test_prior_snapshot_nested_too_deeply_is_written_anew(self):
         self.snapshot.parent.mkdir(parents=True)
@@ -970,6 +999,144 @@ class MutationTargetTest(PolicyCase):
         self.assertEqual(code, 2)
         message = "policy/mutation.txt: not found (mutation.targets)"
         self.assertEqual(env["error"], {"kind": "policy", "message": message})
+
+
+class CheckPolicyTest(PolicyCase):
+    def check(self, today: date = date(2026, 5, 19)):
+        return check_policy(argparse.Namespace(), load(self.repo), today)
+
+    def test_valid_policy(self):
+        checked = self.check()
+        self.assertEqual((checked.sets.sources, checked.violations, checked.targets), (SOURCES, [], None))
+        self.assertEqual(checked.classification.zones[f"{BASE}/auth/Token.java"], "Z2")
+        expected = {"zones.critical": CRITICAL, "zones.standard": STANDARD, "zones.exemptions": EXEMPTIONS}
+        self.assertEqual(checked.raw, expected)
+
+    def test_violations_are_returned_not_reported(self):
+        self.unclassify()
+        self.assertEqual(self.check().violations, [UNCLASSIFIED])
+
+    def test_today_is_given_by_the_caller(self):
+        self.assertEqual(self.check(date(2026, 5, 30)).violations, [])
+        expired = self.check(date(2026, 5, 31)).violations
+        self.assertEqual(len(expired), 1)
+        self.assertIn("'auth/Token.java' expired on 2026-05-30", expired[0])
+
+    def test_profile_and_policy_file_errors_are_raised(self):
+        (self.repo / "policy" / "standard.txt").unlink()
+        with self.assertRaises(PolicyError):
+            self.check()
+        self.write("muster.toml", PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/gone"]'))
+        with self.assertRaises(ConfigError):
+            self.check()
+
+    def test_policy_hash_is_the_one_in_the_snapshot(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        cfg = load(self.repo)
+        checked = check_policy(argparse.Namespace(), cfg, date(2026, 5, 19))
+        self.assertEqual(policy_hash(cfg, checked), self.read_json(self.snapshot)["policy_sha256"])
+        self.assertEqual(policy_hash(cfg, checked), policy_sha256(CRITICAL, STANDARD, EXEMPTIONS, TABLES))
+
+    def test_invalid_policy_with_the_texts_of_the_caller(self):
+        rep = Report("coverage")
+        error = report_invalid(
+            rep,
+            ["first", "second"],
+            heading="## Coverage",
+            verdict="coverage: NOT EVALUATED (invalid policy: {count})",
+            message="cannot evaluate: {count}",
+            summary="**NOT EVALUATED**: invalid policy, {count}.",
+        )
+        self.assertEqual((str(error), error.kind), ("cannot evaluate: 2 violations", "policy"))
+        self.assertEqual(rep.verdict, "coverage: NOT EVALUATED (invalid policy: 2 violations)")
+        summary = "**NOT EVALUATED**: invalid policy, 2 violations."
+        self.assertEqual(rep.md, ["## Coverage", "", summary, "", "- `first`", "- `second`"])
+        self.assertEqual((rep.violation, rep.violations), (True, ["first", "second"]))
+        self.assertEqual(
+            rep.annotations, ["::error title=Invalid policy::first", "::error title=Invalid policy::second"]
+        )
+
+
+SNAPSHOT = {
+    "schema": 1,
+    "tool_version": "0.1.0",
+    "created_epoch_ms": 1,
+    "sources": [f"{BASE}/auth/Token.java"],
+    "sources_sha256": "0123456789abcdef" * 4,
+    "policy_sha256": "fedcba9876543210" * 4,
+}
+
+
+class ReadSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.file = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))) / "snapshot.json"
+
+    def read(self, raw: bytes) -> dict:
+        self.file.write_bytes(raw)
+        return read_snapshot(self.file)
+
+    def test_valid_snapshot_reads_back(self):
+        self.assertEqual(self.read(json.dumps(SNAPSHOT).encode("ascii")), SNAPSHOT)
+        later = {**SNAPSHOT, "later": [1, 2], "sources": []}
+        self.assertEqual(self.read(json.dumps(later).encode("ascii")), later)
+
+    def test_broken_snapshot_is_a_report_error(self):
+        def text(**changes) -> bytes:
+            return json.dumps({**SNAPSHOT, **changes}).encode("ascii")
+
+        cases = [
+            ("not JSON", b'{"schema": 1,', None),
+            ("not UTF-8", text(tool_version="0.1.0").replace(b"0.1.0", b"0.1." + bytes([0xFF])), None),
+            ("NaN", text(created_epoch_ms=float("nan")), None),
+            ("Infinity", text(created_epoch_ms=float("inf")), None),
+            ("-Infinity", text(created_epoch_ms=float("-inf")), None),
+            ("top level a list", b"[]", None),
+            ("top level a string", b'"snapshot"', None),
+            ("nested too deeply", b"[" * 100_000 + b"]" * 100_000, None),
+        ]
+        for key in SNAPSHOT:
+            missing = {name: value for name, value in SNAPSHOT.items() if name != key}
+            cases.append((f"{key} missing", json.dumps(missing).encode("ascii"), key))
+        wrong = [
+            ("schema", "1"),
+            ("schema", True),
+            ("schema", 1.0),
+            ("schema", 2),
+            ("tool_version", 1),
+            ("tool_version", None),
+            ("created_epoch_ms", "1"),
+            ("created_epoch_ms", True),
+            ("created_epoch_ms", 1.5),
+            ("created_epoch_ms", -1),
+            ("sources", f"{BASE}/auth/Token.java"),
+            ("sources", [f"{BASE}/auth/Token.java", 1]),
+            ("sources", None),
+            ("sources_sha256", "0123456789ABCDEF" * 4),
+            ("sources_sha256", "0" * 63),
+            ("sources_sha256", "0" * 65),
+            ("sources_sha256", "g" * 64),
+            ("policy_sha256", int("1" * 64)),
+            ("policy_sha256", "0" * 64 + "\n"),
+        ]
+        for key, value in wrong:
+            cases.append((f"{key} = {value!r}", text(**{key: value}), key))
+        for name, raw, key in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(ReportError) as caught:
+                    self.read(raw)
+                self.assertIn(str(self.file), str(caught.exception))
+                if key is not None:
+                    self.assertIn(key, str(caught.exception))
+
+    def test_missing_file_is_left_to_the_caller(self):
+        with self.assertRaises(FileNotFoundError):
+            read_snapshot(self.file)
+
+    def test_file_that_cannot_be_read_is_a_report_error(self):
+        self.file.mkdir()
+        with self.assertRaises(ReportError) as caught:
+            read_snapshot(self.file)
+        self.assertIn(str(self.file), str(caught.exception))
 
 
 class HashTest(unittest.TestCase):

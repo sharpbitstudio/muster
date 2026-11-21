@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from muster import __version__
 from muster.config import Config, ConfigError, require
 from muster.gitio import records
 from muster.paths import SourceSets, exists_exact, source_sets
-from muster.report import FatalError, Report, json_text, md_path, write_json
+from muster.report import FatalError, Report, ReportError, json_text, md_path, write_json
 from muster.zones import Classification, Names, Targets, classify, target_violations, trim
 
 HELP = "classify the source files by the policy files and check the policy"
@@ -27,6 +29,7 @@ SNAPSHOT_SCHEMA = 1
 REQUIRED = ("source.roots", "source.include", "zones.base", "zones.critical", "zones.standard")
 POLICY_FILES = ("zones.critical", "zones.standard", "zones.exemptions", "mutation.targets")
 _FROM_CONFIG = object()  # --snapshot without FILE; no file name given on the command line is it
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class PolicyError(FatalError):
@@ -186,19 +189,103 @@ def _sets(args: argparse.Namespace, cfg: Config) -> SourceSets:
     return sets
 
 
+@dataclass(frozen=True)
+class CheckedPolicy:
+    """The outcome of check_policy(): the walked sets, the classification and the policy files."""
+
+    sets: SourceSets
+    classification: Classification
+    raw: dict[str, bytes]  # the bytes of each configured policy file, by profile key
+    targets: int | None  # the number of mutation target lines; None without mutation.targets
+    violations: list[str]  # every violation of the policy; empty when it is valid
+
+
+def check_policy(args: argparse.Namespace, cfg: Config, today: date) -> CheckedPolicy:
+    """Check the profile, walk the source sets, read the policy files and classify every source
+    file on `today`. A profile or tree problem is a ConfigError, a policy file that is missing,
+    unreadable or not UTF-8 a PolicyError; the violations of a policy that could be read are
+    returned, not reported, so that each command gives its own verdict."""
+    _check_profile(cfg)
+    sets = _sets(args, cfg)
+    raw = {key: _read(cfg, key) for key, _ in _policy_files(cfg)}
+    lines = {key: _lines(cfg.get(key), data) for key, data in raw.items()}
+    base = cfg.get("zones.base")
+    names = Names(cfg.get("zones.critical"), cfg.get("zones.standard"), cfg.get("zones.exemptions", ""))
+    classification = classify(
+        lines["zones.critical"],
+        lines["zones.standard"],
+        lines.get("zones.exemptions", []),
+        sets.sources,
+        base=base,
+        names=names,
+        today=today,
+        max_days=cfg.exemption_max_days,
+    )
+    violations = list(classification.violations)
+    targets = None
+    if "mutation.targets" in lines:
+        target_lines = lines["mutation.targets"]
+        targets = sum(1 for raw_line in target_lines if trim(raw_line) and not trim(raw_line).startswith("#"))
+        violations += target_violations(
+            target_lines,
+            base,
+            Targets(
+                name=cfg.mutation_targets,
+                sources=frozenset(sets.sources),
+                tests=sets.tests,
+                roots=cfg.get("source.roots"),
+                test_roots=cfg.get("source.tests", []),
+                own_test=cfg.own_test,
+                forbidden=cfg.own_test_forbidden,
+            ),
+        )
+    return CheckedPolicy(sets, classification, raw, targets, violations)
+
+
+def policy_hash(cfg: Config, checked: CheckedPolicy) -> str:
+    """The policy_sha256 of a checked policy: its critical, standard and exemption files (empty
+    bytes without zones.exemptions) and the [source] and [zones] tables of the profile."""
+    tables = {"source": cfg.get("source"), "zones": cfg.get("zones")}
+    parts = [checked.raw.get(key, b"") for key in ("zones.critical", "zones.standard", "zones.exemptions")]
+    return policy_sha256(*parts, tables)
+
+
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
-def _invalid(rep: Report, violations: list[str]) -> PolicyError:
+def report_invalid(
+    rep: Report,
+    violations: list[str],
+    *,
+    heading: str,
+    verdict: str,
+    message: str,
+    summary: str = "**INVALID**: {count}.",
+) -> PolicyError:
+    """Report the violations of an invalid policy: each one is a violation of the section and an
+    error annotation, and the summary lists them under `heading`, after the line `summary`.
+    `{count}` in `verdict`, `summary` and `message` (the text of the returned PolicyError) becomes
+    the number of violations, as in "1 violation" or "3 violations"."""
     rep.violation = True
-    for message in violations:
-        rep.violations.append(message)
-        rep.annotate("error", "Invalid policy", message)
+    for violation in violations:
+        rep.violations.append(violation)
+        rep.annotate("error", "Invalid policy", violation)
     count = _plural(len(violations), "violation")
-    rep.verdict = f"policy: INVALID ({count})"
-    rep.md = ["## Policy", "", f"**INVALID**: {count}.", "", *(f"- {md_path(message)}" for message in violations)]
-    return PolicyError(f"the policy is invalid: {count}")
+    rep.verdict = verdict.replace("{count}", count)
+    lines = [f"- {md_path(violation)}" for violation in violations]
+    rep.md = [heading, "", summary.replace("{count}", count), "", *lines]
+    return PolicyError(message.replace("{count}", count))
+
+
+def _invalid(rep: Report, violations: list[str]) -> PolicyError:
+    return report_invalid(
+        rep,
+        violations,
+        heading="## Policy",
+        verdict="policy: INVALID ({count})",
+        message="the policy is invalid: {count}",
+    )
 
 
 def _passed(rep: Report, classification: Classification, targets: int | None) -> None:
@@ -237,13 +324,75 @@ def _write_zones(target: Path, text: str) -> None:
         raise FatalError(f"cannot write --zones-out {target}: {exc.strerror or exc}") from None
 
 
-def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_hash: str) -> None:
-    """Write the snapshot, unless the one there already has the same sources and policy hashes."""
+def _reject_constant(name: str) -> None:
+    raise ValueError(f"{name} is no JSON number")
+
+
+def _snapshot_problem(document: object) -> str | None:
+    """What keeps a parsed document from having the shape of a snapshot, or None."""
+    if not isinstance(document, dict):
+        return "the top level is not an object"
+
+    def integer(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    def sha256(value: object) -> bool:
+        return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+    def strings(value: object) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+    checks = (
+        ("schema", integer, "an integer"),
+        ("tool_version", lambda value: isinstance(value, str), "a string"),
+        ("created_epoch_ms", lambda value: integer(value) and value >= 0, "a non-negative integer"),
+        ("sources", strings, "a list of strings"),
+        ("sources_sha256", sha256, "64 lower-case hex digits"),
+        ("policy_sha256", sha256, "64 lower-case hex digits"),
+    )
+    for key, valid, expected in checks:
+        if key not in document:
+            return f"the key {key} is missing"
+        if not valid(document[key]):
+            return f"{key} must be {expected}"
+        if key == "schema" and document[key] != SNAPSHOT_SCHEMA:
+            return f"schema {document[key]} is not supported (only {SNAPSHOT_SCHEMA})"
+    return None
+
+
+def read_snapshot(path: Path) -> dict:
+    """The snapshot in `path`, checked against the shape that --snapshot writes; a key it does not
+    know is allowed. A missing file raises FileNotFoundError, for the caller to judge; any other
+    problem (unreadable, not UTF-8, not JSON, NaN or an infinity, nested too deeply, a missing key,
+    a value of the wrong type, another schema) is a ReportError that names the file."""
     try:
-        old = json.loads(target.read_bytes())
-        if old.get("sources_sha256") == sources_hash and old.get("policy_sha256") == policy_hash:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ReportError(f"{path}: cannot read the snapshot: {exc.strerror or exc}") from None
+    try:
+        document = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except UnicodeDecodeError as exc:
+        raise ReportError(f"{path}: the snapshot is not valid UTF-8 (byte {exc.start})") from None
+    except ValueError as exc:
+        raise ReportError(f"{path}: the snapshot is not valid JSON: {exc}") from None
+    except RecursionError:
+        raise ReportError(f"{path}: the snapshot is nested too deeply") from None
+    problem = _snapshot_problem(document)
+    if problem:
+        raise ReportError(f"{path}: not a snapshot: {problem}")
+    return document
+
+
+def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_hash: str) -> None:
+    """Write the snapshot, unless the one there has a valid shape and the same sources and policy
+    hashes; one that is missing, unreadable or broken is written anew."""
+    try:
+        old = read_snapshot(target)
+        if old["sources_sha256"] == sources_hash and old["policy_sha256"] == policy_hash:
             return
-    except (OSError, ValueError, AttributeError, RecursionError):  # unreadable: it is written anew
+    except (ReportError, OSError):
         pass
     document = {
         "schema": SNAPSHOT_SCHEMA,
@@ -262,50 +411,15 @@ def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_
 def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     """Classify the source files and check the policy files; the command line removes the snapshot
     when the run fails."""
-    _check_profile(cfg)
-    sets = _sets(args, cfg)
-    raw = {key: _read(cfg, key) for key, _ in _policy_files(cfg)}
-    lines = {key: _lines(cfg.get(key), data) for key, data in raw.items()}
-    base = cfg.get("zones.base")
-    names = Names(cfg.get("zones.critical"), cfg.get("zones.standard"), cfg.get("zones.exemptions", ""))
-    classification = classify(
-        lines["zones.critical"],
-        lines["zones.standard"],
-        lines.get("zones.exemptions", []),
-        sets.sources,
-        base=base,
-        names=names,
-        today=utc_today(),
-        max_days=cfg.exemption_max_days,
-    )
-    violations = list(classification.violations)
-    targets = None
-    if "mutation.targets" in lines:
-        target_lines = lines["mutation.targets"]
-        targets = sum(1 for raw_line in target_lines if trim(raw_line) and not trim(raw_line).startswith("#"))
-        violations += target_violations(
-            target_lines,
-            base,
-            Targets(
-                name=cfg.mutation_targets,
-                sources=frozenset(sets.sources),
-                tests=sets.tests,
-                roots=cfg.get("source.roots"),
-                test_roots=cfg.get("source.tests", []),
-                own_test=cfg.own_test,
-                forbidden=cfg.own_test_forbidden,
-            ),
-        )
-    if violations:
-        raise _invalid(rep, violations)
-    _passed(rep, classification, targets)
+    checked = check_policy(args, cfg, utc_today())
+    if checked.violations:
+        raise _invalid(rep, checked.violations)
+    _passed(rep, checked.classification, checked.targets)
     snapshot = snapshot_path(args, cfg)
     if args.zones_out is None and snapshot is None:
         return
-    sources_hash = sources_sha256(sets.sources)  # every name is UTF-8 before an output is written
+    sources_hash = sources_sha256(checked.sets.sources)  # every name is UTF-8 before an output is written
     if args.zones_out is not None:
-        _write_zones(Path(args.zones_out), zones_text(classification))
+        _write_zones(Path(args.zones_out), zones_text(checked.classification))
     if snapshot is not None:
-        tables = {"source": cfg.get("source"), "zones": cfg.get("zones")}
-        parts = [raw.get(key, b"") for key in ("zones.critical", "zones.standard", "zones.exemptions")]
-        _write_snapshot(snapshot, sets.sources, sources_hash, policy_sha256(*parts, tables))
+        _write_snapshot(snapshot, checked.sets.sources, sources_hash, policy_hash(cfg, checked))

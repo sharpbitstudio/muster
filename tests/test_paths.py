@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from muster.config import Config, ConfigError
-from muster.paths import _is_junction, exists_exact, is_link, normalize, root_of, source_sets, walk
+from muster.paths import _is_junction, exists_exact, is_link, normalize, resolve_glob, root_of, source_sets, walk
 
 
 class TreeCase(unittest.TestCase):
@@ -27,6 +27,21 @@ class TreeCase(unittest.TestCase):
 
     def config(self, **source) -> Config:
         return Config(self.root, self.root / "muster.toml", {"source": source})
+
+    def denied(self, folder: str):
+        """os.scandir() fails for this folder, as for one whose listing is denied."""
+        path, scandir = str(self.root / folder), os.scandir
+
+        def listing(top="."):
+            if os.fspath(top) == path:
+                raise PermissionError(13, "Permission denied", top)
+            return scandir(top)
+
+        return mock.patch("os.scandir", side_effect=listing)
+
+    def junction(self, target: str, link: str) -> None:
+        _winapi = __import__("_winapi")  # Windows only; a junction needs no privilege
+        _winapi.CreateJunction(str(self.root / target), str(self.root / link))
 
 
 class WalkTest(TreeCase):
@@ -59,17 +74,6 @@ class WalkTest(TreeCase):
         (self.root / "src").mkdir()
         self.assertEqual(walk(self.root, "source.roots", ["src"]), [])
 
-    def denied(self, folder: str):
-        """os.scandir() fails for this folder, as for one whose listing is denied."""
-        path, scandir = str(self.root / folder), os.scandir
-
-        def listing(top="."):
-            if os.fspath(top) == path:
-                raise PermissionError(13, "Permission denied", top)
-            return scandir(top)
-
-        return mock.patch("os.scandir", side_effect=listing)
-
     def test_folder_that_cannot_be_listed(self):
         self.make("src/app/main.py", "src/locked/secret.py", "src/tool.py", "lib/util.py")
         message = f"source.roots: cannot read {self.root / 'src' / 'locked'}: Permission denied"
@@ -90,10 +94,6 @@ class WalkTest(TreeCase):
         except OSError:
             self.skipTest("cannot create a symbolic link here")
         self.assertEqual(walk(self.root, "source.roots", ["src"]), ["src/main.py"])
-
-    def junction(self, target: str, link: str) -> None:
-        _winapi = __import__("_winapi")  # Windows only; a junction needs no privilege
-        _winapi.CreateJunction(str(self.root / target), str(self.root / link))
 
     @unittest.skipUnless(sys.platform == "win32", "junctions exist only on Windows")
     def test_junction_below_a_root_is_not_followed(self):
@@ -128,6 +128,84 @@ class WalkTest(TreeCase):
         self.assertFalse(is_link(str(self.root / "src")))
         self.assertFalse(is_link(str(self.root / "src" / "main.py")))
         self.assertFalse(is_link(str(self.root / "gone")))
+
+
+RESULTS = "app/build/test-results"
+TOKEN = f"{RESULTS}/test/TEST-org.example.app.auth.TokenTest.xml"
+PARSER = f"{RESULTS}/test/nested/deeper/TEST-org.example.app.codec.KeyParserTest.xml"
+TOP = f"{RESULTS}/TEST-org.example.app.TopTest.xml"
+NOTES = f"{RESULTS}/test/notes.txt"
+DISPATCHER = "lib/build/test-results/test/TEST-org.example.app.queue.DispatcherTest.xml"
+
+
+class ResolveGlobTest(TreeCase):
+    def setUp(self):
+        super().setUp()
+        self.make(TOKEN, PARSER, TOP, NOTES, DISPATCHER, "TEST-org.example.app.RootTest.xml")
+
+    def test_double_star_at_several_depths(self):
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/**/TEST-*.xml"), [TOP, TOKEN, PARSER])
+        self.assertEqual(resolve_glob(self.root, "**/test/TEST-*.xml"), [TOKEN, DISPATCHER])
+        self.assertEqual(resolve_glob(self.root, "app/**"), [TOP, TOKEN, PARSER, NOTES])
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test/**/deeper/*.xml"), [PARSER])
+
+    def test_star_within_a_segment(self):
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test/TEST-*Token*.xml"), [TOKEN])
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/*.xml"), [TOP])  # a star stays in its folder
+        self.assertEqual(resolve_glob(self.root, "*/build/test-results/test/*.xml"), [TOKEN, DISPATCHER])
+        self.assertEqual(resolve_glob(self.root, "TEST-*.xml"), ["TEST-org.example.app.RootTest.xml"])
+
+    def test_alternatives_sorted_and_without_duplicates(self):
+        self.assertEqual(resolve_glob(self.root, "{lib,app}/build/test-results/test/*.xml"), [TOKEN, DISPATCHER])
+        overlap = resolve_glob(self.root, f"{{{RESULTS}/**/*.xml,**/test/TEST-*.xml,{TOKEN}}}")
+        self.assertEqual(overlap, [TOP, TOKEN, PARSER, DISPATCHER])
+        self.assertEqual(overlap, sorted(set(overlap)))
+
+    def test_literal_file(self):
+        self.assertEqual(resolve_glob(self.root, TOKEN), [TOKEN])
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test/TEST-Gone.xml"), [])
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test"), [])  # a folder is no file
+
+    def test_missing_start_folder_gives_no_files(self):
+        self.assertEqual(resolve_glob(self.root, "gone/**/*.xml"), [])
+        self.assertEqual(resolve_glob(self.root, "app/build/missing/*.xml"), [])
+        self.assertEqual(resolve_glob(self.root, f"{TOP}/*.xml"), [])  # a file is no folder
+
+    def test_start_folder_in_another_case_gives_no_files(self):
+        self.assertEqual(resolve_glob(self.root, "App/build/test-results/**/*.xml"), [])
+        self.assertEqual(resolve_glob(self.root, "app/Build/test-results/test/*.xml"), [])
+        self.assertEqual(resolve_glob(self.root, TOKEN.replace("app/build", "app/BUILD")), [])
+
+    def test_file_name_in_another_case_is_not_matched(self):
+        self.assertEqual(resolve_glob(self.root, "**/test-*.xml"), [])
+        self.assertEqual(resolve_glob(self.root, "**/TEST-*.XML"), [])
+        self.assertEqual(resolve_glob(self.root, TOKEN.replace("TokenTest", "tokentest")), [])
+
+    def test_folder_that_cannot_be_read_is_skipped(self):
+        with self.denied(f"{RESULTS}/test"):
+            self.assertEqual(resolve_glob(self.root, "app/**/*.xml"), [TOP])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "no symbolic links")
+    def test_linked_folder_below_the_start_is_not_followed(self):
+        self.make("elsewhere/TEST-org.example.app.OtherTest.xml")
+        try:
+            os.symlink(self.root / "elsewhere", self.root / RESULTS / "linked", target_is_directory=True)
+        except OSError:
+            self.skipTest("cannot create a symbolic link here")
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/**/*.xml"), [TOP, TOKEN, PARSER])
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/*/TEST-*.xml"), [TOKEN])
+
+    @unittest.skipUnless(sys.platform == "win32", "junctions exist only on Windows")
+    def test_junction_below_the_start_is_not_followed(self):
+        self.make("elsewhere/TEST-org.example.app.OtherTest.xml")
+        self.junction("elsewhere", f"{RESULTS}/linked")
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/**/*.xml"), [TOP, TOKEN, PARSER])
+
+    @unittest.skipUnless(sys.platform == "win32", "junctions exist only on Windows")
+    def test_start_folder_that_is_a_junction_is_walked(self):
+        self.make("elsewhere/TEST-org.example.app.OtherTest.xml")
+        self.junction("elsewhere", "linked")
+        self.assertEqual(resolve_glob(self.root, "linked/*.xml"), ["linked/TEST-org.example.app.OtherTest.xml"])
 
 
 class SourceSetsTest(TreeCase):

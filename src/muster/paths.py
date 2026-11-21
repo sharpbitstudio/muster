@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from muster.config import Config, ConfigError
-from muster.globs import matches_any
+from muster.globs import alternatives, matches, matches_any
 
 
 def normalize(path: str) -> str:
@@ -86,6 +86,34 @@ def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | N
             for name in filenames:
                 if os.path.isfile(os.path.join(dirpath, name)):
                     found.add(posixpath.join(prefix, name))
+    return sorted(found)
+
+
+def resolve_glob(root: Path, glob: str) -> list[str]:
+    """The files that match a glob of the profile (repository-relative), sorted and without
+    duplicates. Each alternative is walked from its longest literal folder prefix, the leading
+    folders without a `*`; an alternative without any `*` is a single file. The prefix must exist
+    with exactly the names on disk and may be a link; a linked folder below it is not followed.
+    Matching is case-sensitive. A prefix that does not exist gives no files, and a folder that
+    cannot be read hides its files: it never raises for the tree. The glob is one the profile check
+    accepted (well-formed, relative, inside the repository)."""
+    found: set[str] = set()
+    for alternative in alternatives(glob):
+        segments = alternative.split("/")
+        if "*" not in alternative:
+            if exists_exact(root, alternative):
+                found.add(normalize(alternative))
+            continue
+        prefix: list[str] = []
+        for segment in segments[:-1]:
+            if "*" in segment:
+                break
+            prefix.append(segment)
+        start = "/".join(prefix)
+        if not exists_exact(root, start, folder=True):
+            continue
+        hidden: list[ConfigError] = []  # a folder that cannot be read is skipped
+        found.update(path for path in walk(root, "glob", [start], hidden) if matches(alternative, path))
     return sorted(found)
 
 
