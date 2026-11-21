@@ -27,9 +27,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__, policy
+from muster import __version__, coverage, policy
 from muster.config import DEFAULT_CONFIG, SECTIONS, Config, ConfigError, config_path, load, load_unchecked
-from muster.gitio import find_repo_root, git
+from muster.gitio import find_repo_root, git, merge_base
 from muster.report import (
     FatalError,
     Report,
@@ -84,6 +84,9 @@ class Analysis:
 
 ANALYSES: dict[str, Analysis] = {
     "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.inputs, policy.outputs, policy.protected),
+    "coverage": Analysis(
+        coverage.run, coverage.HELP, coverage.arguments, coverage.inputs, protected=coverage.protected
+    ),
 }
 
 
@@ -144,7 +147,7 @@ _NEGATIVE_NUMBER = re.compile(r"-\d+$|-\d*\.\d+$")
 # Every option string of build_parser(), at every level (a test keeps the two equal).
 OPTIONS = frozenset(
     "-h --help --repo --config --format --json-out --strict --strict-only --fail-on-error --summary-file"
-    " --github --snapshot --zones-out".split()
+    " --github --snapshot --zones-out --base --diff-file --no-freshness --today".split()
 )
 # The options before the command word; each takes a value.
 GLOBAL_OPTIONS = ("--repo", "--config")
@@ -217,6 +220,13 @@ def _head_commit(root: Path) -> str | None:
         return None
 
 
+def _merge_base(root: Path, ref: str) -> str | None:
+    try:
+        return merge_base(root, ref)
+    except OSError:  # no git on PATH, or no such folder
+        return None
+
+
 def _same_file(first: Path, second: Path) -> bool:
     """Whether two paths name one file: the same file on disk, else the same resolved path (ignoring
     case on Windows)."""
@@ -257,6 +267,7 @@ class Invocation:
     summary_written: bool = False
     remove_on_failure: list[Path] = field(default_factory=list)
     commit: str | None = None
+    base: dict | None = None  # {"ref", "commit"} once --base is parsed; the commit is None without a merge base
     sections: list[Report] = field(default_factory=list)
 
 
@@ -388,6 +399,9 @@ def run_analysis(
 ) -> int:
     root = _repo_root(args.repo)
     inv.commit = _head_commit(root)
+    if getattr(args, "base", None) is not None:  # the section and the envelope share one merge base
+        args.base_commit = _merge_base(root, args.base)
+        inv.base = {"ref": args.base, "commit": args.base_commit}
     profile = [("the config file", config_path(root, args.config))]
     _refuse_clashes(inv, _named(json_out, summary), profile)
     _arm(inv, json_out, summary)
@@ -494,7 +508,9 @@ def _report_failure(inv: Invocation, message: str, usage: str) -> None:
 
 def _finish(inv: Invocation, code: int, error: tuple[str, str] | None, usage: str = "") -> int:
     def build() -> str:
-        return json_text(envelope(inv.command, exit_code=code, commit=inv.commit, sections=inv.sections, error=error))
+        return json_text(
+            envelope(inv.command, exit_code=code, commit=inv.commit, sections=inv.sections, error=error, base=inv.base)
+        )
 
     try:
         text = build()

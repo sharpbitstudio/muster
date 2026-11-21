@@ -134,8 +134,10 @@ def envelope(
     commit: str | None = None,
     sections: Sequence[Report] = (),
     error: tuple[str, str] | None = None,
+    base: dict | None = None,
 ) -> dict:
-    """The JSON envelope of one run. `error` is (kind, message) on exit 2 or 3."""
+    """The JSON envelope of one run. `error` is (kind, message) on exit 2 or 3; `base` is the
+    {"ref", "commit"} of --base, or None without it."""
     items = [rep.section(exit_code) for rep in sections]
     if exit_code in (2, 3) or error is not None:
         verdict = "error"
@@ -146,7 +148,7 @@ def envelope(
         "tool": {"name": "muster", "version": __version__},
         "command": command,
         "commit": commit,
-        "base": None,
+        "base": base,
         "verdict": verdict,
         "exit_code": exit_code,
         "error": None if error is None else {"kind": error[0], "message": error[1]},

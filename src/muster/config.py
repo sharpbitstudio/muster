@@ -27,6 +27,9 @@ SCHEMA_VERSION = 1
 DEFAULT_CONFIG = "muster.toml"
 SECTIONS = ("policy", "coverage", "duration", "loc", "tests", "mutation")
 DEFAULT_EXEMPTION_MAX_DAYS = 30
+# The coverage thresholds that apply where the profile sets none (POLICY.md, point 4).
+DEFAULT_FLOOR_LINE, DEFAULT_FLOOR_BRANCH = 0.80, 0.65
+DEFAULT_DELTA_LINE, DEFAULT_DELTA_BRANCH = 0.80, 0.80
 
 
 class ConfigError(FatalError):
@@ -400,6 +403,24 @@ class Config:
     @property
     def exemption_max_days(self) -> int:
         return self.get("zones.exemption_max_days", DEFAULT_EXEMPTION_MAX_DAYS)
+
+    @property
+    def coverage_floor(self) -> dict[str, float]:
+        """The effective floor: each key the profile leaves out of coverage.floor has its default."""
+        return {"line": DEFAULT_FLOOR_LINE, "branch": DEFAULT_FLOOR_BRANCH, **self.get("coverage.floor", {})}
+
+    @property
+    def coverage_delta(self) -> dict[str, float]:
+        """The effective delta gate: each key the profile leaves out of coverage.delta has its default."""
+        return {"line": DEFAULT_DELTA_LINE, "branch": DEFAULT_DELTA_BRANCH, **self.get("coverage.delta", {})}
+
+    @property
+    def coverage_format(self) -> str:
+        return self.get("coverage.format", "jacoco")
+
+    @property
+    def tests_format(self) -> str:
+        return self.get("tests.format", "junit")
 
     @property
     def snapshot(self) -> str | None:

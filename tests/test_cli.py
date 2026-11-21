@@ -767,5 +767,65 @@ class AnalysisTest(CliCase):
         self.assertEqual((self.work / "summary.md").read_bytes(), line)
 
 
+class BaseTest(CliCase):
+    """The stand-in takes --base; the command line computes the merge base once, for the section
+    (args.base_commit) and for the envelope."""
+
+    def setUp(self):
+        super().setUp()
+        self.seen = []
+        stand_in = cli.Analysis(
+            lambda args, cfg, rep: self.seen.append(getattr(args, "base_commit", "not set")),
+            "stand-in section",
+            lambda parser: parser.add_argument("--base"),
+        )
+        self.enterContext(mock.patch.dict(cli.ANALYSES, {"coverage": stand_in}))
+
+    def analyse(self, *options: str) -> tuple[int, dict]:
+        code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json", *options)
+        return code, json.loads(out)
+
+    def commit(self) -> str:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True, capture_output=True)
+        commit = ["git", *IDENTITY, "commit", "-q", "--allow-empty", "-m", "first"]
+        subprocess.run(commit, cwd=self.repo, check=True, capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, check=True).stdout
+        return head.decode("ascii").strip()
+
+    def test_null_without_base(self):
+        code, env = self.analyse()
+        self.assertEqual((code, env["base"], self.seen), (0, None, ["not set"]))
+
+    def test_ref_and_merge_base(self):
+        head = self.commit()
+        code, env = self.analyse("--base", "main")
+        self.assertEqual((code, env["base"]), (0, {"ref": "main", "commit": head}))
+        self.assertEqual(self.seen, [head])
+
+    def test_ref_without_merge_base(self):
+        self.commit()
+        code, env = self.analyse("--base", "no-such-ref")
+        self.assertEqual((code, env["base"], self.seen), (0, {"ref": "no-such-ref", "commit": None}, [None]))
+
+    def test_outside_a_repository(self):
+        code, env = self.analyse("--base", "main")
+        self.assertEqual((code, env["base"]), (0, {"ref": "main", "commit": None}))
+
+    def test_kept_on_a_config_error(self):
+        head = self.commit()
+        self.config.write_bytes(b"bogus = 1\n")
+        code, env = self.analyse("--base", "main")
+        self.assertEqual((code, env["error"]["kind"], env["base"]), (2, "config", {"ref": "main", "commit": head}))
+
+    def test_none_when_the_arguments_fail(self):
+        code, env = self.analyse("--base", "main", "--no-such-option")
+        self.assertEqual((code, env["base"]), (2, None))
+
+    def test_envelope_carries_the_given_base(self):
+        base = {"ref": "main", "commit": None}
+        self.assertEqual(envelope("coverage", exit_code=0, base=base)["base"], base)
+        self.assertIsNone(envelope("coverage", exit_code=0)["base"])
+
+
 if __name__ == "__main__":
     unittest.main()

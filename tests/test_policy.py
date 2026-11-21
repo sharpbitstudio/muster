@@ -1138,6 +1138,15 @@ class ReadSnapshotTest(unittest.TestCase):
             read_snapshot(self.file)
         self.assertIn(str(self.file), str(caught.exception))
 
+    def test_given_name_replaces_the_path(self):
+        for raw in (b"{", b"[]"):
+            with self.subTest(raw=raw):
+                self.file.write_bytes(raw)
+                with self.assertRaises(ReportError) as caught:
+                    read_snapshot(self.file, name="build/muster/snapshot.json")
+                self.assertTrue(str(caught.exception).startswith("build/muster/snapshot.json: "))
+                self.assertNotIn(str(self.file), str(caught.exception))
+
 
 class HashTest(unittest.TestCase):
     def test_policy_hash_covers_the_digests_of_the_three_files_in_order(self):
