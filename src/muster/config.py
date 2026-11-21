@@ -3,7 +3,8 @@
 The checker knows every key of schema v1: an unknown key at any level, a value of the wrong type or
 a value out of range is a configuration error (exit 2). No key is required here; each command names
 the keys it needs with require(). Every path and glob is relative to the repository root, in
-canonical POSIX form; every glob is well-formed. There is no built-in default path.
+canonical POSIX form; every glob is well-formed, and compiled here. There is no built-in default
+path.
 """
 
 from __future__ import annotations
@@ -190,13 +191,23 @@ def glob(key: str, value: Any) -> None:
 
 def name_glob(key: str, value: Any) -> None:
     """A well-formed glob of file names, without control characters, and without / or backslash in
-    the glob or in any of its alternatives: it is matched against a file name only."""
+    the glob or in any of its alternatives: it is matched against a file name only. No alternative
+    is empty, `.` or `..`, or starts with a drive."""
     _expect(key, value, isinstance(value, str), "a string")
     if _has_control(value):
         raise ConfigError(f"{key}: has a control character")
     if "/" in value or "\\" in value:  # an alternative is made of parts of the glob
         raise ConfigError(f"{key}: must be a glob of file names, without / or \\")
-    _alternatives(key, value)
+    for alternative in _alternatives(key, value):
+        problem = (
+            "is empty" if alternative == ""
+            else "is . or .." if alternative in (".", "..")
+            else "starts with a drive" if _DRIVE.match(alternative)
+            else None
+        )
+        if problem:
+            shown = json.dumps(alternative)
+            raise ConfigError(f"{key}: must be a glob of file names; its alternative {shown} {problem}")
 
 
 def file_name_template(key: str, value: Any) -> None:
@@ -426,7 +437,7 @@ def _exact_case(root: Path, file: Path) -> bool:
     except ValueError:
         current, parts = file.parent, (file.name,)
     for part in parts:
-        if part not in (".", ".."):
+        if part not in ("", ".", ".."):
             try:
                 if part not in os.listdir(current):
                     return False

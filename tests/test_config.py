@@ -5,12 +5,16 @@ Every path is synthetic. A Windows drive path is built at run time.
 
 import copy
 import math
+import os
+import sys
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from muster.config import Config, ConfigError, config_path, load, require, validate
+from muster import globs
+from muster.config import Config, ConfigError, _exact_case, config_path, load, require, validate
 
 DRIVE = "C" + ":"
 
@@ -508,6 +512,32 @@ class GlobTest(ValidateCase):
                 message = self.error(doc("mutation.own_test_forbidden", [value]))
                 self.assertEqual(message, "mutation.own_test_forbidden[0]: has a control character")
 
+    def test_glob_with_more_than_1024_alternatives(self):
+        glob = "{ab,cd}" * 30 + "/*.py"
+        message = f'source.include[0]: bad glob "{glob}": more than 1024 alternatives'
+        self.assertEqual(self.error(doc("source.include", [glob])), message)
+        validate(doc("source.include", ["{ab,cd}" * 10 + "/*.py"]))
+
+    def test_every_glob_is_compiled_when_the_profile_is_checked(self):
+        with mock.patch("muster.globs._compile", wraps=globs._compile) as compile_:
+            validate({"tests": {"results": "reports/*.xml"}, "mutation": {"own_test_forbidden": ["*IT*"]}})
+        compile_.assert_any_call("reports/*.xml")
+        compile_.assert_any_call("*IT*")
+
+    def test_own_test_forbidden_alternative_is_a_file_name(self):
+        prefix = "mutation.own_test_forbidden[0]: must be a glob of file names; its alternative"
+        cases = [
+            ("", '"" is empty'),
+            ("{.,*Test*}", '"." is . or ..'),
+            ("{*Test*,..}", '".." is . or ..'),
+            (DRIVE + "*Test*", f'"{DRIVE}*Test*" starts with a drive'),
+            ("{*Test*," + DRIVE + "*}", f'"{DRIVE}*" starts with a drive'),
+        ]
+        for value, problem in cases:
+            with self.subTest(value=value):
+                self.assertEqual(self.error(doc("mutation.own_test_forbidden", [value])), f"{prefix} {problem}")
+        validate(doc("mutation.own_test_forbidden", ["*IntegrationTest*", "..*Test*", "{Slow,Live}*"]))
+
     def test_own_test_forbidden_has_no_folder(self):
         message = "mutation.own_test_forbidden[0]: must be a glob of file names, without / or \\"
         for value in ("dir/../*Test*", "{Slow,support/Live}*", "support\\*Test*"):
@@ -533,6 +563,10 @@ class OwnTestTemplateTest(ValidateCase):
 
 class NeverInternalErrorTest(ValidateCase):
     """A value Python cannot handle the plain way is a configuration error, never a crash."""
+
+    def setUp(self):
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)  # the default, which the messages in hex rely on
 
     def test_huge_integer_where_a_number_is_expected(self):
         huge = 16**5000 - 1  # more digits than int-to-str conversion allows, more than a float holds
@@ -601,6 +635,8 @@ class LoadTest(unittest.TestCase):
         self.assertEqual(str(self.error()), f"muster.toml: invalid TOML: {ctx.exception}")
 
     def test_toml_that_python_cannot_hold_is_invalid_toml(self):
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)  # the default, which the parser and the message rely on
         cases = [
             (b"schema = " + b"1" * 5000 + b"\n", "muster.toml: invalid TOML: "),
             (b"x = " + b"[" * 5000 + b"]" * 5000 + b"\n", "muster.toml: invalid TOML: "),
@@ -622,6 +658,12 @@ class LoadTest(unittest.TestCase):
             "muster.toml: policy.snapshot: must be a path relative to the repository root with / separators;"
             " it has a control character",
         )
+
+    def test_root_of_the_file_system_is_not_reported_missing(self):
+        root = Path(os.path.abspath(os.sep))
+        self.assertTrue(_exact_case(self.root, root))
+        if sys.platform != "win32":  # Windows itself reports a drive root as not found
+            self.assertTrue(str(self.error(str(root))).startswith(f"{root}: cannot read: "))
 
     def test_file_name_in_another_case_is_not_found(self):
         self.write("muster.toml", b"schema = 1\n")

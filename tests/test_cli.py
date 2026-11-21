@@ -6,6 +6,7 @@ Every run happens in temporary folders, with git's global and system configurati
 """
 
 import argparse
+import ast
 import contextlib
 import io
 import json
@@ -148,6 +149,10 @@ class EntryPointTest(unittest.TestCase):
 
     def test_entry_point_knows_the_commands(self):
         self.assertEqual(set(self.entry_point()["COMMANDS"]), {"version", *cli.ANALYSES})
+
+    def test_entry_point_is_python_3_8_syntax(self):
+        source = (REPO_ROOT / "src" / "__main__.py").read_text(encoding="ascii")
+        ast.parse(source, filename="__main__.py", feature_version=(3, 8))
 
 
 class OldPythonTest(unittest.TestCase):

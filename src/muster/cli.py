@@ -229,8 +229,9 @@ def _same_file(first: Path, second: Path) -> bool:
 
 
 def _index(files: Inputs) -> dict[str, str]:
-    """The resolved path (case-folded on Windows) of each file -> its label; each folder is resolved
-    once, so that a large set of files costs no call per file."""
+    """The resolved path (case-folded on Windows) of each file -> its label; a file that is a link is
+    also keyed by the file it leads to. Each folder is resolved once, so that a large set of files
+    costs one link check per file and a full resolution only per folder and per link."""
     folders: dict[Path, str] = {}
     index: dict[str, str] = {}
     for label, path in files:
@@ -238,6 +239,8 @@ def _index(files: Inputs) -> dict[str, str]:
         if folder is None:
             folder = folders[path.parent] = os.path.realpath(path.parent)
         index.setdefault(os.path.normcase(os.path.join(folder, path.name)), label)
+        if os.path.islink(path):
+            index.setdefault(os.path.normcase(os.path.realpath(path)), label)
     return index
 
 
@@ -263,7 +266,7 @@ def _refuse_clashes(inv: Invocation, named: Inputs, inputs: Inputs, protected: d
     for i, (label, path) in enumerate(named):
         clash = next((f"is {other}" for other, file in inputs if _same_file(path, file)), None)
         if clash is None and protected:
-            # The file a link leads to, and the link itself: _index() keys a protected link by its own name.
+            # The file a link leads to, and the link itself: _index() keys a protected link by both.
             keys = (os.path.realpath(path), os.path.join(os.path.realpath(path.parent), path.name))
             other = next((protected[key] for key in map(os.path.normcase, keys) if key in protected), None)
             clash = None if other is None else f"is {other}"
@@ -498,22 +501,39 @@ def _finish(inv: Invocation, code: int, error: tuple[str, str] | None, usage: st
     except (TypeError, ValueError, RecursionError) as exc:  # section data that JSON cannot carry is a bug
         code, error, inv.sections = EXIT_INTERNAL, ("internal", f"envelope: {type(exc).__name__}: {exc}"), []
         text = build()
-    if inv.json_out:
-        try:
-            write_json(Path(inv.json_out), text)
-        except OSError as exc:
-            message = f"cannot write --json-out {inv.json_out}: {exc.strerror or exc}"
-            if code in (EXIT_USAGE, EXIT_INTERNAL):  # the first error stays the one reported
-                print(f"muster: error: {message}", file=sys.stderr)
-            else:
-                code, error, usage = EXIT_USAGE, ("usage", message), ""
-                text = build()
+    message = _write_json_out(inv, text)
+    if message is not None:
+        if code in (EXIT_USAGE, EXIT_INTERNAL):  # the first error stays the one reported
+            print(f"muster: error: {message}", file=sys.stderr)
+        else:
+            code, error, usage = EXIT_USAGE, ("usage", message), ""
+            text = build()
     if code in (EXIT_USAGE, EXIT_INTERNAL):
         _remove_failed_outputs(inv)
         _report_failure(inv, error[1], usage)
     if inv.fmt == "json":
-        sys.stdout.write(text)
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except (OSError, ValueError) as exc:  # a closed pipe or stream: the run fails, and the files say so
+            code, error = EXIT_INTERNAL, ("internal", f"cannot write stdout: {getattr(exc, 'strerror', None) or exc}")
+            message = _write_json_out(inv, build())
+            if message is not None:
+                print(f"muster: error: {message}", file=sys.stderr)
+            _remove_failed_outputs(inv)
+            _report_failure(inv, error[1], "")  # in JSON mode it writes nothing to stdout
     return code
+
+
+def _write_json_out(inv: Invocation, text: str) -> str | None:
+    """Write the envelope to --json-out, if there is one; the error message when it cannot be written."""
+    if not inv.json_out:
+        return None
+    try:
+        write_json(Path(inv.json_out), text)
+    except OSError as exc:
+        return f"cannot write --json-out {inv.json_out}: {exc.strerror or exc}"
+    return None
 
 
 def _main(argv: list[str]) -> int:

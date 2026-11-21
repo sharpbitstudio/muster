@@ -59,6 +59,29 @@ class WalkTest(TreeCase):
         (self.root / "src").mkdir()
         self.assertEqual(walk(self.root, "source.roots", ["src"]), [])
 
+    def denied(self, folder: str):
+        """os.scandir() fails for this folder, as for one whose listing is denied."""
+        path, scandir = str(self.root / folder), os.scandir
+
+        def listing(top="."):
+            if os.fspath(top) == path:
+                raise PermissionError(13, "Permission denied", top)
+            return scandir(top)
+
+        return mock.patch("os.scandir", side_effect=listing)
+
+    def test_folder_that_cannot_be_listed(self):
+        self.make("src/app/main.py", "src/locked/secret.py", "src/tool.py", "lib/util.py")
+        message = f"source.roots: cannot read {self.root / 'src' / 'locked'}: Permission denied"
+        with self.denied("src/locked"), self.assertRaises(ConfigError) as caught:
+            walk(self.root, "source.roots", ["src", "lib"])
+        self.assertEqual(str(caught.exception), message)
+        errors = []
+        with self.denied("src/locked"):
+            found = walk(self.root, "source.roots", ["src", "lib"], errors)
+        self.assertEqual(found, ["lib/util.py", "src/app/main.py", "src/tool.py"])
+        self.assertEqual([str(error) for error in errors], [message])
+
     @unittest.skipUnless(hasattr(os, "symlink"), "no symbolic links")
     def test_linked_folder_is_not_followed(self):
         self.make("src/main.py", "elsewhere/other.py")
