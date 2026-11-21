@@ -4,7 +4,8 @@ The critical file lists globs under zone headers `# Zone <n>: <title>` (n from 1
 leading zeros); the standard file lists packages, `<package>/*` or `*` for the base folder; the
 exemption file lists `path | reason | valid-until` lines. Globs and paths are relative to
 [zones].base. A glob is a `/`-separated path where `*` stays inside a segment, `**` is only a whole
-last segment, and `{a,b}` groups expand into alternatives (not nested); `#` starts a comment.
+last segment, and `{a,b}` groups expand into alternatives (not nested, at most MAX_ALTERNATIVES
+per line); `#` starts a comment.
 
 Every source file must be in exactly one zone or in a standard package; every glob and every
 alternative must match a file; a standard glob must match a file that is not critical (critical
@@ -21,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from muster.globs import matches
+from muster.globs import MAX_ALTERNATIVES, matches
 from muster.paths import normalize, root_of
 
 MAX_ZONE = 999
@@ -133,17 +134,24 @@ def zone_number(digits: str) -> int | None:
 
 def expand(glob: str) -> list[str]:
     """All alternatives of `glob` with each `{a,b}` group expanded, left to right; empty on bad
-    braces. One group at a time, without recursion, so that the number of groups has no limit."""
+    braces. One group at a time, without recursion, so that the number of groups has no limit.
+    Past MAX_ALTERNATIVES the groups are only counted, not expanded: with good braces, such a glob
+    is a ValueError."""
     alternatives = [""]
+    count = 1
     rest = glob
     while True:
         open_, close = rest.find("{"), rest.find("}")
         if open_ < 0 and close < 0:
+            if count > MAX_ALTERNATIVES:
+                raise ValueError(f"more than {MAX_ALTERNATIVES} alternatives")
             return [head + rest for head in alternatives]
         if open_ < 0 or close < open_ or "{" in rest[open_ + 1 : close]:
             return []
         options = rest[open_ + 1 : close].split(",")
-        alternatives = [head + rest[:open_] + option for head in alternatives for option in options]
+        count = min(count * len(options), MAX_ALTERNATIVES + 1)
+        if count <= MAX_ALTERNATIVES:
+            alternatives = [head + rest[:open_] + option for head in alternatives for option in options]
         rest = rest[close + 1 :]
 
 
@@ -219,7 +227,11 @@ def _globs(names: Names, critical: bool, lines: list[str], seen: set[str], viola
             continue
         if critical and zone is None:
             violations.append(f"{file}: '{line}' comes before the first '# Zone <n>: ' header")
-        alternatives = expand(line)
+        try:
+            alternatives = expand(line)
+        except ValueError:
+            violations.append(f"{file}: more than {MAX_ALTERNATIVES} alternatives in '{line}'")
+            continue
         if not alternatives:
             violations.append(f"{file}: unbalanced or nested braces in '{line}'")
             continue

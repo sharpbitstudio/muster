@@ -202,6 +202,14 @@ class InvalidPolicyTest(PolicyCase):
         )
         self.assertIn("muster policy: error: the policy is invalid: 1 violation", err)
 
+    def test_line_with_more_than_1024_alternatives(self):
+        line = "{ab,cd}" * 30 + "/**"
+        self.write("policy/critical.txt", CRITICAL + line.encode("ascii") + b"\n")
+        code, env = self.envelope()
+        self.assertEqual((code, env["error"]["kind"]), (2, "policy"))
+        too_many = f"policy/critical.txt: more than 1024 alternatives in '{line}'"
+        self.assertEqual(env["sections"][0]["violations"], [too_many])
+
     def test_exit_two_with_and_without_strict(self):
         self.unclassify()
         for options in ([], ["--strict"], ["--strict-only", "coverage"], ["--fail-on-error"]):
@@ -294,6 +302,14 @@ class ProfileTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertTrue(env["error"]["message"].startswith('muster.toml: source.include[0]: bad glob "**.java"'))
 
+    def test_glob_with_more_than_1024_alternatives(self):
+        glob = "{ab,cd}" * 30 + "/*.java"
+        self.write("muster.toml", PROFILE.replace('include = ["**/*.java"]', f'include = ["{glob}"]'))
+        code, env = self.envelope()
+        self.assertEqual((code, env["error"]["kind"]), (2, "config"))
+        message = f'muster.toml: source.include[0]: bad glob "{glob}": more than 1024 alternatives'
+        self.assertEqual(env["error"]["message"], message)
+
     def suite(self, file: str) -> None:
         entry = f'\n[[coverage.full_run_suites]]\nname = "org.example.app.FullRunSuite"\nfile = "{file}"\n'
         self.write("muster.toml", PROFILE + entry)
@@ -319,6 +335,8 @@ class ProfileTest(PolicyCase):
         self.assertEqual(self.policy()[0], 2)
 
     def test_integer_that_toml_cannot_hold(self):
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)  # the default, which the message in hex relies on
         huge = "0x" + "f" * 5000
         cases = [
             (f"exemption_max_days = {huge}", "zones.exemption_max_days: must be a 64-bit integer"),
@@ -364,6 +382,23 @@ class ZoneListOutputTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot write --zones-out taken", err)
         self.assertTrue((self.work / "taken").is_dir())
+
+    def test_removed_when_stdout_cannot_take_the_envelope(self):
+        class ClosedPipe(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        err = io.StringIO()
+        argv = ["--repo", str(self.repo), "policy", "--format", "json", "--json-out", "out.json"]
+        with contextlib.redirect_stdout(ClosedPipe()), contextlib.redirect_stderr(err):
+            code = cli.main([*argv, "--zones-out", "zones.tsv", "--snapshot"])
+        self.assertEqual(code, 3)
+        document = self.read_json(self.work / "out.json")
+        self.assertEqual((document["exit_code"], document["error"]["kind"]), (3, "internal"))
+        self.assertEqual(document["error"]["message"], "cannot write stdout: Broken pipe")
+        self.assertIn("muster policy: error: cannot write stdout: Broken pipe", err.getvalue())
+        self.assertFalse((self.work / "zones.tsv").exists())
+        self.assertFalse(self.snapshot.exists())
 
     def test_removed_when_a_later_output_fails(self):
         (self.work / "taken").mkdir()
@@ -651,13 +686,19 @@ class OutputClashTest(PolicyCase):
         self.assertUntouched({critical: CRITICAL})
 
     def test_protected_files_never_raise_on_a_denied_folder(self):
-        denied = PermissionError(13, "Permission denied")
-        with (
-            mock.patch("os.stat", side_effect=denied),
-            mock.patch.object(Path, "is_dir", side_effect=denied),
-            mock.patch.object(Path, "is_file", side_effect=denied),
-        ):
-            self.assertIsInstance(protected(argparse.Namespace(), load(self.repo)), list)
+        denied, scandir = str(self.repo / BASE / "codec"), os.scandir
+
+        def listing(path="."):
+            if os.fspath(path) == denied:
+                raise PermissionError(13, "Permission denied", path)
+            return scandir(path)
+
+        args = argparse.Namespace()
+        with mock.patch("os.scandir", side_effect=listing):
+            files = protected(args, load(self.repo))
+        self.assertEqual(str(args.source_sets.error), f"source.roots: cannot read {denied}: Permission denied")
+        self.assertIn((f"the source file {SOURCES[3]}", self.repo / SOURCES[3]), files)
+        self.assertNotIn(f"the source file {SOURCES[2]}", [label for label, _ in files])
 
     def test_outputs_are_checked_when_the_snapshot_cannot_be_named(self):
         self.write("muster.toml", PROFILE.replace('[policy]\nsnapshot = "build/muster/snapshot.json"\n', ""))
@@ -686,6 +727,27 @@ class OutputClashTest(PolicyCase):
         self.assertEqual(code, 2)
         self.assertIn(f"is the source file {BASE}/codec/Linked.java", err)
         self.assertTrue(link.is_symlink())
+        self.assertUntouched({target: b"class X {}\n"})
+
+    def test_output_is_the_file_a_source_link_leads_to(self):
+        target = self.write("outside/Linked.java", "class X {}\n")
+        self.link(target, self.repo / BASE / "codec" / "Linked.java")
+        alias = self.work / "alias.tsv"
+        self.link(target, alias)
+        for output in (target, alias):
+            with self.subTest(output=output.name):
+                code, _, err = self.policy("--zones-out", str(output))
+                self.assertEqual(code, 2)
+                self.assertIn(f"is the source file {BASE}/codec/Linked.java", err)
+                self.assertTrue(alias.is_symlink())
+                self.assertUntouched({target: b"class X {}\n"})
+
+    def test_output_is_the_file_a_test_link_leads_to(self):
+        target = self.write("outside/LinkedTest.java", "class X {}\n")
+        self.link(target, self.repo / TESTS / "codec" / "LinkedTest.java")
+        code, _, err = self.policy("--zones-out", str(target))
+        self.assertEqual(code, 2)
+        self.assertIn(f"is the test file {TESTS}/codec/LinkedTest.java", err)
         self.assertUntouched({target: b"class X {}\n"})
 
     def test_summary_file_is_a_policy_file(self):

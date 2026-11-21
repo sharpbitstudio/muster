@@ -482,6 +482,16 @@ class GrammarHelperTest(unittest.TestCase):
         dead = f"{CRITICAL}: '{expand(line)[0]}' (alternative of '{line}') matches no source file"
         self.assertEqual(check(zoned(line), ["auth/*"], sources("auth/Token.java")), [dead])
 
+    def test_line_with_more_than_1024_alternatives(self):
+        line = "{ab,cd}" * 30 + "/**"
+        too_many = f"{CRITICAL}: more than 1024 alternatives in '{line}'"
+        self.assertEqual(check(zoned(line, "auth/**"), [], sources("auth/Token.java")), [too_many])
+        self.assertEqual(expand("{ab,cd}" * 30 + "/{x"), [])  # bad braces are still found
+        self.assertEqual(len(expand("{ab,cd}" * 10 + "/**")), 1024)
+        violations = check(zoned("{ab,cd}" * 10 + "/**", "auth/**"), [], sources("auth/Token.java"))
+        self.assertEqual(len(violations), 1024)
+        self.assertFalse(any("more than 1024" in violation for violation in violations))
+
     def test_glob_error(self):
         self.assertIsNone(glob_error("billing/**"))
         self.assertIsNone(glob_error("**"))
