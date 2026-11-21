@@ -477,11 +477,18 @@ class InternalErrorTest(CliCase):
         self.assertEqual((env["error"]["kind"], env["sections"]), ("internal", []))
 
     def test_data_nested_too_deeply_for_json_is_a_bug(self):
-        nested: list = []
-        for _ in range(10_000):
-            nested = [nested]
-        self.behave = lambda args, cfg, rep: rep.data.update(nested=nested)
-        code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json")
+        # How deep the encoder goes before a RecursionError depends on the Python version and on
+        # the stack, so the encoder raises it here for any envelope that carries a section.
+        encode = cli.json_text
+
+        def too_deep(document):
+            if document["sections"]:
+                raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+            return encode(document)
+
+        self.behave = lambda args, cfg, rep: rep.data.update(nested=[[[]]])
+        with mock.patch.object(cli, "json_text", side_effect=too_deep):
+            code, out, _ = self.run_main("--repo", str(self.repo), "coverage", "--format", "json")
         self.assertEqual(code, 3)
         env = json.loads(out)
         self.assertEqual((env["error"]["kind"], env["sections"]), ("internal", []))
