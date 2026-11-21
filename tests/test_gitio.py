@@ -1,5 +1,5 @@
-"""Tests of muster.gitio: running git, the repository root, the merge base and
-reading git output.
+"""Tests of muster.gitio: running git, the repository root, the merge base,
+reading git output, and the changes since a base.
 
 The repositories are built in temporary folders, with git's global and system
 configuration switched off and a synthetic identity given per command.
@@ -14,7 +14,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from muster.gitio import find_repo_root, git, merge_base, records, unquote_git_path
+from muster.gitio import (
+    count_file_lines,
+    diff_since,
+    find_repo_root,
+    git,
+    merge_base,
+    parse_diff,
+    records,
+    ref_problem,
+    unquote_git_path,
+    untracked_under,
+)
 from muster.report import ReportError
 
 IDENTITY = (
@@ -23,9 +34,50 @@ IDENTITY = (
     "-c", "commit.gpgsign=false",
 )
 
+ENGINE = "src/main/java/org/example/app/billing/internal/ledger/Engine.java"
+TOKEN = "src/main/java/org/example/app/auth/Token.java"
+KEY_PARSER = "src/main/java/org/example/app/codec/KeyParser.java"
+DISPATCHER = "src/main/java/org/example/app/queue/Dispatcher.java"
+TOKEN_CHECK = "src/test/java/org/example/app/auth/TokenCheck.java"
+# Line breaks of str.splitlines() that are no line end for git: form feed,
+# U+2028, NEL, file separator, vertical tab, U+2029.
+ODD_BREAKS = [chr(code) for code in (0x0C, 0x2028, 0x85, 0x1C, 0x0B, 0x2029)]
+# A folder whose name is a glob, a sibling folder "ac" and a sibling file "bc".
+# git matches a glob pathspec against the whole path, so as a pattern the name
+# would take in the file "bc" (the files in "ac" have a longer path).
+GLOB_FOLDER = "src/main/java/org/example/app/[ab]c"
+GLOB_FOLDER_FILE = GLOB_FOLDER + "/Token.java"
+GLOB_SIBLINGS = ("src/main/java/org/example/app/ac/Token.java", "src/main/java/org/example/app/bc")
+
 
 def same_path(first: Path, second: Path) -> bool:
     return os.path.normcase(str(first.resolve())) == os.path.normcase(str(second.resolve()))
+
+
+def diff_text(*lines: str, end: str = "\n") -> str:
+    return "".join(line + end for line in lines)
+
+
+def file_header(path: str) -> tuple[str, ...]:
+    return (
+        f"diff --git a/{path} b/{path}",
+        "index 1111111..2222222 100644",
+        f"--- a/{path}",
+        f"+++ b/{path}",
+    )
+
+
+def c_quote(path: str) -> str:
+    """`path` as git quotes it: `"` and `\\` escaped, bytes above 0x7F in octal."""
+    out = []
+    for byte in path.encode("utf-8"):
+        if byte >= 0x80:
+            out.append(f"\\{byte:03o}")
+        elif chr(byte) in '"\\':
+            out.append("\\" + chr(byte))
+        else:
+            out.append(chr(byte))
+    return '"' + "".join(out) + '"'
 
 
 class GitRepoCase(unittest.TestCase):
@@ -106,6 +158,30 @@ class MergeBaseTest(GitRepoCase):
 
     def test_missing_ref(self):
         self.assertIsNone(merge_base(self.repo, "no-such-ref"))
+
+    def test_valid_ref_resolves(self):
+        self.assertEqual(merge_base(self.repo, "main"), self.fork)
+
+    def test_option_like_or_empty_ref_never_reaches_git(self):
+        for ref in ("-x", "--all", ""):
+            with self.subTest(ref=ref), mock.patch("muster.gitio.subprocess.run") as run:
+                with self.assertRaises(ValueError) as ctx:
+                    merge_base(self.repo, ref)
+                run.assert_not_called()
+                self.assertIn(repr(ref), str(ctx.exception))
+
+
+class RefProblemTest(unittest.TestCase):
+    def test_problems(self):
+        cases = {"": "is empty", "-x": "starts with -", "--all": "starts with -", "main\0x": "has a NUL"}
+        for ref, problem in cases.items():
+            with self.subTest(ref=ref):
+                self.assertEqual(ref_problem(ref), problem)
+
+    def test_ordinary_refs_pass(self):
+        for ref in ("main", "origin/main", "HEAD~2", "feature/retry-queue", "a" * 40):
+            with self.subTest(ref=ref):
+                self.assertIsNone(ref_problem(ref))
 
 
 class FindRepoRootTest(GitRepoCase):
@@ -197,6 +273,244 @@ class RecordsTest(unittest.TestCase):
 
     def test_single_newline_is_one_empty_line(self):
         self.assertEqual(records("\n"), [""])
+
+
+class ParseDiffTest(unittest.TestCase):
+    def test_hunk_without_counts_adds_one_line(self):
+        text = diff_text(*file_header(ENGINE), "@@ -4 +5 @@", "-old", "+new")
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {5}})
+
+    def test_pure_deletion_adds_nothing(self):
+        text = diff_text(*file_header(ENGINE), "@@ -7,2 +6,0 @@", "-one", "-two")
+        self.assertEqual(parse_diff(text, ""), {})
+
+    def test_insertion_adds_every_new_line(self):
+        text = diff_text(*file_header(ENGINE), "@@ -29,0 +30,3 @@", "+one", "+two", "+three")
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {30, 31, 32}})
+
+    def test_deleted_file_adds_nothing(self):
+        text = diff_text(
+            f"diff --git a/{ENGINE} b/{ENGINE}",
+            "deleted file mode 100644",
+            "index 1111111..0000000",
+            f"--- a/{ENGINE}",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-one",
+            "-two",
+            *file_header(TOKEN),
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        )
+        self.assertEqual(parse_diff(text, ""), {TOKEN: {1}})
+
+    def test_quoted_path_is_unquoted(self):
+        name = 'src/main/java/org/example/app/codec/Key"Parser' + chr(0x65E5) + chr(0x672C) + ".java"
+        old, new = c_quote("a/" + name), c_quote("b/" + name)
+        self.assertIn('\\"Parser\\346\\227\\245\\346\\234\\254.java"', new)
+        text = diff_text(f"diff --git {old} {new}", f"--- {old}", f"+++ {new}", "@@ -2 +2 @@", "-old", "+new")
+        self.assertEqual(parse_diff(text, ""), {name: {2}})
+
+    def test_no_newline_marker_changes_no_count(self):
+        text = diff_text(
+            *file_header(ENGINE),
+            "@@ -9 +9,2 @@",
+            "-last",
+            "\\ No newline at end of file",
+            "+last",
+            "+added",
+            "\\ No newline at end of file",
+            *file_header(TOKEN),
+            "@@ -3 +3 @@",
+            "-old",
+            "+new",
+        )
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {9, 10}, TOKEN: {3}})
+
+    def test_prefix_is_stripped_and_files_outside_it_left_out(self):
+        text = diff_text(
+            *file_header(ENGINE),
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            *file_header(TOKEN_CHECK),
+            "@@ -2 +2 @@",
+            "-old",
+            "+new",
+            *file_header("build.gradle"),
+            "@@ -3 +3 @@",
+            "-old",
+            "+new",
+        )
+        self.assertEqual(parse_diff(text, "src/main/java/"), {"org/example/app/billing/internal/ledger/Engine.java": {1}})
+
+    def test_context_lines_of_merged_hunk_are_not_changes(self):
+        text = diff_text(
+            *file_header(ENGINE),
+            "@@ -3,6 +3,6 @@",
+            "-old three",
+            "+new three",
+            " four",
+            " five",
+            " six",
+            " seven",
+            "-old eight",
+            "+new eight",
+        )
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {3, 8}})
+
+    def test_hunk_lines_that_look_like_file_headers(self):
+        text = diff_text(
+            *file_header(ENGINE),
+            "@@ -2 +2 @@",
+            "--- x",
+            "+++ x",
+            "@@ -10,0 +11 @@",
+            "+later",
+        )
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {2, 11}})
+
+    def test_only_line_feed_ends_a_record(self):
+        breaks = [*ODD_BREAKS, "\r"]
+        lines = [
+            *file_header(ENGINE),
+            f"@@ -1,{len(breaks) + 1} +1,{len(breaks) + 1} @@",
+            *(f" context{brk} more" for brk in breaks),
+            "-old",
+            "+new",
+            f"@@ -20,0 +21,{len(breaks)} @@",
+            *(f"+added{brk}+more" for brk in breaks),
+        ]
+        expected = {ENGINE: {len(breaks) + 1, *range(21, 21 + len(breaks))}}
+        for end in ("\n", "\r\n"):
+            with self.subTest(end=repr(end)):
+                self.assertEqual(parse_diff(diff_text(*lines, end=end), ""), expected)
+
+    def test_short_hunk_ends_at_next_file(self):
+        text = diff_text(
+            *file_header(ENGINE),
+            "@@ -1,5 +1,5 @@",
+            "-old",
+            "+new",
+            *file_header(TOKEN),
+            "@@ -3 +3 @@",
+            "-old",
+            "+new",
+        )
+        self.assertEqual(parse_diff(text, ""), {ENGINE: {1}, TOKEN: {3}})
+
+
+class CountFileLinesTest(unittest.TestCase):
+    def test_counts_records(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        odd = ("one" + chr(0x0C) + chr(0x2028) + chr(0x85) + "\r" + "two").encode("utf-8")
+        cases = [(b"", 0), (b"x", 1), (b"x\n", 1), (b"a\n\nb", 3), (b"a\r\nb\r\n", 2), (odd, 1)]
+        for number, (data, expected) in enumerate(cases):
+            with self.subTest(data=data):
+                path = folder / f"sample{number}.txt"
+                path.write_bytes(data)
+                self.assertEqual(count_file_lines(path), expected)
+
+
+class ChangesRepoCase(GitRepoCase):
+    """A repository whose files are written and committed by path."""
+
+    def write(self, root: Path, relative: str, data: str):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data.encode("utf-8"))
+
+    def commit_all(self, repo: Path, message: str) -> str:
+        self.run_git(repo, "add", "-A")
+        return self.commit(repo, message)
+
+
+class DiffSinceTest(ChangesRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+
+    def test_lines_with_other_line_breaks(self):
+        # The text after each break starts with a space: split there, it would read as a context line.
+        lines = [f"line{number}{brk} tail" for number, brk in enumerate(ODD_BREAKS, 1)]
+        self.write(self.repo, ENGINE, "\n".join(lines) + "\n")
+        base = self.commit_all(self.repo, "base")
+        lines[1] = "edited" + ODD_BREAKS[1] + " tail"
+        lines[4] = "edited" + ODD_BREAKS[4] + " tail"
+        self.write(self.repo, ENGINE, "\n".join(lines) + "\n")
+        self.assertEqual(parse_diff(diff_since(self.repo, base, ["src/main/java"]), ""), {ENGINE: {2, 5}})
+
+    def test_inter_hunk_context_of_repo_config_adds_no_lines(self):
+        self.run_git(self.repo, "config", "--local", "diff.interHunkContext", "10")
+        lines = [f"line {number}" for number in range(1, 21)]
+        self.write(self.repo, ENGINE, "\n".join(lines) + "\n")
+        base = self.commit_all(self.repo, "base")
+        lines[4] = "edited 5"
+        lines[9] = "edited 10"
+        self.write(self.repo, ENGINE, "\n".join(lines) + "\n")
+        self.assertEqual(parse_diff(diff_since(self.repo, base, ["src/main/java"]), ""), {ENGINE: {5, 10}})
+
+    def test_paths_relative_to_profile_root_in_subfolder(self):
+        profile_root = self.repo / "app"
+        self.write(profile_root, ENGINE, "one\n")
+        self.write(self.repo, DISPATCHER, "one\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(profile_root, ENGINE, "edited\n")
+        self.write(self.repo, DISPATCHER, "edited\n")
+        changed = parse_diff(diff_since(profile_root, base, ["src/main/java"]), "")
+        self.assertEqual(changed, {ENGINE: {1}})
+
+    def test_glob_characters_in_folder_match_literally(self):
+        for path in (GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "one\n")
+        base = self.commit_all(self.repo, "base")
+        for path in (GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "edited\n")
+        changed = parse_diff(diff_since(self.repo, base, [GLOB_FOLDER]), "")
+        self.assertEqual(changed, {GLOB_FOLDER_FILE: {1}})
+
+
+class UntrackedUnderTest(ChangesRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+        self.profile_root = self.repo / "app"
+        self.write(self.profile_root, ".gitignore", "*.log\n")
+        self.write(self.profile_root, ENGINE, "one\n")
+        self.commit_all(self.repo, "base")
+
+    def test_lists_untracked_files_under_folders(self):
+        self.write(self.profile_root, TOKEN_CHECK, "one\n")
+        self.write(self.profile_root, DISPATCHER, "one\n")
+        self.write(self.profile_root, "src/main/java/org/example/app/queue/trace.log", "one\n")
+        self.write(self.profile_root, "docs/notes.txt", "one\n")
+        found = untracked_under(self.profile_root, ["src/test/java", "src/main/java"])
+        self.assertEqual(found, [DISPATCHER, TOKEN_CHECK])
+
+    def test_glob_characters_in_folder_match_literally(self):
+        for path in (GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.profile_root, path, "one\n")
+        self.assertEqual(untracked_under(self.profile_root, [GLOB_FOLDER]), [GLOB_FOLDER_FILE])
+
+
+class GitNotRunnableTest(GitRepoCase):
+    def test_os_error_becomes_report_error(self):
+        calls = {
+            "diff_since": lambda: diff_since(self.root, "HEAD", ["src/main/java"]),
+            "untracked_under": lambda: untracked_under(self.root, ["src/main/java"]),
+        }
+        for name, call in calls.items():
+            with self.subTest(helper=name), mock.patch("muster.gitio.subprocess.run", side_effect=FileNotFoundError):
+                with self.assertRaises(ReportError):
+                    call()
+
+    def test_missing_folder_becomes_report_error(self):
+        gone = self.root / "gone"
+        with self.assertRaises(ReportError):
+            diff_since(gone, "HEAD", ["src/main/java"])
+        with self.assertRaises(ReportError):
+            untracked_under(gone, ["src/main/java"])
 
 
 if __name__ == "__main__":
