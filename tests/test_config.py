@@ -503,6 +503,18 @@ class GlobTest(ValidateCase):
                     self.assertEqual(self.error(doc(key, [glob])), f"{key}[0]: {prefix} {problem}")
         validate(doc("source.include", ["{src,lib}/**/*.{py,pyi}", "src/{,app/}main.py"]))
 
+    def test_no_alternative_of_the_test_results_leaves_the_repository(self):
+        prefix = "must be a path relative to the repository root with / separators; its alternative"
+        cases = [
+            ("{../reports,build}/*.xml", '"../reports/*.xml" has a .. segment'),
+            ("{build,/work}/*.xml", '"/work/*.xml" starts with /'),
+            ("{build," + DRIVE + "/work}/*.xml", f'"{DRIVE}/work/*.xml" starts with a drive'),
+        ]
+        for glob, problem in cases:
+            with self.subTest(glob=glob):
+                self.assertEqual(self.error(doc("tests.results", glob)), f"tests.results: {prefix} {problem}")
+        validate(doc("tests.results", "{app,lib}/build/test-results/**/TEST-*.xml"))
+
     def test_own_test_forbidden_is_a_glob_of_file_names(self):
         validate(doc("mutation.own_test_forbidden", ["*IntegrationTest*", "{Slow,Live}*"]))
         message = self.error(doc("mutation.own_test_forbidden", ["*Test*", "{Integration"]))
