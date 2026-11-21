@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__, coverage, policy
+from muster import __version__, coverage, duration, policy
 from muster.config import DEFAULT_CONFIG, SECTIONS, Config, ConfigError, config_path, load, load_unchecked
 from muster.gitio import find_repo_root, git, merge_base
 from muster.report import (
@@ -87,6 +87,7 @@ ANALYSES: dict[str, Analysis] = {
     "coverage": Analysis(
         coverage.run, coverage.HELP, coverage.arguments, coverage.inputs, protected=coverage.protected
     ),
+    "duration": Analysis(duration.run, duration.HELP, inputs=duration.inputs, protected=duration.protected),
 }
 
 

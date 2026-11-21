@@ -162,6 +162,15 @@ def doc(key: str, value) -> dict:
     return root
 
 
+def accepted(key: str, value) -> dict:
+    """doc(key, value), with both duration thresholds set to the value for a duration threshold: an
+    error threshold below the warning one, a default included, is refused on its own."""
+    data = doc(key, value)
+    if key in ("duration.warn_s", "duration.error_s"):
+        data["duration"] = {"warn_s": value, "error_s": value}
+    return data
+
+
 def shown(key: str) -> str:
     """The key as an error message names it: the one entry of an array is entry 0."""
     return key.replace("[]", "[0]")
@@ -326,8 +335,8 @@ class RangeTest(ValidateCase):
     def test_positive_values(self):
         for key in POSITIVE_KEYS:
             with self.subTest(key=key):
-                validate(doc(key, 0.5))
-                validate(doc(key, 1000))
+                validate(accepted(key, 0.5))
+                validate(accepted(key, 1000))
                 self.assertEqual(self.error(doc(key, 0)), f"{key}: must be greater than 0, got 0")
                 self.assertEqual(self.error(doc(key, -1.5)), f"{key}: must be greater than 0, got -1.5")
 
@@ -342,6 +351,50 @@ class RangeTest(ValidateCase):
             with self.subTest(key=key):
                 validate(doc(key, 0))
                 self.assertEqual(self.error(doc(key, -1)), f"{shown(key)}: must be 0 or more, got -1")
+
+
+class DurationThresholdTest(ValidateCase):
+    """The effective error threshold, a default included, must not be below the warning one."""
+
+    def test_error_below_the_default_warning(self):
+        self.assertEqual(
+            self.error(doc("duration.error_s", 200)), "duration.error_s: 200 is below duration.warn_s 240 (the default)"
+        )
+
+    def test_warning_above_the_default_error(self):
+        self.assertEqual(
+            self.error(doc("duration.warn_s", 400)), "duration.error_s: 300 (the default) is below duration.warn_s 400"
+        )
+
+    def test_both_set_and_inverted(self):
+        data = {"duration": {"warn_s": 120, "error_s": 90.5}}
+        self.assertEqual(self.error(data), "duration.error_s: 90.5 is below duration.warn_s 120")
+
+    def test_equal_thresholds_are_allowed(self):
+        validate({"duration": {"warn_s": 240, "error_s": 240.0}})
+        validate(doc("duration.error_s", 240))
+        validate(doc("duration.warn_s", 300))
+
+    def test_one_side_within_the_default(self):
+        validate(doc("duration.warn_s", 60))
+        validate(doc("duration.error_s", 600))
+
+    def test_effective_values(self):
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), {})
+        self.assertEqual((cfg.duration_warn_s, cfg.duration_error_s), (240, 300))
+        self.assertEqual((cfg.duration_source, cfg.duration_task), ("task-json", None))
+        data = {"duration": {"warn_s": 90, "error_s": 150.5, "source": "junit-span", "task": ":app:test"}}
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), data)
+        self.assertEqual((cfg.duration_warn_s, cfg.duration_error_s), (90, 150.5))
+        self.assertEqual((cfg.duration_source, cfg.duration_task), ("junit-span", ":app:test"))
+
+    def test_load_names_the_file(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "muster.toml").write_bytes(b"[duration]\nerror_s = 120\n")
+        with self.assertRaises(ConfigError) as ctx:
+            load(root)
+        message = "muster.toml: duration.error_s: 120 is below duration.warn_s 240 (the default)"
+        self.assertEqual((str(ctx.exception), ctx.exception.kind), (message, "config"))
 
 
 class SchemaVersionTest(ValidateCase):
@@ -596,7 +649,7 @@ class NeverInternalErrorTest(ValidateCase):
     def test_integer_beyond_64_bits(self):
         for key in COUNT_KEYS + POSITIVE_KEYS:
             with self.subTest(key=key):
-                validate(doc(key, 2**63 - 1))
+                validate(accepted(key, 2**63 - 1))
                 self.assertEqual(self.error(doc(key, 2**63)), f"{shown(key)}: {self.BEYOND_64_BITS}")
                 self.assertEqual(self.error(doc(key, 16**5000)), f"{shown(key)}: {self.BEYOND_64_BITS}")
         huge = -(16**5000)
