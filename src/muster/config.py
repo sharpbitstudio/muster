@@ -30,6 +30,8 @@ DEFAULT_EXEMPTION_MAX_DAYS = 30
 # The coverage thresholds that apply where the profile sets none (POLICY.md, point 4).
 DEFAULT_FLOOR_LINE, DEFAULT_FLOOR_BRANCH = 0.80, 0.65
 DEFAULT_DELTA_LINE, DEFAULT_DELTA_BRANCH = 0.80, 0.80
+# The duration thresholds in seconds that apply where the profile sets none (POLICY.md, point 5).
+DEFAULT_WARN_S, DEFAULT_ERROR_S = 240, 300
 
 
 class ConfigError(FatalError):
@@ -362,9 +364,26 @@ SCHEMA: dict[str, Check] = {
 }
 
 
+def _check_duration(data: dict) -> None:
+    """The effective error threshold of the duration, a default included, is not below the warning
+    threshold; the two may be equal."""
+    duration = data.get("duration", {})
+    warn_s = duration.get("warn_s", DEFAULT_WARN_S)
+    error_s = duration.get("error_s", DEFAULT_ERROR_S)
+    if error_s < warn_s:
+
+        def shown(key: str, value: Any) -> str:
+            return _shown(value) + ("" if key in duration else " (the default)")
+
+        raise ConfigError(
+            f"duration.error_s: {shown('error_s', error_s)} is below duration.warn_s {shown('warn_s', warn_s)}"
+        )
+
+
 def validate(data: dict) -> None:
     """Raises ConfigError naming the first problem of a parsed muster.toml."""
     _check_table("", data, SCHEMA)
+    _check_duration(data)
 
 
 def config_path(root: Path, value: str) -> Path:
@@ -413,6 +432,23 @@ class Config:
     def coverage_delta(self) -> dict[str, float]:
         """The effective delta gate: each key the profile leaves out of coverage.delta has its default."""
         return {"line": DEFAULT_DELTA_LINE, "branch": DEFAULT_DELTA_BRANCH, **self.get("coverage.delta", {})}
+
+    @property
+    def duration_source(self) -> str:
+        return self.get("duration.source", "task-json")
+
+    @property
+    def duration_task(self) -> str | None:
+        """The task a timing record must name; None when the profile does not check it."""
+        return self.get("duration.task")
+
+    @property
+    def duration_warn_s(self) -> float:
+        return self.get("duration.warn_s", DEFAULT_WARN_S)
+
+    @property
+    def duration_error_s(self) -> float:
+        return self.get("duration.error_s", DEFAULT_ERROR_S)
 
     @property
     def coverage_format(self) -> str:

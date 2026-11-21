@@ -27,7 +27,7 @@ Coverage is a floor for critical zones, never a goal of its own. By default the 
 
 ## 5. A duration budget with warn and error thresholds
 
-The wall time of the test suite is compared with two thresholds. Above the warning threshold the run gets a warning; above the error threshold it gets an error. A failed or interrupted run has no duration verdict. A test that noticeably lengthens the suite needs a reason in review.
+The wall time of the test suite is compared with two thresholds. Above the warning threshold the run gets a warning; above the error threshold it gets an error. By default a run gets a warning above 240 seconds and an error above 300 seconds; the profile changes them. A failed or interrupted run has no duration verdict. A test that noticeably lengthens the suite needs a reason in review.
 
 ## 6. Mutation testing over an allowlist
 
