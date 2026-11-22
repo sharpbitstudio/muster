@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from muster import __version__
-from muster.config import Config, ConfigError, require
+from muster.config import Config, ConfigError, named_files, require
 from muster.gitio import records
 from muster.paths import SourceSets, exists_exact, source_sets
 from muster.report import FatalError, Report, ReportError, json_text, md_path, write_json
@@ -69,16 +70,9 @@ def _policy_files(cfg: Config) -> list[tuple[str, str]]:
 
 
 def inputs(cfg: Config) -> list[tuple[str, Path]]:
-    """The policy files and the coverage.full_run_suites files the profile names (label, path). It
-    never raises, not even on a profile that failed its check, where it takes the string values it
-    finds: the command line protects them before this command can report any error."""
-    named = [(f"the file of {key}", cfg.get(key)) for key in POLICY_FILES]
-    suites = cfg.get("coverage.full_run_suites")
-    for i, suite in enumerate(suites if isinstance(suites, list) else []):
-        if isinstance(suite, dict):
-            named.append((f"the file of coverage.full_run_suites[{i}].file", suite.get("file")))
-    usable = [(label, value) for label, value in named if isinstance(value, str) and value and "\0" not in value]
-    return [(label, cfg.root / value) for label, value in usable]
+    """Every file the profile names (label, path) but the snapshot, which this command writes. Like
+    config.named_files, it never raises, not even on a profile that failed its check."""
+    return named_files(cfg, leave_out=("policy.snapshot",))
 
 
 def outputs(args: argparse.Namespace, cfg: Config) -> tuple[list[tuple[str, Path, bool, bool]], FatalError | None]:
@@ -101,12 +95,12 @@ def outputs(args: argparse.Namespace, cfg: Config) -> tuple[list[tuple[str, Path
 
 
 def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
-    """The repository files no output may be: every walked source and test file. It never raises:
-    the walk is kept in args.source_sets for run(), which reports a folder that is missing or cannot
-    be read."""
+    """The repository files no output may be: every file the walk of the source and the test
+    folders found, before the include, exclude and generated globs. It never raises: the walk is
+    kept in args.source_sets for run(), which reports a folder that is missing or cannot be read."""
     sets = args.source_sets = source_sets(cfg, defer=True)
-    files = [(f"the source file {path}", cfg.root / path) for path in sets.sources]
-    files += [(f"the test file {path}", cfg.root / path) for path in sorted(sets.tests)]
+    files = [(f"the source file {path}", cfg.root / path) for path in sets.walked_sources]
+    files += [(f"the test file {path}", cfg.root / path) for path in sets.walked_tests]
     return files
 
 
@@ -328,6 +322,15 @@ def _reject_constant(name: str) -> None:
     raise ValueError(f"{name} is no JSON number")
 
 
+def _finite(text: str) -> float:
+    """A JSON number with a fraction or an exponent; one too large for a float, such as 1e400, would
+    be an infinity."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is no finite number")
+    return value
+
+
 def _snapshot_problem(document: object) -> str | None:
     """What keeps a parsed document from having the shape of a snapshot, or None."""
     if not isinstance(document, dict):
@@ -363,9 +366,9 @@ def _snapshot_problem(document: object) -> str | None:
 def read_snapshot(path: Path, *, name: str | None = None) -> dict:
     """The snapshot in `path`, checked against the shape that --snapshot writes; a key it does not
     know is allowed. A missing file raises FileNotFoundError, for the caller to judge; any other
-    problem (unreadable, not UTF-8, not JSON, NaN or an infinity, nested too deeply, a missing key,
-    a value of the wrong type, another schema) is a ReportError that names the file: `name`, by
-    default the path."""
+    problem (unreadable, not UTF-8, not JSON, NaN or an infinity, also in a key it does not know,
+    nested too deeply, a missing key, a value of the wrong type, another schema) is a ReportError
+    that names the file: `name`, by default the path."""
     name = str(path) if name is None else name
     try:
         raw = path.read_bytes()
@@ -374,7 +377,7 @@ def read_snapshot(path: Path, *, name: str | None = None) -> dict:
     except OSError as exc:
         raise ReportError(f"{name}: cannot read the snapshot: {exc.strerror or exc}") from None
     try:
-        document = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        document = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite)
     except UnicodeDecodeError as exc:
         raise ReportError(f"{name}: the snapshot is not valid UTF-8 (byte {exc.start})") from None
     except ValueError as exc:

@@ -22,6 +22,7 @@ from muster.config import Config, ConfigError, load
 from muster.policy import (
     PolicyError,
     check_policy,
+    inputs,
     outputs,
     policy_hash,
     policy_sha256,
@@ -850,6 +851,36 @@ class OutputClashTest(PolicyCase):
         self.assertIn("is the file of coverage.full_run_suites[0].file", err)
         self.assertUntouched({test_file: b"class X {}\n", suite: b"class Suite {}\n"})
 
+    def test_output_is_a_file_under_the_folders_that_no_glob_matches(self):
+        notes = self.write(f"{BASE}/notes.txt", "data\n")
+        fixture = self.write(f"{TESTS}/codec/fixture.txt", "data\n")
+        for target, label in (
+            (self.repo / BASE / "package-info.java", f"the source file {BASE}/package-info.java"),
+            (notes, f"the source file {BASE}/notes.txt"),
+            (fixture, f"the test file {TESTS}/codec/fixture.txt"),
+        ):
+            with self.subTest(target=target.name):
+                before = target.read_bytes()
+                code, _, err = self.policy("--json-out", str(target))
+                self.assertEqual(code, 2)
+                self.assertIn(f"--json-out {target} is {label}", err)
+                self.assertUntouched({target: before})
+
+    def test_output_is_a_file_the_profile_names_for_another_command(self):
+        tables = '\n[coverage]\nreport = "build/jacoco/report.xml"\n\n[duration]\ntask_json = "build/task.json"\n'
+        self.write("muster.toml", PROFILE + tables)
+        for path, key in (("build/jacoco/report.xml", "coverage.report"), ("build/task.json", "duration.task_json")):
+            with self.subTest(key=key):
+                target = self.write(path, "kept\n")
+                code, _, err = self.policy("--json-out", str(target))
+                self.assertEqual(code, 2)
+                self.assertIn(f"--json-out {target} is the file of {key}", err)
+                self.assertUntouched({target: b"kept\n"})
+
+    def test_own_snapshot_is_no_input(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertNotIn("the file of policy.snapshot", [label for label, _ in inputs(load(self.repo))])
+
     def test_source_file_is_protected_when_another_root_is_missing(self):
         self.write("muster.toml", PROFILE.replace('roots = ["src/main/java"]', 'roots = ["lib/src", "src/main/java"]'))
         source = self.repo / SOURCES[2]
@@ -1090,6 +1121,7 @@ class ReadSnapshotTest(unittest.TestCase):
             ("NaN", text(created_epoch_ms=float("nan")), None),
             ("Infinity", text(created_epoch_ms=float("inf")), None),
             ("-Infinity", text(created_epoch_ms=float("-inf")), None),
+            ("1e9999 in a key it does not know", text(later=1).replace(b'"later": 1', b'"later": 1e9999'), "1e9999"),
             ("top level a list", b"[]", None),
             ("top level a string", b'"snapshot"', None),
             ("nested too deeply", b"[" * 100_000 + b"]" * 100_000, None),

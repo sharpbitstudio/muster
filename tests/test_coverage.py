@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 from muster import cli, coverage
+from muster.adapters import junit
 from muster.config import (
     DEFAULT_DELTA_BRANCH,
     DEFAULT_DELTA_LINE,
@@ -321,6 +322,15 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(found, [(f"{round(a * 100)}", f"{round(b * 100)}") for a, b in expected])
         self.assertIn("By default the floor is", point)
 
+    def test_policy_text_says_at_least_where_equality_passes(self):
+        text = (REPO_ROOT / "POLICY.md").read_bytes().decode("ascii")
+        point = text.split("## 4. ", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("**Floor:** line and branch coverage of the whole code base is at least a global minimum.", point)
+        self.assertIn("since the merge base must be at least a threshold of its own.", point)
+        self.assertNotIn("above", point)
+        preamble = text.split("\n## ", 1)[0]
+        self.assertIn("where the profile does not, the default applies where the point names one.", preamble)
+
 
 class ArgumentTest(CoverageCase):
     def test_option_shaped_or_empty_base_is_a_usage_error(self):
@@ -357,6 +367,13 @@ class ArgumentTest(CoverageCase):
         code, env = self.json_main("coverage", "--diff-file=")
         self.assertEqual((code, env["error"]["kind"]), (2, "usage"))
         self.assertIn("the file name is empty", env["error"]["message"])
+
+    def test_nul_in_the_diff_file_is_a_usage_error(self):
+        for value in ("folder" + chr(0) + "/change.diff", "change" + chr(0) + ".diff"):
+            with self.subTest(value=value):
+                code, env = self.json_main("coverage", "--diff-file", value)
+                self.assertEqual((code, env["error"]["kind"]), (2, "usage"))
+                self.assertIn("the file name has a NUL", env["error"]["message"])
 
     def test_diff_file_that_cannot_be_read_is_a_usage_error(self):
         self.measure()
@@ -564,6 +581,22 @@ class SnapshotFreshnessTest(CoverageCase):
         self.assertEqual(run.data["reasons"], [f"no JaCoCo XML at {REPORT}"])
         self.assertEqual(run.verdict, f"coverage: NOT EVALUATED (no JaCoCo XML at {REPORT}; freshness not checked)")
 
+    def test_not_evaluated_data_has_the_thresholds_and_the_counts(self):
+        thresholds = {
+            "floor": {"line": DEFAULT_FLOOR_LINE, "branch": DEFAULT_FLOOR_BRANCH},
+            "delta": {"line": DEFAULT_DELTA_LINE, "branch": DEFAULT_DELTA_BRANCH},
+        }
+        self.measure({"src/main/java/org/example/other/Gone.java": lines_of(1)}, only=True)
+        data = self.coverage("--no-freshness").data
+        self.assertEqual(data["outcome"], "not-evaluated")
+        self.assertEqual(data["thresholds"], thresholds)
+        self.assertEqual(data["unresolved"], {"count": 1, "names": ["org/example/other/Gone.java"]})
+        self.assertEqual(data["excluded"], {"count": 0, "paths": []})
+        (self.repo / REPORT).unlink()
+        data = self.coverage().data
+        self.assertEqual((data["outcome"], data["thresholds"]), ("not-evaluated", thresholds))
+        self.assertNotIn("unresolved", data)
+
     def test_report_without_sourcefile(self):
         self.measure({}, only=True)
         self.stale(self.coverage(), "the JaCoCo XML has no <sourcefile>")
@@ -605,6 +638,12 @@ class FullRunSuiteTest(CoverageCase):
     def test_window_spans_every_session(self):
         self.measure(sessions=[(100, 2000), (5000, 60_000)], suites=[(SUITE, 30_000, 2.0)])
         self.passed()
+
+    def test_window_is_exact_far_from_the_epoch(self):
+        start = datetime(9999, 1, 1, tzinfo=timezone.utc)
+        last = int((start - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()) * 1000
+        self.assertTrue(coverage._inside(junit.Suite(SUITE, "file.xml", start, 1.0), last, last))
+        self.assertFalse(coverage._inside(junit.Suite(SUITE, "file.xml", start, 1.00001), last, last))
 
     def test_suite_inside_a_wrapper(self):
         self.measure(suites=[(SUITE, 1000, 2.0, True)])
@@ -691,6 +730,16 @@ class FloorTest(CoverageCase):
         self.assertEqual(run.data["thresholds"], expected)
         self.assertIn("**Global floor** (82.5% line / 65% branch)", run.summary)
         self.assertIn("Gate: 80% line / 50% branch over changed lines of critical files", run.summary)
+
+    def test_threshold_keeps_the_precision_of_the_profile(self):
+        for fraction, text in ((0.8, "80%"), (0.07, "7%"), (0.825, "82.5%"), (0.8250001, "82.50001%"), (1, "100%")):
+            with self.subTest(fraction=fraction):
+                self.assertEqual(coverage._percent(fraction), text)
+        self.assertEqual(coverage._percent(0.8255555), "82.55555%")
+        report_line = 'report = "build/jacoco/report.xml"\n'
+        self.write("muster.toml", PROFILE.replace(report_line, report_line + "floor = { line = 0.8250001 }\n"))
+        self.measure()
+        self.assertIn("**Global floor** (82.50001% line / 65% branch)", self.passed().summary)
 
     def test_default_thresholds_in_the_data(self):
         self.measure()
@@ -974,6 +1023,9 @@ class InputErrorTest(CoverageCase):
         "missing attribute": ('mi="0" ci="3"', 'mi="0"'),
         "negative value": ('mi="0" ci="3"', 'mi="-1" ci="3"'),
         "unparseable": ("</report>", ""),
+        "more digits than int() reads": ('mi="0" ci="3"', 'mi="0" ci="' + "9" * 4301 + '"'),
+        "more than a long": ('mi="0" ci="3"', f'mi="0" ci="{2**63}"'),
+        "a counter too large for a float": ('missed="0" covered="10"', 'missed="0" covered="1' + "0" * 400 + '"'),
     }
     JUNIT = {
         "non-finite number": ('time="2.0">', 'time="inf">'),
@@ -990,6 +1042,7 @@ class InputErrorTest(CoverageCase):
         "missing attribute": ('"sources": [', '"source_list": ['),
         "negative value": ('"created_epoch_ms": ', '"created_epoch_ms": -1, "was": '),
         "unparseable": ("{", "["),
+        "an infinite number in an extra key": ('"created_epoch_ms": ', '"was": 1e9999, "created_epoch_ms": '),
     }
 
     def assert_errored(self, prefix: str) -> None:
@@ -1037,6 +1090,26 @@ class InputErrorTest(CoverageCase):
         for error in errors:
             self.assertIn(f"- {error}", run.summary)
         self.assertEqual(len(run.annotations), 2)
+
+    def test_report_or_snapshot_that_is_a_folder(self):
+        for path in (REPORT, SNAPSHOT):
+            with self.subTest(path=path):
+                self.measure()
+                (self.repo / path).unlink()
+                (self.repo / path).mkdir()
+                self.assert_errored(f"{path}: not a file")
+                self.assertEqual(self.coverage().section["errors"], [f"{path}: not a file"])
+                (self.repo / path).rmdir()
+
+    def test_every_broken_junit_file_is_listed(self):
+        other = "org.example.app.codec.OtherTest"
+        self.write("muster.toml", PROFILE + FULL_RUN)
+        self.measure(suites=[(SUITE, 1000, 2.0), (other, 1000, 2.0)])
+        for name in (SUITE, other):
+            self.replace(f"{RESULTS}/TEST-{name}.xml", "</testsuite>", "")
+        errors = self.coverage().section["errors"]
+        files = [f"{RESULTS}/TEST-{name}.xml" for name in (SUITE, other)]
+        self.assertEqual([error.split(":")[0] for error in errors], files)
 
     def test_junit_files_are_read_only_for_full_run_suites(self):
         self.measure()
@@ -1091,6 +1164,25 @@ class ProtectedFileTest(CoverageCase):
         self.assertEqual(env["error"]["message"], "--summary-file change.diff is --diff-file change.diff")
         self.assertEqual((code, diff.read_bytes()), (2, b""))
 
+    def test_excluded_file_under_a_source_root(self):
+        self.measure()
+        self.assert_refused(self.repo / PACKAGE_INFO, f"the source file {PACKAGE_INFO}")
+
+    def test_file_under_a_test_folder_that_no_glob_matches(self):
+        fixture = self.write(f"{TESTS}/codec/fixture.txt", "data\n")
+        self.measure()
+        self.assert_refused(fixture, f"the test file {TESTS}/codec/fixture.txt")
+
+    def test_files_the_profile_names_for_other_commands(self):
+        tables = '\n[duration]\ntask_json = "build/muster/test-task.json"\n'
+        tables += '\n[mutation]\nreport = "build/mutation/mutations.xml"\n'
+        self.write("muster.toml", PROFILE + tables)
+        for path in ("build/muster/test-task.json", "build/mutation/mutations.xml"):
+            self.write(path, "{}\n")
+        self.measure()
+        self.assert_refused(self.repo / "build/muster/test-task.json", "the file of duration.task_json")
+        self.assert_refused(self.repo / "build/mutation/mutations.xml", "the file of mutation.report")
+
     def test_report_and_snapshot(self):
         self.measure()
         self.assert_refused(self.repo / REPORT, "the file of coverage.report")
@@ -1102,10 +1194,11 @@ class ProtectedFileTest(CoverageCase):
         self.assert_refused(self.repo / REPORT, "the file of coverage.report")
 
     def test_inputs_never_raise_on_an_unchecked_profile(self):
+        inputs = cli.ANALYSES["coverage"].inputs
         data = {"coverage": {"report": ["not", "a", "path"]}, "policy": {"snapshot": "build/x" + chr(0) + ".json"}}
-        self.assertEqual(coverage.inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
+        self.assertEqual(inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
         data = {"coverage": "a string", "policy": 7}
-        self.assertEqual(coverage.inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
+        self.assertEqual(inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
 
 
 class BaseInEnvelopeTest(CoverageCase):
@@ -1117,6 +1210,14 @@ class BaseInEnvelopeTest(CoverageCase):
     def test_null_without_base(self):
         self.measure()
         self.assertIsNone(self.passed().env["base"])
+
+    def test_kept_on_a_usage_error_after_the_parse(self):
+        head = self.git("rev-parse", "HEAD")
+        for argv in (["--json-out", "-"], ["--summary-file="]):
+            with self.subTest(argv=argv):
+                code, env = self.json_main("coverage", "--base", "HEAD", *argv)
+                self.assertEqual((code, env["error"]["kind"]), (2, "usage"))
+                self.assertEqual((env["base"], env["commit"]), ({"ref": "HEAD", "commit": head}, head))
 
     def test_kept_on_a_config_error(self):
         self.write("muster.toml", PROFILE.replace('[coverage]\nreport = "build/jacoco/report.xml"\n', ""))

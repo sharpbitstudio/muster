@@ -6,8 +6,9 @@ policy command, also without a report), then the report and its freshness. Fresh
 snapshot that `muster policy --snapshot` wrote before the tests with the current policy and source
 set, and the sessions of the report and the JUnit results with each other and with the time of the
 snapshot; a check that fails leaves the section not evaluated. Zones and exemptions always come
-from the current classification. A report, a snapshot or a JUnit file that cannot be read is an
-input error, and the section then has no verdict.
+from the current classification. A report, a snapshot or a JUnit file that cannot be read, or a
+configured path that is there but is not a file, is an input error, and the section then has no
+verdict.
 
 With --base, the changed lines of critical files since the merge base must be covered at least as
 far as the delta thresholds; a base without a merge base, or a git failure, leaves the delta not
@@ -18,29 +19,26 @@ from __future__ import annotations
 
 import argparse
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from pathlib import Path
 
 from muster import policy
-from muster.adapters import SourceResolver, jacoco, junit
+from muster.adapters import SourceResolver, exists, jacoco, junit
 from muster.adapters.jacoco import CoverageReport, FileCoverage
 from muster.config import Config, require
 from muster.gitio import count_file_lines, diff_since, parse_diff, ref_problem, untracked_under
-from muster.paths import exists_exact, resolve_glob
+from muster.paths import resolve_glob
 from muster.policy import CheckedPolicy
 from muster.report import FatalError, Report, ReportError, md_path
 
 HELP = "global floor, zones table and the critical delta gate"
 EXPIRY_WARN_DAYS = 7  # an exemption that ends within this many days, today included, gets a warning
-TOLERANCE_MS = 1000  # clock rounding between the build, the JUnit XML and the coverage agent
 UNCOVERED_FILES_CAP = 50
 UNCOVERED_ITEMS_CAP = 40
 SHOWN_PATHS = 10  # paths listed in data for the excluded and the unresolved files
 NO_SNAPSHOT = 'no snapshot: run "muster policy --snapshot" before the tests'
 SKIPPED_NOTE = "; freshness not checked"
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_MS = timedelta(milliseconds=1)
 
 
 def _ref(text: str) -> str:
@@ -53,6 +51,8 @@ def _ref(text: str) -> str:
 def _file_name(text: str) -> str:
     if not text:
         raise argparse.ArgumentTypeError("the file name is empty")
+    if "\0" in text:
+        raise argparse.ArgumentTypeError("the file name has a NUL")
     return text
 
 
@@ -74,18 +74,6 @@ def arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--diff-file", type=_file_name, help=argparse.SUPPRESS)
     parser.add_argument("--no-freshness", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--today", type=_day, help=argparse.SUPPRESS)
-
-
-def inputs(cfg: Config) -> list[tuple[str, Path]]:
-    """The policy files, the full-run suite files, the coverage report and the snapshot that the
-    profile names (label, path). Like policy.inputs, it never raises, not even on a profile that
-    failed its check."""
-    named = policy.inputs(cfg)
-    for key in ("coverage.report", "policy.snapshot"):
-        value = cfg.get(key)
-        if isinstance(value, str) and value and "\0" not in value:
-            named.append((f"the file of {key}", cfg.root / value))
-    return named
 
 
 def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
@@ -144,8 +132,9 @@ def add_to(acc: dict, sf: FileCoverage) -> None:
 
 
 def _percent(fraction: float) -> str:
-    """A threshold as a percentage, as precise as the profile gives it: 0.8 is 80%, 0.825 is 82.5%."""
-    return f"{round(fraction * 100, 6):g}%"
+    """A threshold as a percentage, as precise as the profile gives it: 0.8 is 80%, 0.825 is 82.5%
+    and 0.8250001 is 82.50001%; ten significant digits drop only the float error of the product."""
+    return f"{fraction * 100:.10g}%"
 
 
 def _require(cfg: Config, no_freshness: bool) -> None:
@@ -168,12 +157,11 @@ def _read_diff_file(name: str) -> dict[str, set[int]]:
 
 def _read_snapshot(cfg: Config, problems: list[str], errors: list[str]) -> dict | None:
     name = cfg.snapshot
-    path = cfg.root / name
-    if not exists_exact(cfg.root, name):
-        problems.append(NO_SNAPSHOT)
-        return None
     try:
-        return policy.read_snapshot(path, name=name)
+        if not exists(cfg.root, name):
+            problems.append(NO_SNAPSHOT)
+            return None
+        return policy.read_snapshot(cfg.root / name, name=name)
     except FileNotFoundError:  # removed since it was seen
         problems.append(NO_SNAPSHOT)
     except ReportError as exc:
@@ -182,10 +170,9 @@ def _read_snapshot(cfg: Config, problems: list[str], errors: list[str]) -> dict 
 
 
 def _inside(suite: junit.Suite, first: int, last: int) -> bool:
-    """Whether the suite ran within [first, last] (epoch ms) give or take the tolerance; the times
-    are compared in exact milliseconds, without a float timestamp."""
-    start, end = (suite.start - _EPOCH) / _MS, (suite.end - _EPOCH) / _MS
-    return first - TOLERANCE_MS <= start and end <= last + TOLERANCE_MS
+    """Whether the suite ran within [first, last] (epoch ms) give or take the tolerance, compared as
+    exact integers."""
+    return junit.within(suite.start, suite.end, first, last)
 
 
 def _freshness(
@@ -216,7 +203,7 @@ def _freshness(
         return problems
     first = min(start for start, _ in report.sessions)
     last = max(dump for _, dump in report.sessions)
-    if snapshot is not None and snapshot["created_epoch_ms"] > first + TOLERANCE_MS:
+    if snapshot is not None and snapshot["created_epoch_ms"] > first + junit.TOLERANCE_MS:
         problems.append("the snapshot is newer than the test run: run the tests again after writing the snapshot")
     for entry in cfg.get("coverage.full_run_suites", []):
         name = entry["name"]
@@ -274,7 +261,10 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
             summary="**NOT EVALUATED**: invalid policy, {count}.",
         )
     changed = _read_diff_file(args.diff_file) if args.diff_file is not None else None
-    data: dict = {"freshness": "skipped" if args.no_freshness else "checked"}
+    data: dict = {
+        "freshness": "skipped" if args.no_freshness else "checked",
+        "thresholds": {"floor": cfg.coverage_floor, "delta": cfg.coverage_delta},
+    }
     if args.today is not None:
         data["today"] = args.today.isoformat()
     note = SKIPPED_NOTE if args.no_freshness else ""
@@ -283,23 +273,22 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     report = snapshot = None
     suites: list[junit.Suite] = []
     name = cfg.get("coverage.report")
-    if not exists_exact(cfg.root, name):
-        problems.append(f"no JaCoCo XML at {name}")
-    else:
-        resolver = SourceResolver(cfg.root, cfg.get("source.roots"), frozenset(checked.sets.sources))
-        try:
+    try:
+        if not exists(cfg.root, name):
+            problems.append(f"no JaCoCo XML at {name}")
+        else:
+            resolver = SourceResolver(cfg.root, cfg.get("source.roots"), frozenset(checked.sets.sources))
             report = jacoco.load(cfg.root / name, resolver, name=name)
-        except ReportError as exc:
-            errors.append(str(exc))
+            data["excluded"] = {"count": len(report.excluded), "paths": report.excluded[:SHOWN_PATHS]}
+            data["unresolved"] = {"count": len(report.unresolved), "names": report.unresolved[:SHOWN_PATHS]}
+    except ReportError as exc:
+        errors.append(str(exc))
     if not args.no_freshness:
         snapshot = _read_snapshot(cfg, problems, errors)
         if cfg.get("coverage.full_run_suites"):
             files = getattr(args, "junit_files", None)
             files = resolve_glob(cfg.root, cfg.get("tests.results")) if files is None else files
-            try:
-                suites = junit.read_suites(cfg.root, files)
-            except ReportError as exc:
-                errors.append(str(exc))
+            suites = junit.read_suites(cfg.root, files, errors)
     if errors:
         _errored(rep, errors, data)
         return
@@ -373,9 +362,6 @@ def _evaluate(
         "standard": standard,
         "zones": per_zone,
         "floor_ok": floor_ok,
-        "thresholds": {"floor": floor, "delta": cfg.coverage_delta},
-        "excluded": {"count": len(report.excluded), "paths": report.excluded[:SHOWN_PATHS]},
-        "unresolved": {"count": len(report.unresolved), "names": report.unresolved[:SHOWN_PATHS]},
         **data,
     }
     _exemptions(rep, checked, today)

@@ -3,7 +3,9 @@ the sessions of the run.
 
 A source file is named in the report by its package and its file name; the source resolver finds
 it under the source roots. A file found under no root is unresolved, one found under a root but
-outside the classification set is excluded, and one found under two or more roots is a ConfigError.
+outside the classification set is excluded, and one found under two or more roots is a ConfigError,
+as are two names found as the same file. Every number is an integer that a Java long holds; a
+session that ends before it starts is an input error.
 """
 
 from __future__ import annotations
@@ -19,8 +21,10 @@ from muster.report import ReportError
 
 _COUNT_RE = re.compile(r"[0-9]+")
 _EPOCH_RE = re.compile(r"-?[0-9]+")
-_COUNTERS = ("LINE", "BRANCH")
 _LINE_ATTRIBUTES = ("mi", "ci", "mb", "cb")
+# The range of a Java long, which JaCoCo writes: counts from 0, session times in epoch ms.
+LONG_MIN, LONG_MAX = -(2**63), 2**63 - 1
+_LONG_DIGITS = len(str(LONG_MAX))
 
 
 @dataclass(frozen=True)
@@ -40,17 +44,27 @@ class CoverageReport:
     sourcefiles: int  # number of <sourcefile> elements in the report
 
 
-def _attribute(element: ET.Element, key: str, pattern: re.Pattern[str], what: str, name: str) -> int:
+def _attribute(element: ET.Element, key: str, pattern: re.Pattern[str], what: str, low: int, name: str) -> int:
+    """An integer attribute from `low` to LONG_MAX; it is converted only once it is known to fit, as
+    int() refuses a string of more than 4300 digits."""
     value = element.get(key)
     if value is None:
         raise ReportError(f"{name}: <{element.tag}> has no attribute {key}")
     if not pattern.fullmatch(value):
         raise ReportError(f"{name}: <{element.tag}> attribute {key} must be {what}, got {value!r}")
-    return int(value)
+    digits = value.lstrip("-").lstrip("0") or "0"
+    number = None if len(digits) > _LONG_DIGITS else -int(digits) if value.startswith("-") else int(digits)
+    if number is None or not low <= number <= LONG_MAX:
+        raise ReportError(f"{name}: <{element.tag}> attribute {key} must be from {low} to {LONG_MAX}")
+    return number
 
 
 def _count(element: ET.Element, key: str, name: str) -> int:
-    return _attribute(element, key, _COUNT_RE, "a non-negative integer", name)
+    return _attribute(element, key, _COUNT_RE, "a non-negative integer", 0, name)
+
+
+def _epoch(element: ET.Element, key: str, name: str) -> int:
+    return _attribute(element, key, _EPOCH_RE, "an integer", LONG_MIN, name)
 
 
 def _report(path: Path, name: str | None) -> tuple[ET.Element, str]:
@@ -62,20 +76,13 @@ def _report(path: Path, name: str | None) -> tuple[ET.Element, str]:
 
 
 def _sessions(root: ET.Element, name: str) -> list[tuple[int, int]]:
-    return [
-        (
-            _attribute(session, "start", _EPOCH_RE, "an integer", name),
-            _attribute(session, "dump", _EPOCH_RE, "an integer", name),
-        )
-        for session in root.iter("sessioninfo")
-    ]
-
-
-def read_sessions(path: Path, *, name: str | None = None) -> list[tuple[int, int]]:
-    """The (start, dump) pairs of every <sessioninfo>, in epoch ms, without resolving any source.
-    Messages name the file `name`, by default the path."""
-    root, name = _report(path, name)
-    return _sessions(root, name)
+    sessions = []
+    for session in root.iter("sessioninfo"):
+        start, dump = _epoch(session, "start", name), _epoch(session, "dump", name)
+        if dump < start:
+            raise ReportError(f"{name}: <sessioninfo> dump {dump} is before start {start}")
+        sessions.append((start, dump))
+    return sessions
 
 
 def _unsafe(text: str) -> bool:
@@ -98,13 +105,15 @@ def _report_name(package: ET.Element, sourcefile: ET.Element, name: str) -> str:
 
 
 def _coverage(sourcefile: ET.Element, report_name: str, name: str) -> FileCoverage:
+    """The lines and the counters of a source file; every counter is checked, whatever its type, and
+    the LINE and BRANCH counters are kept."""
     counters: dict[str, tuple[int, int]] = {}
     for counter in sourcefile.findall("counter"):
         kind = counter.get("type")
-        if kind not in _COUNTERS:
-            continue
+        if kind is None:
+            raise ReportError(f"{name}: {report_name} has a <counter> without attribute type")
         if kind in counters:
-            raise ReportError(f"{name}: {report_name} has two {kind} counters")
+            raise ReportError(f"{name}: {report_name} has two counters of type {kind!r}")
         counters[kind] = (_count(counter, "missed", name), _count(counter, "covered", name))
     lines: dict[int, tuple[int, int, int, int]] = {}
     for line in sourcefile.findall("line"):
@@ -116,33 +125,54 @@ def _coverage(sourcefile: ET.Element, report_name: str, name: str) -> FileCovera
     return FileCoverage(lines, counters.get("LINE", (0, 0)), counters.get("BRANCH", (0, 0)))
 
 
-def load(path: Path, resolver: SourceResolver, *, name: str | None = None) -> CoverageReport:
-    """Every source file of the report with its per-line data and its counters, and the sessions.
-    The packages are found at any depth, so groups may nest them. A report name found under two or
-    more source roots is a ConfigError naming every path. Messages name the file `name`, by default
-    the path."""
+def _read(path: Path, name: str | None) -> tuple[list[tuple[int, int]], list[tuple[str, FileCoverage]], str]:
+    """The sessions and every source file (report name, coverage) of a report, after the whole
+    document is checked; the packages are found at any depth, so groups may nest them. Also returns
+    the name that messages give the file."""
     root, name = _report(path, name)
     sessions = _sessions(root, name)
-    files: dict[str, FileCoverage] = {}
+    entries: list[tuple[str, FileCoverage]] = []
     seen: set[str] = set()
-    unresolved: list[str] = []
-    excluded: list[str] = []
-    sourcefiles = 0
     for package in root.iter("package"):
         for sourcefile in package.findall("sourcefile"):
-            sourcefiles += 1
             report_name = _report_name(package, sourcefile, name)
             if report_name in seen:
                 raise ReportError(f"{name}: source file {report_name} occurs twice")
             seen.add(report_name)
-            coverage = _coverage(sourcefile, report_name, name)
-            paths = resolver.resolve(report_name)
-            if len(paths) > 1:
-                raise ConfigError(f"{name}: {report_name} is under more than one source root: {', '.join(paths)}")
-            if not paths:
-                unresolved.append(report_name)
-            elif paths[0] in resolver.classified:
-                files[paths[0]] = coverage
-            else:
-                excluded.append(paths[0])
-    return CoverageReport(files, sessions, sorted(unresolved), sorted(excluded), sourcefiles)
+            entries.append((report_name, _coverage(sourcefile, report_name, name)))
+    return sessions, entries, name
+
+
+def read_sessions(path: Path, *, name: str | None = None) -> list[tuple[int, int]]:
+    """The (start, dump) pairs of every <sessioninfo>, in epoch ms. The whole report is checked as
+    load() checks it, but no source is resolved. Messages name the file `name`, by default the
+    path."""
+    return _read(path, name)[0]
+
+
+def load(path: Path, resolver: SourceResolver, *, name: str | None = None) -> CoverageReport:
+    """Every source file of the report with its per-line data and its counters, and the sessions.
+    A report name found under two or more source roots, and two report names found as one file
+    (source roots that nest), are a ConfigError naming every path. Messages name the file `name`, by
+    default the path."""
+    sessions, entries, name = _read(path, name)
+    files: dict[str, FileCoverage] = {}
+    found: dict[str, str] = {}  # repository-relative path -> the report name found as it
+    unresolved: list[str] = []
+    excluded: list[str] = []
+    for report_name, coverage in entries:
+        paths = resolver.resolve(report_name)
+        if len(paths) > 1:
+            raise ConfigError(f"{name}: {report_name} is under more than one source root: {', '.join(paths)}")
+        if not paths:
+            unresolved.append(report_name)
+            continue
+        path = paths[0]
+        if path in found:
+            raise ConfigError(f"{name}: {found[path]} and {report_name} are both {path} (the source roots nest)")
+        found[path] = report_name
+        if path in resolver.classified:
+            files[path] = coverage
+        else:
+            excluded.append(path)
+    return CoverageReport(files, sessions, sorted(unresolved), sorted(excluded), len(entries))
