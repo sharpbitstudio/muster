@@ -234,10 +234,18 @@ def _scan_command(words: list[str]) -> str | None:
 
 
 def _repo_root(explicit: str | None) -> Path:
+    """The repository root: --repo, else the git top level, else the working directory, resolved.
+    A folder that cannot be resolved is a UsageError, never a bug: a busy named pipe on Windows
+    raises OSError, and a link loop raises RuntimeError on Python 3.11 and 3.12."""
     try:
         return find_repo_root(explicit)
-    except OSError:  # no git on PATH
+    except (OSError, RuntimeError):  # no git on PATH, or a folder that cannot be resolved
+        pass
+    try:
         return Path(explicit or ".").resolve()
+    except (OSError, RuntimeError) as exc:
+        name = f"--repo {explicit}" if explicit else "the working directory"
+        raise UsageError(f"{name}: cannot resolve the folder: {getattr(exc, 'strerror', None) or exc}") from None
 
 
 def _head_commit(root: Path) -> str | None:
@@ -431,16 +439,20 @@ def _refuse_profile_clashes(inv: Invocation, named: Inputs, repo: str | None, va
     file it names or a file under one of its source or test folders: exit 2, and nothing is removed
     or written. The profile is read only when it is a regular file, so a named pipe never blocks
     the run; one that cannot be read or is not TOML adds nothing. A path that cannot be resolved is
-    no clash. Only a UsageError is raised: a NUL in `repo` names no repository, and one in `value`
-    no file.
+    no clash. Only a UsageError is raised: a NUL in `repo`, or a folder `repo` that cannot be
+    resolved, names no repository, so only the outputs are checked against each other; a NUL in
+    `value` names no file.
 
     It does not refuse what only a command would find: a JUnit file of tests.results (a glob) or a
     --diff-file named on the same command line. Nor does the fallback in src/__main__.py, for an
     older Python or a broken install, run it: that one writes --json-out without any check."""
-    if "\0" in (repo or ""):
+    try:
+        root = None if "\0" in (repo or "") else _repo_root(repo)
+    except UsageError:  # the folder cannot be resolved
+        root = None
+    if root is None:
         _refuse_clashes(inv, named, [], best_effort=True)
         return
-    root = _repo_root(repo)
     given = [] if "\0" in value else [("the config file", config_path(root, value))]
     if default:
         given.append(("the default config file", config_path(root, DEFAULT_CONFIG)))
