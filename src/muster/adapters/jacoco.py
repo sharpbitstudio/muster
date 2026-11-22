@@ -125,10 +125,27 @@ def _coverage(sourcefile: ET.Element, report_name: str, name: str) -> FileCovera
     return FileCoverage(lines, counters.get("LINE", (0, 0)), counters.get("BRANCH", (0, 0)))
 
 
+def _check_counters(root: ET.Element, name: str) -> None:
+    """Every <counter> of the document, at any level (the report, a group, a package, a class, a
+    method), has a type, no type twice in one element, and valid counts; only those of the source
+    files are kept."""
+    for element in root.iter():
+        kinds: set[str] = set()
+        for counter in element.findall("counter"):
+            kind = counter.get("type")
+            if kind is None:
+                raise ReportError(f"{name}: <{element.tag}> has a <counter> without attribute type")
+            if kind in kinds:
+                raise ReportError(f"{name}: <{element.tag}> has two counters of type {kind!r}")
+            kinds.add(kind)
+            _count(counter, "missed", name)
+            _count(counter, "covered", name)
+
+
 def _read(path: Path, name: str | None) -> tuple[list[tuple[int, int]], list[tuple[str, FileCoverage]], str]:
     """The sessions and every source file (report name, coverage) of a report, after the whole
-    document is checked; the packages are found at any depth, so groups may nest them. Also returns
-    the name that messages give the file."""
+    document is checked; the packages are found at any depth, so groups may nest them, and the
+    counters of every level are checked. Also returns the name that messages give the file."""
     root, name = _report(path, name)
     sessions = _sessions(root, name)
     entries: list[tuple[str, FileCoverage]] = []
@@ -140,6 +157,7 @@ def _read(path: Path, name: str | None) -> tuple[list[tuple[int, int]], list[tup
                 raise ReportError(f"{name}: source file {report_name} occurs twice")
             seen.add(report_name)
             entries.append((report_name, _coverage(sourcefile, report_name, name)))
+    _check_counters(root, name)
     return sessions, entries, name
 
 

@@ -86,7 +86,7 @@ class WalkTest(TreeCase):
 
     def test_folder_that_cannot_be_listed(self):
         self.make("src/app/main.py", "src/locked/secret.py", "src/tool.py", "lib/util.py")
-        message = f"source.roots: cannot read {self.root / 'src' / 'locked'}: Permission denied"
+        message = "source.roots: cannot read src/locked: Permission denied"  # repository-relative
         with self.denied("src/locked"), self.assertRaises(ConfigError) as caught:
             walk(self.root, "source.roots", ["src", "lib"])
         self.assertEqual(str(caught.exception), message)
@@ -174,7 +174,14 @@ class ResolveGlobTest(TreeCase):
     def test_literal_file(self):
         self.assertEqual(resolve_glob(self.root, TOKEN), [TOKEN])
         self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test/TEST-Gone.xml"), [])
-        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test"), [])  # a folder is no file
+        # A folder is listed, so that the reader refuses it rather than take it as no results.
+        self.assertEqual(resolve_glob(self.root, f"{RESULTS}/test"), [f"{RESULTS}/test"])
+
+    def test_git_folders_are_not_walked(self):
+        self.make(".git/TEST-org.example.app.GitTest.xml", "app/.git/refs/TEST-org.example.app.GitTest.xml")
+        found = resolve_glob(self.root, "**/TEST-*.xml")
+        self.assertEqual(found, sorted([TOP, TOKEN, PARSER, DISPATCHER, "TEST-org.example.app.RootTest.xml"]))
+        self.assertEqual(resolve_glob(self.root, "app/**/TEST-*.xml"), [TOP, TOKEN, PARSER])
 
     def test_missing_start_folder_gives_no_files(self):
         self.assertEqual(resolve_glob(self.root, "gone/**/*.xml"), [])

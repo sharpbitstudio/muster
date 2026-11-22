@@ -44,7 +44,7 @@ Check = Callable[[str, Any], None]
 
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 _DRIVE = re.compile(r"[A-Za-z]:")
-_SHA256 = re.compile(r"[0-9a-f]{64}")
+SHA256 = re.compile(r"[0-9a-f]{64}")  # a SHA-256 digest in lower-case hex (the profile, the snapshot)
 _MISSING = object()
 # The range of a TOML integer: 64-bit signed.
 INT_MIN, INT_MAX = -(2**63), 2**63 - 1
@@ -285,7 +285,7 @@ _STRINGS = array(string())
 
 SCHEMA: dict[str, Check] = {
     "schema": _schema_version,
-    "tool": table({"version": string(), "sha256": string(pattern=_SHA256, shape="64 lower-case hex digits")}),
+    "tool": table({"version": string(), "sha256": string(pattern=SHA256, shape="64 lower-case hex digits")}),
     "source": table(
         {
             "roots": array(path(), non_empty=True),

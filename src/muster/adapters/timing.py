@@ -5,12 +5,10 @@ holds, from the epoch to the end of the year 9999, whatever the outcome.
 
 from __future__ import annotations
 
-import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from muster.adapters import label
+from muster.adapters import label, strict_json
 from muster.report import ReportError
 
 EPOCH_MS_MAX = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z, the last millisecond a datetime holds
@@ -49,19 +47,6 @@ def _kind(value) -> str:
     return "null" if value is None else _JSON_TYPES.get(type(value), type(value).__name__)
 
 
-def _no_constant(text: str):
-    raise ValueError(f"{text} is not a JSON number")
-
-
-def _finite(text: str) -> float:
-    """A JSON number with a fraction or an exponent; one too large for a float, such as 1e400, would
-    be an infinity."""
-    value = float(text)
-    if not math.isfinite(value):
-        raise ValueError(f"{text} is not a finite number")
-    return value
-
-
 def _epoch_ms(document: dict, key: str, name: str) -> int:
     if key not in document:
         raise ReportError(f"{name}: missing key {key}")
@@ -90,7 +75,7 @@ def load(path: Path, task: str | None = None, *, name: str | None = None) -> Tim
     except OSError as exc:
         raise ReportError(f"{name}: cannot read: {exc.strerror or exc}") from None
     try:
-        document = json.loads(raw.decode("utf-8"), parse_constant=_no_constant, parse_float=_finite)
+        document = strict_json(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise ReportError(f"{name}: not valid UTF-8 (byte {exc.start})") from None
     except RecursionError:

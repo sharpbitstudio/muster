@@ -381,6 +381,13 @@ class ArgumentTest(CoverageCase):
         self.assertEqual((code, env["error"]["kind"]), (2, "usage"))
         self.assertTrue(env["error"]["message"].startswith("cannot read --diff-file missing.diff: "))
 
+    def test_diff_file_with_a_line_number_too_long_is_a_usage_error(self):
+        diff = f"--- a/{ENGINE}\n+++ b/{ENGINE}\n@@ -1 +{'9' * 4301} @@\n+    int one;\n"
+        (self.work / "change.diff").write_bytes(diff.encode("ascii"))
+        code, env = self.json_main("coverage", "--diff-file", "change.diff")
+        message = "cannot read --diff-file change.diff: a hunk header has a line number too long"
+        self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+
     def test_hidden_options_are_not_in_the_help(self):
         code, out, _ = self.main("coverage", "--help")
         self.assertEqual(code, 0)
@@ -741,6 +748,15 @@ class FloorTest(CoverageCase):
         self.measure()
         self.assertIn("**Global floor** (82.50001% line / 65% branch)", self.passed().summary)
 
+    def test_threshold_is_never_rounded(self):
+        self.assertEqual(coverage._percent(0.800000000001), "80.0000000001%")
+        self.assertEqual(coverage._percent(0.123456789012345), "12.3456789012345%")
+        self.assertEqual(coverage._percent(0), "0%")
+        report_line = 'report = "build/jacoco/report.xml"\n'
+        self.write("muster.toml", PROFILE.replace(report_line, report_line + "floor = { line = 0.800000000001 }\n"))
+        self.measure()
+        self.assertIn("**Global floor** (80.0000000001% line / 65% branch)", self.passed().summary)
+
     def test_default_thresholds_in_the_data(self):
         self.measure()
         expected = {"floor": {"line": 0.8, "branch": 0.65}, "delta": {"line": 0.8, "branch": 0.8}}
@@ -910,6 +926,27 @@ class DeltaGateTest(CoverageCase):
         self.assertIn("coverage: FAIL", run.verdict)
         self.assertEqual(run.env["verdict"], "not-evaluated")
         self.assertEqual(run.section["violations"], ["no merge-base with no-such-ref; delta not evaluated"])
+        self.assertEqual(run.data["outcome"], "violation")
+
+    def test_failing_delta_under_strict(self):
+        self.edit(ENGINE, {3: "    int three;"})
+        self.measure({ENGINE: {**lines_of(*range(1, 11)), 3: MISSED}})
+        run = self.coverage("--base", "main", "--strict")
+        self.assertEqual((run.code, run.section["verdict"], run.section["violation"]), (1, "fail", True))
+        message = "changed critical lines below the gate: line 0.0% (0/1) < 80% (vs main)"
+        self.assertEqual(run.annotations, [f"::error title=Critical delta coverage::{message}"])
+        self.assertTrue(run.verdict.startswith("coverage: FAIL (global line "), run.verdict)
+        self.assertIn("floor ok; critical delta WOULD FAIL: line 0.0% (0/1) < 80%)", run.verdict)
+        self.assertEqual((run.data["outcome"], run.section["violations"]), ("violation", [message]))
+
+    def test_floor_below_with_a_delta_not_evaluated_warns(self):
+        self.measure({DISPATCHER: lines_of(*range(1, 101), data=MISSED)})
+        run = self.coverage("--base", "no-such-ref")
+        self.assertEqual((run.code, run.section["verdict"], run.section["violation"]), (0, "not-evaluated", True))
+        self.assertTrue(run.verdict.startswith("coverage: WARN (global line "), run.verdict)
+        self.assertIn("BELOW FLOOR; delta not evaluated (no merge-base)", run.verdict)
+        self.assertEqual((run.data["outcome"], run.data["floor_ok"]), ("violation", False))
+        self.assertEqual(run.data["delta"], {"evaluated": False})
 
     def test_diff_file_keeps_a_lone_carriage_return_in_its_line(self):
         diff = (
@@ -997,6 +1034,25 @@ class GitFailureTest(CoverageCase):
         self.assertEqual(run.code, 0)
         self.assertEqual(run.env["base"], {"ref": "main", "commit": None})
         self.assertEqual(run.data["delta"], {"evaluated": False})
+
+    def test_untracked_file_that_cannot_be_read(self):
+        self.write(JOURNAL, source_text(3))
+        self.measure({JOURNAL: lines_of(1, 2, 3)})
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch("muster.coverage.count_file_lines", side_effect=denied):
+            run = self.coverage("--base", "main")
+        self.assertEqual((run.code, run.data["delta"]), (0, {"evaluated": False}))
+        self.assertIn("delta not evaluated (cannot read a changed file)", run.verdict)
+        self.assertNotIn("git error", run.verdict)
+        message = f"delta not evaluated: {JOURNAL}: cannot read: Permission denied"
+        self.assertEqual(run.annotations, [f"::warning title=Critical delta coverage::{message}"])
+
+
+class ResolverTest(CoverageCase):
+    def test_source_roots_are_walked_once(self):
+        self.measure()
+        with mock.patch("muster.adapters.walk", side_effect=AssertionError("the source roots are walked again")):
+            self.assertEqual(self.passed().data["global"]["files"], 4)
 
 
 class SubfolderProfileTest(CoverageCase):
@@ -1132,8 +1188,8 @@ class InputErrorTest(CoverageCase):
 
 
 class ProtectedFileTest(CoverageCase):
-    """An output that is a source, test, JUnit, diff, report or snapshot file: exit 2, nothing is
-    removed or written."""
+    """An output that is a JUnit, diff, report or snapshot file, or lies under a source or test
+    folder: exit 2, nothing is removed or written."""
 
     def assert_refused(self, target: Path, label: str, *options: str) -> None:
         before = target.read_bytes()
@@ -1144,11 +1200,11 @@ class ProtectedFileTest(CoverageCase):
 
     def test_source_file(self):
         self.measure()
-        self.assert_refused(self.repo / ENGINE, f"the source file {ENGINE}")
+        self.assert_refused(self.repo / ENGINE, "under the source folder src/main/java")
 
     def test_test_file(self):
         self.measure()
-        self.assert_refused(self.repo / PARSER_TEST, f"the test file {PARSER_TEST}")
+        self.assert_refused(self.repo / PARSER_TEST, "under the test folder src/test/java")
 
     def test_junit_file(self):
         self.measure()
@@ -1164,14 +1220,60 @@ class ProtectedFileTest(CoverageCase):
         self.assertEqual(env["error"]["message"], "--summary-file change.diff is --diff-file change.diff")
         self.assertEqual((code, diff.read_bytes()), (2, b""))
 
+    def test_diff_file_of_a_missing_or_invalid_profile(self):
+        diff = self.work / "change.diff"
+        diff.write_bytes(b"kept\n")
+        for state in ("invalid", "missing"):
+            if state == "invalid":
+                self.write("muster.toml", PROFILE + "\n[output]\nbogus = 1\n")
+            else:
+                (self.repo / "muster.toml").unlink()
+            for option in ("--json-out", "--summary-file"):
+                with self.subTest(state=state, option=option):
+                    code, env = self.json_main("coverage", "--diff-file", "change.diff", option, "change.diff")
+                    message = f"{option} change.diff is --diff-file change.diff"
+                    self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+                    self.assertEqual(diff.read_bytes(), b"kept\n")
+
+    def test_output_under_a_source_folder_on_every_run(self):
+        self.measure()
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "src/main/java/build"\n')
+        target = self.repo / "src/main/java/build/coverage.json"
+        default = self.repo / "src/main/java/build/coverage.md"
+        for options, file, message in (
+            (["--json-out", str(target)], target, f"--json-out {target} is under the source folder src/main/java"),
+            ([], default, "the summary src/main/java/build/coverage.md is under the source folder src/main/java"),
+        ):
+            for run in ("first", "second"):
+                with self.subTest(file=file.name, run=run):
+                    if run == "second":  # as an earlier run would have left it
+                        file.parent.mkdir(parents=True, exist_ok=True)
+                        file.write_bytes(b"left\n")
+                    code, env = self.json_main("coverage", *options)
+                    self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+                    if run == "first":
+                        self.assertFalse(file.exists())
+                    else:
+                        self.assertEqual(file.read_bytes(), b"left\n")
+            file.unlink()
+
+    def test_default_summary_is_named_by_its_repository_path(self):
+        profile = PROFILE.replace('report = "build/jacoco/report.xml"', 'report = "build/coverage.md"')
+        self.write("muster.toml", profile + '\n[output]\ndir = "build"\n')
+        self.write("build/coverage.md", "kept\n")
+        code, env = self.json_main("coverage")
+        message = "the summary build/coverage.md is the file of coverage.report"
+        self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+        self.assertEqual((self.repo / "build/coverage.md").read_bytes(), b"kept\n")
+
     def test_excluded_file_under_a_source_root(self):
         self.measure()
-        self.assert_refused(self.repo / PACKAGE_INFO, f"the source file {PACKAGE_INFO}")
+        self.assert_refused(self.repo / PACKAGE_INFO, "under the source folder src/main/java")
 
     def test_file_under_a_test_folder_that_no_glob_matches(self):
         fixture = self.write(f"{TESTS}/codec/fixture.txt", "data\n")
         self.measure()
-        self.assert_refused(fixture, f"the test file {TESTS}/codec/fixture.txt")
+        self.assert_refused(fixture, "under the test folder src/test/java")
 
     def test_files_the_profile_names_for_other_commands(self):
         tables = '\n[duration]\ntask_json = "build/muster/test-task.json"\n'

@@ -21,9 +21,7 @@ file, is an input error, and the section then has no verdict.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from muster import policy
 from muster.adapters import exists, jacoco, junit, timing
 from muster.adapters.timing import TimingRecord
 from muster.config import Config, require
@@ -32,17 +30,6 @@ from muster.report import Report, ReportError, md_path, one_line
 
 HELP = "test task duration against the budget"
 SPAN_NOTE = "; JUnit span, a lower bound: a file left over from an earlier run widens it"
-
-
-def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
-    """The files no output may be: every walked source and test file (the walk is kept in
-    args.source_sets) and the JUnit files of tests.results (resolved once, kept in args.junit_files
-    for run()). It never raises."""
-    files = policy.protected(args, cfg)
-    results = cfg.get("tests.results")
-    args.junit_files = resolve_glob(cfg.root, results) if results is not None else []
-    files += [(f"the JUnit file {path}", cfg.root / path) for path in args.junit_files]
-    return files
 
 
 def fmt_seconds(seconds: float) -> str:
@@ -121,7 +108,7 @@ def _errored(rep: Report, errors: list[str], data: dict) -> None:
 
 
 def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
-    """Judge the duration of the test run; protected() has resolved args.junit_files."""
+    """Judge the duration of the test run; policy.protected() has resolved args.junit_files."""
     source = cfg.duration_source
     require(cfg, "tests.results", *(("duration.task_json",) if source == "task-json" else ()))
     data: dict = {
@@ -182,7 +169,7 @@ def _task_json(
         verdict = "NOT MEASURED (no task timing)"
         rep.md.append(f"{who} task timing: missing ({name}) - no verdict.")
     elif record.outcome == "failed":
-        failure = one_line(record.failure or "no message")
+        failure = one_line(record.failure or "") or "no message"
         verdict = f"INCOMPLETE RUN (task failed: {failure})"
         rep.md.append(f"{who} task failed or timed out - incomplete run, no verdict. Failure: {failure}")
     elif record.outcome != "success":
