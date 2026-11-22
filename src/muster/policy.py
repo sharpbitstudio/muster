@@ -23,7 +23,7 @@ from muster.config import SHA256, Config, ConfigError, named_files, require
 from muster.gitio import records
 from muster.paths import SourceSets, exists_exact, resolve_glob, source_sets
 from muster.report import FatalError, Report, ReportError, json_text, md_path, write_json
-from muster.zones import Classification, Names, Targets, classify, target_violations, trim
+from muster.zones import Classification, Names, Targets, classify, target_files, target_violations
 
 HELP = "classify the source files by the policy files and check the policy"
 SNAPSHOT_SCHEMA = 1
@@ -219,6 +219,9 @@ class CheckedPolicy:
     raw: dict[str, bytes]  # the bytes of each configured policy file, by profile key
     targets: int | None  # the number of mutation target lines; None without mutation.targets
     violations: list[str]  # every violation of the policy; empty when it is valid
+    # The repository-relative paths of the mutation targets in file order: None without
+    # mutation.targets, empty when the target list has a violation.
+    target_files: tuple[str, ...] | None
 
 
 def check_policy(args: argparse.Namespace, cfg: Config, today: date) -> CheckedPolicy:
@@ -244,10 +247,12 @@ def check_policy(args: argparse.Namespace, cfg: Config, today: date) -> CheckedP
     )
     violations = list(classification.violations)
     targets = None
+    checked_targets = None
     if "mutation.targets" in lines:
         target_lines = lines["mutation.targets"]
-        targets = sum(1 for raw_line in target_lines if trim(raw_line) and not trim(raw_line).startswith("#"))
-        violations += target_violations(
+        entries = target_files(target_lines, base)
+        targets = len(entries)
+        target_problems = target_violations(
             target_lines,
             base,
             Targets(
@@ -260,7 +265,9 @@ def check_policy(args: argparse.Namespace, cfg: Config, today: date) -> CheckedP
                 forbidden=cfg.own_test_forbidden,
             ),
         )
-    return CheckedPolicy(sets, classification, raw, targets, violations)
+        violations += target_problems
+        checked_targets = () if target_problems else tuple(entries)
+    return CheckedPolicy(sets, classification, raw, targets, violations, checked_targets)
 
 
 def policy_hash(cfg: Config, checked: CheckedPolicy) -> str:
@@ -269,6 +276,27 @@ def policy_hash(cfg: Config, checked: CheckedPolicy) -> str:
     tables = {"source": cfg.get("source"), "zones": cfg.get("zones")}
     parts = [checked.raw.get(key, b"") for key in ("zones.critical", "zones.standard", "zones.exemptions")]
     return policy_sha256(*parts, tables)
+
+
+def snapshot_problems(cfg: Config, checked: CheckedPolicy, snapshot: dict | None) -> list[str]:
+    """The reasons why the snapshot no longer matches the checked policy: the policy hash differs,
+    or the source set changed (with the counts and the first path of each change); empty when it
+    matches or when there is no snapshot."""
+    problems: list[str] = []
+    if snapshot is None:
+        return problems
+    if snapshot["policy_sha256"] != policy_hash(cfg, checked):
+        problems.append("the policy changed after the snapshot (policy_sha256 differs)")
+    current, recorded = set(checked.sets.sources), set(snapshot["sources"])
+    added, gone = sorted(current - recorded), sorted(recorded - current)
+    parts = []
+    if added:
+        parts.append(f"{len(added)} added (e.g. {added[0]})")
+    if gone:
+        parts.append(f"{len(gone)} gone (e.g. {gone[0]})")
+    if parts:
+        problems.append("the source set changed after the snapshot: " + ", ".join(parts))
+    return problems
 
 
 def _plural(count: int, word: str) -> str:

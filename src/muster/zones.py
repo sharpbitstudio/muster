@@ -396,21 +396,34 @@ class Targets:
     forbidden: list[str] = field(default_factory=list)  # globs an own test's file name must not match
 
 
+def _target_entries(lines: list[str], base: str) -> list[tuple[str, str]]:
+    """The entries of the allowlist of mutation targets in file order, each as the trimmed line and
+    its repository-relative path; blank lines and lines that start with `#` are skipped, and no
+    entry is checked."""
+    prefix = base_prefix(base)
+    entries: list[tuple[str, str]] = []
+    for raw in lines:
+        line = trim(raw)
+        if line and not line.startswith("#"):
+            entries.append((line, prefix + line))
+    return entries
+
+
+def target_files(lines: list[str], base: str) -> list[str]:
+    """The repository-relative paths of the entries of the allowlist of mutation targets, in file
+    order; they are the checked list only when target_violations() finds nothing."""
+    return [path for _, path in _target_entries(lines, base)]
+
+
 def target_violations(lines: list[str], base: str, targets: Targets) -> list[str]:
     """The broken rules of the allowlist of mutation targets, in line order; empty when it is valid.
     Each entry is one source file, relative to the base, with its own test in the same folder
     (relative to its source root) under one of the test roots."""
     name = targets.name
-    prefix = base_prefix(base)
+    entries = _target_entries(lines, base)
     violations: list[str] = []
     seen: set[str] = set()
-    has_entry = False
-    for raw in lines:
-        line = trim(raw)
-        if not line or line.startswith("#"):
-            continue
-        has_entry = True
-        path = prefix + line
+    for line, path in entries:
         if not _target_shape(line):
             violations.append(malformed_target(name, line))
             continue
@@ -439,7 +452,7 @@ def target_violations(lines: list[str], base: str, targets: Targets) -> list[str
         ):
             folders = " or ".join(targets.test_roots) or "no folder ([source].tests is not set)"
             violations.append(f"{name}: '{line}' has no own unit test '{test_path}' in {folders}")
-    if not has_entry:
+    if not entries:
         # An empty target list must never reach a mutation tool: it could fall back to a project-wide default.
         violations.append(f"{name}: lists no file - it must list at least one file")
     return violations

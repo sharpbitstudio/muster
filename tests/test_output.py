@@ -20,6 +20,7 @@ from muster.report import (
     json_text,
     md_path,
     one_line,
+    percent_digits,
     write_json,
     write_markdown,
 )
@@ -63,6 +64,17 @@ class MdPathTest(unittest.TestCase):
 
     def test_backtick_becomes_quote(self):
         self.assertEqual(md_path("a`b``c"), "`a'b''c`")
+
+
+class PercentDigitsTest(unittest.TestCase):
+    def test_number_as_the_profile_gives_it(self):
+        for fraction, text in ((0.8, "80"), (0.07, "7"), (0.825, "82.5"), (1, "100"), (1.0, "100"), (0, "0")):
+            with self.subTest(fraction=fraction):
+                self.assertEqual(percent_digits(fraction), text)
+
+    def test_never_rounded(self):
+        self.assertEqual(percent_digits(0.800000000001), "80.0000000001")
+        self.assertEqual(percent_digits(0.123456789012345), "12.3456789012345")
 
 
 class CapMarkdownTest(unittest.TestCase):

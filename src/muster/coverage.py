@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import re
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
 from muster import policy
@@ -30,7 +29,7 @@ from muster.config import Config, require
 from muster.gitio import count_file_lines, diff_since, parse_diff, ref_problem, untracked_under
 from muster.paths import resolve_glob
 from muster.policy import CheckedPolicy
-from muster.report import FatalError, Report, ReportError, md_path
+from muster.report import FatalError, Report, ReportError, md_path, percent_digits
 
 HELP = "global floor, zones table and the critical delta gate"
 EXPIRY_WARN_DAYS = 7  # an exemption that ends within this many days, today included, gets a warning
@@ -130,10 +129,8 @@ def add_to(acc: dict, sf: FileCoverage) -> None:
 
 
 def _percent(fraction: float) -> str:
-    """A threshold as a percentage, exactly as the profile gives it: 0.8 is 80%, 0.825 is 82.5% and
-    0.800000000001 is 80.0000000001%. The decimal point of the value's shortest form is moved, so no
-    float error of a product shows and no digit is rounded away."""
-    return f"{(Decimal(repr(fraction)) * 100).normalize():f}%"
+    """A threshold as a percentage with its sign, as percent_digits() gives the number: 0.825 is 82.5%."""
+    return percent_digits(fraction) + "%"
 
 
 def _require(cfg: Config, no_freshness: bool) -> None:
@@ -181,19 +178,7 @@ def _freshness(
     cfg: Config, checked: CheckedPolicy, report: CoverageReport | None, snapshot: dict | None, suites: list
 ) -> list[str]:
     """The reasons why the report is not from a full test run after the snapshot; empty when it is."""
-    problems = []
-    if snapshot is not None:
-        if snapshot["policy_sha256"] != policy.policy_hash(cfg, checked):
-            problems.append("the policy changed after the snapshot (policy_sha256 differs)")
-        current, recorded = set(checked.sets.sources), set(snapshot["sources"])
-        added, gone = sorted(current - recorded), sorted(recorded - current)
-        parts = []
-        if added:
-            parts.append(f"{len(added)} added (e.g. {added[0]})")
-        if gone:
-            parts.append(f"{len(gone)} gone (e.g. {gone[0]})")
-        if parts:
-            problems.append("the source set changed after the snapshot: " + ", ".join(parts))
+    problems = policy.snapshot_problems(cfg, checked, snapshot)
     if report is None:
         return problems
     if report.unresolved:
