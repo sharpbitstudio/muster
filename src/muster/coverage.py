@@ -36,7 +36,6 @@ EXPIRY_WARN_DAYS = 7  # an exemption that ends within this many days, today incl
 UNCOVERED_FILES_CAP = 50
 UNCOVERED_ITEMS_CAP = 40
 SHOWN_PATHS = 10  # paths listed in data for the excluded and the unresolved files
-NO_SNAPSHOT = 'no snapshot: run "muster policy --snapshot" before the tests'
 SKIPPED_NOTE = "; freshness not checked"
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -158,11 +157,11 @@ def _read_snapshot(cfg: Config, problems: list[str], errors: list[str]) -> dict 
     name = cfg.snapshot
     try:
         if not exists(cfg.root, name):
-            problems.append(NO_SNAPSHOT)
+            problems.append(policy.NO_SNAPSHOT)
             return None
         return policy.read_snapshot(cfg.root / name, name=name)
     except FileNotFoundError:  # removed since it was seen
-        problems.append(NO_SNAPSHOT)
+        problems.append(policy.NO_SNAPSHOT)
     except ReportError as exc:
         errors.append(str(exc))
     return None

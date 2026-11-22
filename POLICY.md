@@ -31,7 +31,7 @@ The wall time of the test suite is compared with two thresholds. Above the warni
 
 ## 6. Mutation testing over an allowlist
 
-Mutation testing runs over an allowlist of pure-logic files, each with its own unit test. The measure is test strength: detected mutants over mutants that tests reach.
+Mutation testing runs over an allowlist of pure-logic files, each with its own unit test. The measure is test strength: detected mutants over mutants that tests reach. By default the threshold is 60% and the target 70%; the profile changes them.
 
 - **Threshold:** below it the check reports a violation.
 - **Target:** the level the repository aims for.
