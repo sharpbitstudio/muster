@@ -32,13 +32,19 @@ muster checks its own source tree, every Python file under `src/`, with its own 
 python -I src policy
 ```
 
+muster also counts its own lines of code with `loc`, over the Python files under `src/` and `tests/`, with the language that the `[[language]]` table of `muster.toml` defines for them. A file it cannot count fails the check, so a new file type under `src/` or `tests/` that the include globs take needs a language in `muster.toml`:
+
+```sh
+python -I src loc --fail-on-error
+```
+
 ## Checks
 
 CI runs four checks:
 
 - **gitleaks**, on every push and every pull request: over every fetched ref, every object and the working tree;
 - **hygiene**, `python tools/hygiene.py`, on every push and every pull request: over the tree and over the commits of the change; run it locally before committing, and with `--range origin/main..HEAD` before pushing;
-- **tests**, on every push and every pull request: the unit tests on Linux and Windows for each supported Python version from 3.11 on, and in the same jobs `python -I src policy` over muster's own profile; the job `tests` passes only when every combination passed;
+- **tests**, on every push and every pull request: the unit tests on Linux and Windows for each supported Python version from 3.11 on, and in the same jobs `python -I src policy` and `python -I src loc --fail-on-error` over muster's own profile; the job `tests` passes only when every combination passed;
 - **identity**, on pushes to branches other than `main` and on pull requests from branches of this repository: every commit must carry the project's commit identity.
 
 ## Identity

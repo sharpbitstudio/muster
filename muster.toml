@@ -10,3 +10,9 @@ include = ["**/*.py"]
 base     = "src"
 critical = "policy/critical.txt"
 standard = "policy/standard.txt"
+
+# The language of muster's own files, for the loc command; a docstring counts as code.
+[[language]]
+name         = "python"
+extensions   = [".py"]
+line_comment = "#"
