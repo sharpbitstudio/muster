@@ -11,10 +11,11 @@ and --repo and --config from the words before the command; otherwise the parsed 
 output file (the envelope, the summary, the command's own outputs) may be the config file, an input
 of the command (also one its options name), a file under a source or test folder, a protected file
 of the repository or another output: on such a clash nothing is removed or written. A profile that
-fails its check still names every file it can, as far as it parses; after a failed parse of argv
-only the config file and the default one of the repository are known. Once that holds, the outputs
-that must not outlive a failed run are removed before the command does anything else, and those
-removed when the run fails go on any exit 2 or 3.
+fails its check, or one that no command reads (after a failed parse of argv, where the default
+config file of the repository is refused too, and for `version`), still names every file and folder
+it can, as far as it parses. Once that holds, the outputs that must not outlive a failed run are
+removed before the command does anything else, and those removed when the run fails go on any exit
+2 or 3.
 """
 
 from __future__ import annotations
@@ -384,11 +385,31 @@ def _option_summary(args: argparse.Namespace) -> Summary | None:
     return f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True, step_summary
 
 
+def _refuse_profile_clashes(inv: Invocation, named: Inputs, repo: str | None, value: str, *, default: bool) -> None:
+    """For a profile that no command reads: refuse an output that is the config file `value` of the
+    repository `repo` (--repo and --config, which may be anything), with `default` also the default
+    config file, or, as far as the profile parses without its check, a file it names or a file
+    under one of its source or test folders: exit 2, and nothing is removed or written. A profile
+    that cannot be read or is not TOML adds nothing. Only a UsageError is raised: a NUL in `repo`
+    names no repository, and one in `value` no file."""
+    if "\0" in (repo or ""):
+        return
+    root = _repo_root(repo)
+    given = [] if "\0" in value else [("the config file", config_path(root, value))]
+    if default:
+        given.append(("the default config file", config_path(root, DEFAULT_CONFIG)))
+    unchecked = load_unchecked(root, value)
+    _refuse_clashes(inv, named, given + (named_files(unchecked) if unchecked is not None else []))
+    if unchecked is not None:
+        _refuse_under_folders(inv, named, unchecked)
+
+
 def _arm_scanned(inv: Invocation) -> None:
-    """argparse failed, or a file name it read is empty or '-', so only the profile is known: the
-    --json-out and the summary file read from argv are refused when they are the config file named
-    before the command or the default one of the repository; else the envelope and the line go
-    there."""
+    """argparse failed, or a file name it read is empty or '-': the --json-out and the summary file
+    read from argv are refused when they are the config file named before the command or the default
+    one of the repository, a file that profile names or a file under one of its source or test
+    folders, as far as it parses (the --repo and --config read from argv may be anything); else the
+    envelope and the line go there."""
     words = _options(inv.argv)
     json_out = _scan_option(words, "--json-out")
     json_out = json_out if json_out not in ("", "-") else None
@@ -402,10 +423,8 @@ def _arm_scanned(inv: Invocation) -> None:
     named = _named(json_out, summary)
     if named:
         before = _global_words(words)
-        root = _repo_root(_scan_option(before, "--repo"))
-        profile = config_path(root, _scan_option(before, "--config") or DEFAULT_CONFIG)
-        default = config_path(root, DEFAULT_CONFIG)
-        _refuse_clashes(inv, named, [("the config file", profile), ("the default config file", default)])
+        value = _scan_option(before, "--config") or DEFAULT_CONFIG
+        _refuse_profile_clashes(inv, named, _scan_option(before, "--repo"), value, default=True)
     _arm(inv, json_out, summary)
 
 
@@ -523,9 +542,8 @@ def _run(inv: Invocation) -> int:
         raise
     if args.command != "version":
         return run_analysis(args, inv, ANALYSES[args.command], json_out, summary)
-    if json_out:
-        profile = config_path(_repo_root(args.repo), args.config)
-        _refuse_clashes(inv, _named(json_out, None), [("the config file", profile)])
+    if json_out:  # version reads no profile, but its envelope may not land where any run may not write
+        _refuse_profile_clashes(inv, _named(json_out, None), args.repo, args.config, default=False)
         _arm(inv, json_out, None)
         _clear(inv, json_out, None, [])
     return run_version(args, inv)
