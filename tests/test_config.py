@@ -510,6 +510,32 @@ class LanguageEntryTest(ValidateCase):
             ({**PYTHON, "line_comment": ""}, "language[0].line_comment: must not be empty"),
             ({**PYTHON, "block_comment": ["", "*/"]}, "language[0].block_comment[0]: must not be empty"),
             ({**PYTHON, "block_comment": ['"""', ""]}, "language[0].block_comment[1]: must not be empty"),
+            # The counter scans one line at a time: a line feed in a marker never matches.
+            (
+                {**PYTHON, "line_comment": "#" + chr(10)},
+                'language[0].line_comment: has a control character, got "#\\n"',
+            ),
+            (
+                {**PYTHON, "line_comment": "#" + chr(0x7F)},
+                'language[0].line_comment: has a control character, got "#\\u007f"',
+            ),
+            (
+                {**PYTHON, "block_comment": ["/*", "*/" + chr(10)]},
+                'language[0].block_comment[1]: has a control character, got "*/\\n"',
+            ),
+            (
+                {"name": "python", "extensions": [".p" + chr(9) + "y"]},
+                'language[0].extensions[0]: has a control character, got ".p\\ty"',
+            ),
+            ({**PYTHON, "line_comment": "  "}, 'language[0].line_comment: must not be only white space, got "  "'),
+            (
+                {**PYTHON, "block_comment": [" ", "*/"]},
+                'language[0].block_comment[0]: must not be only white space, got " "',
+            ),
+            (
+                {"name": "java", "line_comment": "//" + chr(10)},
+                'language[0].line_comment: has a control character, got "//\\n"',
+            ),
             (
                 {"name": "java", "line_comment": "#"},
                 'language[0].line_comment: must be "//" on the built-in language java, or left out',

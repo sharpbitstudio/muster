@@ -185,8 +185,9 @@ def untracked_under(repo: Path, folders: list[str]) -> list[str]:
 
 
 # A record of `git diff --numstat -z` without renames: added, deleted (ASCII digits, or `-` for a
-# file git takes as binary) and a path that is not empty (tabs and line feeds included).
-_NUMSTAT_RECORD = re.compile(r"([0-9]+|-)\t([0-9]+|-)\t(.+)", re.S)
+# file git takes as binary) and a path that is not empty (tabs and line feeds included). A count
+# has at most 18 digits, far below the digits int() refuses to convert.
+_NUMSTAT_RECORD = re.compile(r"([0-9]{1,18}|-)\t([0-9]{1,18}|-)\t(.+)", re.S)
 
 
 def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int | None, int | None, str]]:
