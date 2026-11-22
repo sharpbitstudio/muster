@@ -436,6 +436,97 @@ class ArgumentScanTest(CliCase):
         self.assertEqual(self.config.read_bytes(), b"")
 
 
+class ScannedOutputClashTest(CliCase):
+    """After an argument error, and for version, the outputs are checked against the profile as far
+    as it parses: no output is a file under a source or test folder or a file the profile names."""
+
+    PROFILE = (
+        b'schema = 1\n\n[source]\nroots = ["src/main/java"]\ntests = ["src/test/java"]\n\n'
+        b'[zones]\ncritical = "policy/critical.txt"\n\n[policy]\nsnapshot = "build/muster/snapshot.json"\n'
+    )
+    # Argument errors: argparse refuses the value, an unknown option, an empty file name.
+    ERRORS = (("loc", "--base="), ("coverage", "--bogus"), ("loc", "--summary-file", ""))
+
+    def setUp(self):
+        super().setUp()
+        self.config.write_bytes(self.PROFILE)
+        self.source = self.repo / "src/main/java/org/example/app/Engine.java"
+        self.test = self.repo / "src/test/java/org/example/app/EngineTest.java"
+        for path in (self.source, self.test):
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"class Engine {}\n")
+
+    def assert_refused(self, argv: list[str], target: Path, message: str) -> None:
+        before = target.read_bytes()
+        code, _, err = self.run_main("--repo", str(self.repo), *argv)
+        self.assertEqual(code, 2, err)
+        self.assertIn(f"error: {message}\n", err)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(os.listdir(self.work), [])
+
+    def under_folders(self) -> tuple[tuple[Path, str], ...]:
+        return ((self.source, "the source folder src/main/java"), (self.test, "the test folder src/test/java"))
+
+    def test_json_out_under_a_source_or_test_folder(self):
+        for error in self.ERRORS:
+            for target, folder in self.under_folders():
+                with self.subTest(error=error, folder=folder):
+                    argv = [*error, "--json-out", str(target)]
+                    self.assert_refused(argv, target, f"--json-out {target} is under {folder}")
+
+    def test_summary_file_under_a_source_or_test_folder(self):
+        for error in self.ERRORS[:2]:
+            for target, folder in self.under_folders():
+                with self.subTest(error=error, folder=folder):
+                    argv = [*error, "--json-out", "out.json", "--summary-file", str(target)]
+                    self.assert_refused(argv, target, f"--summary-file {target} is under {folder}")
+
+    def test_version_json_out_under_a_source_folder(self):
+        argv = ["version", "--json-out", str(self.source)]
+        self.assert_refused(argv, self.source, f"--json-out {self.source} is under the source folder src/main/java")
+        argv = ["--config", "muster.toml", "version", "--format", "json", "--json-out", str(self.test)]
+        self.assert_refused(argv, self.test, f"--json-out {self.test} is under the test folder src/test/java")
+
+    def test_file_the_profile_names(self):
+        named = (("policy/critical.txt", "zones.critical"), ("build/muster/snapshot.json", "policy.snapshot"))
+        for path, key in named:
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"kept\n")
+            for argv in (["loc", "--base=", "--json-out", str(target)], ["version", "--json-out", str(target)]):
+                with self.subTest(key=key, command=argv[0]):
+                    self.assert_refused(argv, target, f"--json-out {target} is the file of {key}")
+
+    def test_profile_that_cannot_be_read_or_is_not_toml_keeps_the_envelope(self):
+        for profile in (None, b"[source\n"):
+            with self.subTest(profile=profile):
+                self.config.unlink(missing_ok=True)
+                if profile is not None:
+                    self.config.write_bytes(profile)
+                code, _, _ = self.run_main("--repo", str(self.repo), "loc", "--base=", "--json-out", "out.json")
+                self.assertEqual(code, 2)
+                self.assertEqual(self.read_json(self.work / "out.json")["error"]["kind"], "usage")
+                (self.work / "out.json").unlink()
+
+    def test_repo_and_config_read_from_argv_may_be_anything(self):
+        missing, nul = str(self.root / "missing"), chr(0)  # no command line carries a NUL, cli.main() may
+        cases = (
+            (missing, "muster.toml"),
+            (str(self.config), "muster.toml"),
+            (str(self.repo), "src"),
+            (str(self.repo) + nul, "muster.toml"),
+            (str(self.repo), "muster" + nul + ".toml"),
+        )
+        for repo, config in cases:
+            for command, expected in ((["loc", "--base="], 2), (["version"], 0)):
+                with self.subTest(repo=repo, config=config, command=command[0]):
+                    argv = ["--repo", repo, "--config", config, *command, "--json-out", "out.json"]
+                    code, _, err = self.run_main(*argv)
+                    self.assertEqual(code, expected, err)
+                    self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
+                    (self.work / "out.json").unlink()
+
+
 class InternalErrorTest(CliCase):
     def test_bug_exits_three_with_envelope(self):
         with mock.patch.object(cli, "run_version", side_effect=RuntimeError("boom")):
