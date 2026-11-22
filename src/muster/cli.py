@@ -356,10 +356,12 @@ def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config, *, best_e
     and nothing is removed or written. The paths are compared resolved (ignoring case on Windows),
     so a link that leads into such a folder counts, and so does a path inside one whose last part is
     a link. On a profile that failed its check only the entries that listed_folders() keeps count.
-    With `best_effort`, a folder or an output that cannot be resolved is left out."""
+    Each output is resolved and compared in turn, so an earlier clash is refused before a later
+    output can fail to resolve. With `best_effort`, a folder or an output that cannot be resolved
+    is left out."""
     folders = [("source", folder) for folder in listed_folders(cfg, "source.roots")]
     folders += [("test", folder) for folder in listed_folders(cfg, "source.tests")]
-    resolved, outputs = [], []
+    resolved = []
     for kind, folder in folders:
         try:
             resolved.append((kind, folder, _real(cfg.root / folder)))
@@ -368,11 +370,11 @@ def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config, *, best_e
                 raise
     for label, path in named:
         try:
-            outputs.append((label, _output_keys(path)))
+            keys = _output_keys(path)
         except OSError:
             if not best_effort:
                 raise
-    for label, keys in outputs:
+            continue
         for kind, folder, top in resolved:
             if any(key == top or key.startswith(top.rstrip(os.sep) + os.sep) for key in keys):
                 inv.json_out, inv.summary, inv.remove_on_failure = None, None, []
