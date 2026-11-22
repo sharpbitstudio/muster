@@ -614,6 +614,8 @@ class NumstatSinceTest(ChangesRepoCase):
         malformed = (
             f"1\t2\t{ENGINE}\0no tabs\0", f"one\ttwo\t{ENGINE}\0", "1\t2\0", f"-1\t2\t{ENGINE}\0",
             f"1_0\t2\t{ENGINE}\0", f"1\t+1\t{ENGINE}\0", f"{digit}\t2\t{ENGINE}\0", "1\t2\t\0", f"1\t--\t{ENGINE}\0",
+            # more digits than int() converts by default (4300), and one more than a count may have
+            "9" * 5000 + f"\t2\t{ENGINE}\0", f"1\t{'1' * 19}\t{ENGINE}\0",
         )  # fmt: skip
         for out in malformed:
             with self.subTest(out=out), mock.patch("muster.gitio._literal_git", return_value=out):

@@ -386,6 +386,18 @@ def _extension_problem(value: str) -> str | None:
         "must start with ." if not value.startswith(".")
         else "must not contain / or \\" if "/" in value or "\\" in value
         else "must have a character after the ." if value == "."
+        else "has a control character" if _has_control(value)
+        else None
+    )  # fmt: skip
+
+
+def _marker_problem(value: str) -> str | None:
+    """What makes a comment marker unusable: the counter scans one line at a time, so a control
+    character (a line feed, say) would keep the marker from ever matching."""
+    return (
+        "must not be empty" if value == ""
+        else "has a control character" if _has_control(value)
+        else "must not be only white space" if not value.strip()
         else None
     )  # fmt: skip
 
@@ -394,7 +406,8 @@ def _check_languages(data: dict) -> None:
     """Every [[language]] entry is unambiguous: a name that is not empty and not taken by an earlier
     entry; a new language with at least one extension; every extension a file-name suffix that no
     other language has, the built-in ones included, and listed once in its entry; comment markers
-    that are not empty, and on a built-in language only its own ones."""
+    that are neither empty nor only white space, and on a built-in language only its own ones. No
+    extension or marker has a control character."""
     owners = {ext: f"the built-in language {name}" for name, lang in BUILT_IN.items() for ext in lang.extensions}
     seen: dict[str, int] = {}
     for i, entry in enumerate(data.get("language", [])):
@@ -422,11 +435,14 @@ def _check_languages(data: dict) -> None:
             owner = owners.setdefault(ext, key)
             if owner != key and not (built_in is not None and ext in built_in.extensions):
                 raise ConfigError(f"{ext_key}: {shown} is already an extension of {owner}")
-        if entry.get("line_comment") == "":
-            raise ConfigError(f"{key}.line_comment: must not be empty")
-        for j, marker in enumerate(entry.get("block_comment", [])):
-            if marker == "":
-                raise ConfigError(f"{key}.block_comment[{j}]: must not be empty")
+        markers = [("line_comment", entry["line_comment"])] if "line_comment" in entry else []
+        markers += [(f"block_comment[{j}]", marker) for j, marker in enumerate(entry.get("block_comment", []))]
+        for marker_key, marker in markers:
+            problem = _marker_problem(marker)
+            if problem == "must not be empty":
+                raise ConfigError(f"{key}.{marker_key}: {problem}")
+            if problem:
+                raise ConfigError(f"{key}.{marker_key}: {problem}, got {json.dumps(marker)}")
         if built_in is not None:
             if "line_comment" in entry and entry["line_comment"] != built_in.line_comment:
                 shown = json.dumps(built_in.line_comment)
