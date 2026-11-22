@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__, coverage, duration, loc, policy
+from muster import __version__, coverage, duration, loc, mutation, policy
 from muster.config import (
     DEFAULT_CONFIG,
     SECTIONS,
@@ -114,6 +114,7 @@ ANALYSES: dict[str, Analysis] = {
     ),
     "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=policy.protected),
     "loc": Analysis(loc.run, loc.HELP, loc.arguments, named_files, protected=policy.protected),
+    "mutation": Analysis(mutation.run, mutation.HELP, inputs=named_files, protected=policy.protected),
 }
 
 
@@ -522,9 +523,9 @@ def _write_summary(inv: Invocation, rep: Report) -> None:
 def _commits(inv: Invocation, args: argparse.Namespace) -> None:
     """The repository root, HEAD and, with --base, the merge base, found once right after argv
     parses: the envelope carries them on every later exit, a usage error included, and the section
-    uses the same merge base."""
+    uses the same HEAD (args.head_commit, None without one) and the same merge base."""
     args.repo_root = _repo_root(args.repo)
-    inv.commit = _head_commit(args.repo_root)
+    inv.commit = args.head_commit = _head_commit(args.repo_root)
     if getattr(args, "base", None) is not None:
         args.base_commit = _merge_base(args.repo_root, args.base)
         inv.base = {"ref": args.base, "commit": args.base_commit}

@@ -176,11 +176,14 @@ def doc(key: str, value) -> dict:
 
 
 def accepted(key: str, value) -> dict:
-    """doc(key, value), with both duration thresholds set to the value for a duration threshold: an
-    error threshold below the warning one, a default included, is refused on its own."""
+    """doc(key, value), with both thresholds of the pair set to the value for a duration or a
+    mutation threshold: an error threshold below the warning one, and a mutation target below the
+    threshold, a default included, are refused on their own."""
     data = doc(key, value)
     if key in ("duration.warn_s", "duration.error_s"):
         data["duration"] = {"warn_s": value, "error_s": value}
+    if key in ("mutation.threshold", "mutation.target"):
+        data["mutation"] = {"threshold": value, "target": value}
     return data
 
 
@@ -298,7 +301,7 @@ class TypeTest(ValidateCase):
     def test_integer_accepted_where_a_float_is_expected(self):
         for key in FRACTION_KEYS:
             with self.subTest(key=key):
-                validate(doc(key, 1))
+                validate(accepted(key, 1))
         validate(doc("duration.warn_s", 240))
         validate(doc("loc.budget_ratio", 2))
 
@@ -337,7 +340,7 @@ class RangeTest(ValidateCase):
         for key in FRACTION_KEYS:
             for value in (0, 0.0, 0.5, 1, 1.0):
                 with self.subTest(key=key, value=value):
-                    validate(doc(key, value))
+                    validate(accepted(key, value))
 
     def test_fraction_out_of_range(self):
         for key in FRACTION_KEYS:
@@ -408,6 +411,87 @@ class DurationThresholdTest(ValidateCase):
             load(root)
         message = "muster.toml: duration.error_s: 120 is below duration.warn_s 240 (the default)"
         self.assertEqual((str(ctx.exception), ctx.exception.kind), (message, "config"))
+
+
+class MutationThresholdTest(ValidateCase):
+    """The effective mutation target, a default included, must not be below the threshold."""
+
+    def test_threshold_above_the_default_target(self):
+        message = "mutation.target: 0.7 (the default) is below mutation.threshold 0.75"
+        self.assertEqual(self.error(doc("mutation.threshold", 0.75)), message)
+
+    def test_target_below_the_default_threshold(self):
+        message = "mutation.target: 0.5 is below mutation.threshold 0.6 (the default)"
+        self.assertEqual(self.error(doc("mutation.target", 0.5)), message)
+
+    def test_both_set_and_inverted(self):
+        data = {"mutation": {"threshold": 0.8, "target": 0.625}}
+        self.assertEqual(self.error(data), "mutation.target: 0.625 is below mutation.threshold 0.8")
+
+    def test_equal_thresholds_are_allowed(self):
+        validate({"mutation": {"threshold": 0.75, "target": 0.75}})
+        validate({"mutation": {"threshold": 1, "target": 1.0}})
+        validate(doc("mutation.threshold", 0.7))
+        validate(doc("mutation.target", 0.6))
+
+    def test_one_side_within_the_default(self):
+        validate(doc("mutation.threshold", 0.5))
+        validate(doc("mutation.target", 0.9))
+
+    def test_effective_values(self):
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), {})
+        self.assertEqual((cfg.mutation_threshold, cfg.mutation_target, cfg.mutation_format), (0.60, 0.70, "pit"))
+        data = {"mutation": {"threshold": 0.5, "target": 0.875, "format": "pit"}}
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), data)
+        self.assertEqual((cfg.mutation_threshold, cfg.mutation_target, cfg.mutation_format), (0.5, 0.875, "pit"))
+
+    def test_load_names_the_file(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "muster.toml").write_bytes(b"[mutation]\nthreshold = 0.75\n")
+        with self.assertRaises(ConfigError) as ctx:
+            load(root)
+        message = "muster.toml: mutation.target: 0.7 (the default) is below mutation.threshold 0.75"
+        self.assertEqual((str(ctx.exception), ctx.exception.kind), (message, "config"))
+
+
+class ToolVersionsTest(ValidateCase):
+    """The keys of mutation.tool_versions are not empty, have no control character, are listed once
+    and need the file they are read from; a file without keys is allowed."""
+
+    def versions(self, table: dict) -> dict:
+        return {"mutation": {"tool_versions": table}}
+
+    def test_refusals(self):
+        file = "build/versions.toml"
+        missing = "mutation.tool_versions.file: missing; the versions of the keys are read from it"
+        for table, message in (
+            ({"file": file, "keys": ["mutation-plugin", ""]}, "mutation.tool_versions.keys[1]: must not be empty"),
+            (
+                {"file": file, "keys": ["mutation" + chr(10) + "tool"]},
+                'mutation.tool_versions.keys[0]: has a control character, got "mutation\\ntool"',
+            ),
+            (
+                {"file": file, "keys": ["mutation-tool" + chr(0x85)]},
+                'mutation.tool_versions.keys[0]: has a control character, got "mutation-tool\\u0085"',
+            ),
+            (
+                {"file": file, "keys": ["mutation-tool", "mutation-plugin", "mutation-tool"]},
+                'mutation.tool_versions.keys[2]: "mutation-tool" is already mutation.tool_versions.keys[0]',
+            ),
+            ({"keys": ["mutation-tool"]}, missing),
+        ):
+            with self.subTest(table=table):
+                self.assertEqual(self.error(self.versions(table)), message)
+
+    def test_accepted(self):
+        for table in (
+            {"file": "build/versions.toml"},
+            {"file": "build/versions.toml", "keys": []},
+            {"keys": []},
+            {"file": "build/versions.toml", "keys": ["mutation-plugin", "mutation-tool"]},
+        ):
+            with self.subTest(table=table):
+                validate(self.versions(table))
 
 
 class SchemaVersionTest(ValidateCase):

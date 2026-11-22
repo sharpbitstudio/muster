@@ -27,6 +27,8 @@ from muster.zones import Classification, Names, Targets, classify, target_files,
 
 HELP = "classify the source files by the policy files and check the policy"
 SNAPSHOT_SCHEMA = 1
+# The freshness reason of a command when the snapshot is not there.
+NO_SNAPSHOT = 'no snapshot: run "muster policy --snapshot" before the tests'
 REQUIRED = ("source.roots", "source.include", "zones.base", "zones.critical", "zones.standard")
 POLICY_FILES = ("zones.critical", "zones.standard", "zones.exemptions", "mutation.targets")
 _FROM_CONFIG = object()  # --snapshot without FILE; no file name given on the command line is it

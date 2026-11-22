@@ -760,7 +760,7 @@ class OutputClashTest(PolicyCase):
         self.assertNotIn(f"the source file {SOURCES[2]}", [label for label, _ in files])
 
     def test_every_analysis_command_protects_the_same_files(self):
-        for name in ("policy", "coverage", "duration"):
+        for name in cli.ANALYSES:
             with self.subTest(command=name):
                 self.assertIs(cli.ANALYSES[name].protected, policy.protected)
 

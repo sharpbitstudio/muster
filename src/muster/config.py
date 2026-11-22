@@ -33,6 +33,8 @@ DEFAULT_FLOOR_LINE, DEFAULT_FLOOR_BRANCH = 0.80, 0.65
 DEFAULT_DELTA_LINE, DEFAULT_DELTA_BRANCH = 0.80, 0.80
 # The duration thresholds in seconds that apply where the profile sets none (POLICY.md, point 5).
 DEFAULT_WARN_S, DEFAULT_ERROR_S = 240, 300
+# The mutation thresholds of test strength that apply where the profile sets none (POLICY.md, point 6).
+DEFAULT_MUTATION_THRESHOLD, DEFAULT_MUTATION_TARGET = 0.60, 0.70
 
 
 class ConfigError(FatalError):
@@ -381,6 +383,36 @@ def _check_duration(data: dict) -> None:
         )
 
 
+def _check_mutation(data: dict) -> None:
+    """The effective mutation target, a default included, is not below the threshold (the two may be
+    equal), and the keys of mutation.tool_versions are usable: each one not empty, without a control
+    character and listed once, and read from a file that the table names."""
+    mutation = data.get("mutation", {})
+    threshold = mutation.get("threshold", DEFAULT_MUTATION_THRESHOLD)
+    target = mutation.get("target", DEFAULT_MUTATION_TARGET)
+    if target < threshold:
+
+        def shown(key: str, value: Any) -> str:
+            return _shown(value) + ("" if key in mutation else " (the default)")
+
+        raise ConfigError(
+            f"mutation.target: {shown('target', target)} is below mutation.threshold {shown('threshold', threshold)}"
+        )
+    versions = mutation.get("tool_versions", {})
+    seen: dict[str, int] = {}
+    for i, key in enumerate(versions.get("keys", [])):
+        item, shown_key = f"mutation.tool_versions.keys[{i}]", json.dumps(key)
+        if key == "":
+            raise ConfigError(f"{item}: must not be empty")
+        if _has_control(key):
+            raise ConfigError(f"{item}: has a control character, got {shown_key}")
+        if key in seen:
+            raise ConfigError(f"{item}: {shown_key} is already mutation.tool_versions.keys[{seen[key]}]")
+        seen[key] = i
+    if seen and "file" not in versions:
+        raise ConfigError("mutation.tool_versions.file: missing; the versions of the keys are read from it")
+
+
 def _extension_problem(value: str) -> str | None:
     return (
         "must start with ." if not value.startswith(".")
@@ -456,6 +488,7 @@ def validate(data: dict) -> None:
     """Raises ConfigError naming the first problem of a parsed muster.toml."""
     _check_table("", data, SCHEMA)
     _check_duration(data)
+    _check_mutation(data)
     _check_languages(data)
 
 
@@ -538,6 +571,18 @@ class Config:
     @property
     def output_dir(self) -> str | None:
         return self.get("output.dir")
+
+    @property
+    def mutation_format(self) -> str:
+        return self.get("mutation.format", "pit")
+
+    @property
+    def mutation_threshold(self) -> float:
+        return self.get("mutation.threshold", DEFAULT_MUTATION_THRESHOLD)
+
+    @property
+    def mutation_target(self) -> float:
+        return self.get("mutation.target", DEFAULT_MUTATION_TARGET)
 
     @property
     def mutation_targets(self) -> str | None:
