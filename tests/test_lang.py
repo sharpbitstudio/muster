@@ -90,6 +90,10 @@ class GenericCounterTest(unittest.TestCase):
         lines = ['"""', "a docstring", '"""', 'x = 1  """ inline """', '""" once """ y']
         self.assertEqual(generic_loc(lines, "#", ('"""', '"""')), 2)
 
+    def test_line_comment_equal_to_the_block_start_wins(self):
+        # A block would hide the second line and the closing marker; the line comment hides nothing more.
+        self.assertEqual(generic_loc(["-- open", "x = 1", "]] y"], "--", ("--", "]]")), 2)
+
 
 class JavaCounterTest(unittest.TestCase):
     SAMPLE = "\n".join(

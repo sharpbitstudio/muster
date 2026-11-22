@@ -184,6 +184,11 @@ def untracked_under(repo: Path, folders: list[str]) -> list[str]:
     return sorted({path for path in out.split("\0") if path})
 
 
+# A record of `git diff --numstat -z` without renames: added, deleted (ASCII digits, or `-` for a
+# file git takes as binary) and a path that is not empty (tabs and line feeds included).
+_NUMSTAT_RECORD = re.compile(r"([0-9]+|-)\t([0-9]+|-)\t(.+)", re.S)
+
+
 def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int | None, int | None, str]]:
     """(added, deleted, path) of every file changed from `commit` to the work tree under `folders`,
     in git's order, run in `repo` with paths relative to it (`--relative`). A count is None where
@@ -200,11 +205,11 @@ def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int
     changes: list[tuple[int | None, int | None, str]] = []
     for record in out.split("\0"):
         if record:
-            try:
-                added, deleted, path = record.split("\t", 2)
-                changes.append((None if added == "-" else int(added), None if deleted == "-" else int(deleted), path))
-            except ValueError:
-                raise ReportError(f"git diff --numstat gave an unexpected record: {record!r}") from None
+            match = _NUMSTAT_RECORD.fullmatch(record)
+            if match is None:
+                raise ReportError(f"git diff --numstat gave an unexpected record: {record!r}")
+            added, deleted, path = match.groups()
+            changes.append((None if added == "-" else int(added), None if deleted == "-" else int(deleted), path))
     return changes
 
 
