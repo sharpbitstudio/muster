@@ -521,6 +521,10 @@ jobs:
       - name: Own policy
         run: python -I src policy
 
+      # muster counts its own lines of code; a file it cannot count fails.
+      - name: Own lines of code
+        run: python -I src loc --fail-on-error
+
   # The one check the ruleset requires for the unit tests: its name stays
   # the same when the matrix changes. It also reads the conclusion of each
   # test job of the run, since a job cancelled before any runner took it
