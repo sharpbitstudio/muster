@@ -576,6 +576,50 @@ class ScannedOutputClashTest(CliCase):
                     self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
                     (self.work / "out.json").unlink()
 
+    # The best-effort paths (version, an argument error) and a run of a command.
+    REPO_COMMANDS = ((["version"], 0), (["loc", "--base="], 2), (["loc"], 2))
+
+    def test_repo_that_cannot_be_resolved_is_never_a_bug(self):
+        # Resolving --repo raises OSError for a busy named pipe on Windows, and RuntimeError for a
+        # link loop on Python 3.11 and 3.12; here the resolution of the repository folder raises.
+        resolve = Path.resolve
+        for failure in (OSError(231, "All pipe instances are busy"), RuntimeError("a synthetic link loop")):
+
+            def raising(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(self.repo)):
+                    raise failure
+                return resolve(path, *args, **kwargs)
+
+            for command, expected in self.REPO_COMMANDS:
+                with self.subTest(failure=type(failure).__name__, command=command):
+                    with mock.patch.object(Path, "resolve", autospec=True, side_effect=raising) as patched:
+                        code, _, err = self.run_main("--repo", str(self.repo), *command, "--json-out", "out.json")
+                    self.assertTrue(patched.called)
+                    self.assertEqual(code, expected, err)
+                    env = self.read_json(self.work / "out.json")
+                    self.assertEqual(env["exit_code"], expected)
+                    if command == ["loc"]:
+                        self.assertEqual(env["error"]["kind"], "usage")
+                        prefix = f"--repo {self.repo}: cannot resolve the folder: "
+                        self.assertTrue(env["error"]["message"].startswith(prefix), env["error"])
+                    (self.work / "out.json").unlink()
+
+    def test_repo_that_is_a_link_loop(self):
+        loop = self.root / "loop"
+        try:
+            os.symlink(loop, loop, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symbolic link here")
+        for command, expected in self.REPO_COMMANDS:
+            with self.subTest(command=command):
+                code, _, err = self.run_main("--repo", str(loop), *command, "--json-out", "out.json")
+                self.assertEqual(code, expected, err)
+                env = self.read_json(self.work / "out.json")
+                self.assertEqual(env["exit_code"], expected)
+                if command == ["loc"]:  # cannot resolve (Python 3.11, 3.12), else cannot read the profile
+                    self.assertIn(env["error"]["kind"], ("usage", "config"))
+                (self.work / "out.json").unlink()
+
 
 class InternalErrorTest(CliCase):
     def test_bug_exits_three_with_envelope(self):
