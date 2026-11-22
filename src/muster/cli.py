@@ -13,9 +13,13 @@ of the command (also one its options name), a file under a source or test folder
 of the repository or another output: on such a clash nothing is removed or written. A profile that
 fails its check, or one that no command reads (after a failed parse of argv, where the default
 config file of the repository is refused too, and for `version`), still names every file and folder
-it can, as far as it parses. Once that holds, the outputs that must not outlive a failed run are
-removed before the command does anything else, and those removed when the run fails go on any exit
-2 or 3.
+it can, as far as it parses; there it is read only when it is a regular file, and a path that
+cannot be resolved (a busy named pipe on Windows, say) is no clash. These best-effort checks do not
+refuse what only a command would find: the JUnit files of tests.results (a glob), or a --diff-file
+named on the same command line; and the fallback in src/__main__.py, for an older Python or a broken
+install, writes --json-out without any check. Once that holds, the outputs that must not outlive a
+failed run are removed before the command does anything else, and those removed when the run fails
+go on any exit 2 or 3.
 """
 
 from __future__ import annotations
@@ -261,6 +265,15 @@ def _same_file(first: Path, second: Path) -> bool:
     return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
 
 
+def _same_file_if_resolved(first: Path, second: Path) -> bool:
+    """_same_file(), with paths that cannot be resolved (os.path.realpath raises for a busy named
+    pipe on Windows, say) never the same file."""
+    try:
+        return _same_file(first, second)
+    except OSError:
+        return False
+
+
 def _index(files: Inputs) -> dict[str, str]:
     """The resolved path (case-folded on Windows) of each file -> its label; a file that is a link is
     also keyed by the file it leads to. Each folder is resolved once, so that a large set of files
@@ -295,18 +308,27 @@ class Invocation:
     sections: list[Report] = field(default_factory=list)
 
 
-def _refuse_clashes(inv: Invocation, named: Inputs, inputs: Inputs, protected: dict[str, str] | None = None) -> None:
+def _refuse_clashes(
+    inv: Invocation,
+    named: Inputs,
+    inputs: Inputs,
+    protected: dict[str, str] | None = None,
+    *,
+    best_effort: bool = False,
+) -> None:
     """Refuse an output that is an input, a protected file or another output: exit 2, and nothing is
-    removed or written, the envelope and the summary included."""
+    removed or written, the envelope and the summary included. With `best_effort`, two paths of
+    which one cannot be resolved are no clash."""
+    same = _same_file_if_resolved if best_effort else _same_file
     for i, (label, path) in enumerate(named):
-        clash = next((f"is {other}" for other, file in inputs if _same_file(path, file)), None)
+        clash = next((f"is {other}" for other, file in inputs if same(path, file)), None)
         if clash is None and protected:
             # The file a link leads to, and the link itself: _index() keys a protected link by both.
             keys = (os.path.realpath(path), os.path.join(os.path.realpath(path.parent), path.name))
             other = next((protected[key] for key in map(os.path.normcase, keys) if key in protected), None)
             clash = None if other is None else f"is {other}"
         if clash is None:
-            clash = next((f"is the same file as {other}" for other, file in named[:i] if _same_file(path, file)), None)
+            clash = next((f"is the same file as {other}" for other, file in named[:i] if same(path, file)), None)
         if clash is not None:
             inv.json_out, inv.summary, inv.remove_on_failure = None, None, []
             raise UsageError(f"{label} {clash}")
@@ -316,16 +338,33 @@ def _real(path: Path) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config) -> None:
+def _output_keys(path: Path) -> tuple[str, str]:
+    """An output as _refuse_under_folders() compares it: resolved, and with only its folder resolved."""
+    return _real(path), os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name))
+
+
+def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config, *, best_effort: bool = False) -> None:
     """Refuse an output under a folder of source.roots or source.tests, on every run alike: exit 2,
     and nothing is removed or written. The paths are compared resolved (ignoring case on Windows),
     so a link that leads into such a folder counts, and so does a path inside one whose last part is
-    a link. On a profile that failed its check only the entries that listed_folders() keeps count."""
+    a link. On a profile that failed its check only the entries that listed_folders() keeps count.
+    With `best_effort`, a folder or an output that cannot be resolved is left out."""
     folders = [("source", folder) for folder in listed_folders(cfg, "source.roots")]
     folders += [("test", folder) for folder in listed_folders(cfg, "source.tests")]
-    resolved = [(kind, folder, _real(cfg.root / folder)) for kind, folder in folders]
+    resolved, outputs = [], []
+    for kind, folder in folders:
+        try:
+            resolved.append((kind, folder, _real(cfg.root / folder)))
+        except OSError:
+            if not best_effort:
+                raise
     for label, path in named:
-        keys = (_real(path), os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name)))
+        try:
+            outputs.append((label, _output_keys(path)))
+        except OSError:
+            if not best_effort:
+                raise
+    for label, keys in outputs:
         for kind, folder, top in resolved:
             if any(key == top or key.startswith(top.rstrip(os.sep) + os.sep) for key in keys):
                 inv.json_out, inv.summary, inv.remove_on_failure = None, None, []
@@ -386,22 +425,29 @@ def _option_summary(args: argparse.Namespace) -> Summary | None:
 
 
 def _refuse_profile_clashes(inv: Invocation, named: Inputs, repo: str | None, value: str, *, default: bool) -> None:
-    """For a profile that no command reads: refuse an output that is the config file `value` of the
-    repository `repo` (--repo and --config, which may be anything), with `default` also the default
-    config file, or, as far as the profile parses without its check, a file it names or a file
-    under one of its source or test folders: exit 2, and nothing is removed or written. A profile
-    that cannot be read or is not TOML adds nothing. Only a UsageError is raised: a NUL in `repo`
-    names no repository, and one in `value` no file."""
+    """For a profile that no command reads: refuse an output that is another output, the config
+    file `value` of the repository `repo` (--repo and --config, which may be anything), with
+    `default` also the default config file, or, as far as the profile parses without its check, a
+    file it names or a file under one of its source or test folders: exit 2, and nothing is removed
+    or written. The profile is read only when it is a regular file, so a named pipe never blocks
+    the run; one that cannot be read or is not TOML adds nothing. A path that cannot be resolved is
+    no clash. Only a UsageError is raised: a NUL in `repo` names no repository, and one in `value`
+    no file.
+
+    It does not refuse what only a command would find: a JUnit file of tests.results (a glob) or a
+    --diff-file named on the same command line. Nor does the fallback in src/__main__.py, for an
+    older Python or a broken install, run it: that one writes --json-out without any check."""
     if "\0" in (repo or ""):
+        _refuse_clashes(inv, named, [], best_effort=True)
         return
     root = _repo_root(repo)
     given = [] if "\0" in value else [("the config file", config_path(root, value))]
     if default:
         given.append(("the default config file", config_path(root, DEFAULT_CONFIG)))
-    unchecked = load_unchecked(root, value)
-    _refuse_clashes(inv, named, given + (named_files(unchecked) if unchecked is not None else []))
+    unchecked = load_unchecked(root, value) if os.path.isfile(config_path(root, value)) else None
+    _refuse_clashes(inv, named, given + (named_files(unchecked) if unchecked is not None else []), best_effort=True)
     if unchecked is not None:
-        _refuse_under_folders(inv, named, unchecked)
+        _refuse_under_folders(inv, named, unchecked, best_effort=True)
 
 
 def _arm_scanned(inv: Invocation) -> None:
