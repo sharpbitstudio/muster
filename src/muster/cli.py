@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__, coverage, duration, policy
+from muster import __version__, coverage, duration, loc, policy
 from muster.config import (
     DEFAULT_CONFIG,
     SECTIONS,
@@ -108,6 +108,7 @@ ANALYSES: dict[str, Analysis] = {
         option_inputs=coverage.option_inputs,
     ),
     "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=policy.protected),
+    "loc": Analysis(loc.run, loc.HELP, loc.arguments, named_files, protected=policy.protected),
 }
 
 
