@@ -11,17 +11,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
-import re
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from muster import __version__
-from muster.config import Config, ConfigError, named_files, require
+from muster.adapters import strict_json
+from muster.config import SHA256, Config, ConfigError, named_files, require
 from muster.gitio import records
-from muster.paths import SourceSets, exists_exact, source_sets
+from muster.paths import SourceSets, exists_exact, resolve_glob, source_sets
 from muster.report import FatalError, Report, ReportError, json_text, md_path, write_json
 from muster.zones import Classification, Names, Targets, classify, target_violations, trim
 
@@ -30,7 +30,6 @@ SNAPSHOT_SCHEMA = 1
 REQUIRED = ("source.roots", "source.include", "zones.base", "zones.critical", "zones.standard")
 POLICY_FILES = ("zones.critical", "zones.standard", "zones.exemptions", "mutation.targets")
 _FROM_CONFIG = object()  # --snapshot without FILE; no file name given on the command line is it
-_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class PolicyError(FatalError):
@@ -64,14 +63,21 @@ def snapshot_path(args: argparse.Namespace, cfg: Config) -> Path | None:
     return cfg.root / cfg.snapshot
 
 
+def snapshot_name(args: argparse.Namespace, cfg: Config) -> str:
+    """The snapshot to write as messages name it: FILE as typed, else policy.snapshot as the profile
+    names it (repository-relative)."""
+    return cfg.snapshot if args.snapshot is _FROM_CONFIG else str(Path(args.snapshot))
+
+
 def _policy_files(cfg: Config) -> list[tuple[str, str]]:
     """(key, configured path) of every policy file the profile names."""
     return [(key, cfg.get(key)) for key in POLICY_FILES if cfg.get(key) is not None]
 
 
 def inputs(cfg: Config) -> list[tuple[str, Path]]:
-    """Every file the profile names (label, path) but the snapshot, which this command writes. Like
-    config.named_files, it never raises, not even on a profile that failed its check."""
+    """Every file the profile names (label, path) but the snapshot, which this command may write;
+    protected() keeps the snapshot from a run that does not write it. Like config.named_files, it
+    never raises, not even on a profile that failed its check."""
     return named_files(cfg, leave_out=("policy.snapshot",))
 
 
@@ -90,17 +96,38 @@ def outputs(args: argparse.Namespace, cfg: Config) -> tuple[list[tuple[str, Path
         snapshot, error = None, error or exc
     if snapshot is not None:
         # Kept while the check runs, so that an unchanged snapshot keeps its created_epoch_ms.
-        files.append((f"the snapshot {snapshot}", snapshot, False, True))
+        files.append((f"the snapshot {snapshot_name(args, cfg)}", snapshot, False, True))
     return files, error
 
 
+def _writes_snapshot(args: argparse.Namespace, cfg: Config) -> bool:
+    """Whether this run writes the snapshot of policy.snapshot: --snapshot without FILE, or a FILE
+    that resolves to the same path (ignoring case on Windows)."""
+    option = getattr(args, "snapshot", None)
+    if option is _FROM_CONFIG:
+        return True
+    if not isinstance(option, str) or not option:
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(option)) == os.path.normcase(os.path.realpath(cfg.root / cfg.snapshot))
+    except (OSError, ValueError):  # a name no path can hold, such as one with a NUL, is no file of the profile
+        return False
+
+
 def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
-    """The repository files no output may be: every file the walk of the source and the test
-    folders found, before the include, exclude and generated globs. It never raises: the walk is
-    kept in args.source_sets for run(), which reports a folder that is missing or cannot be read."""
+    """The repository files no output of any analysis command may be: every file the walk of the
+    source and the test folders found, before the include, exclude and generated globs; every JUnit
+    file of tests.results; and the snapshot of policy.snapshot unless this run writes it. It never
+    raises: the walk is kept in args.source_sets and the JUnit files in args.junit_files for run(),
+    which reports a folder that is missing or cannot be read."""
     sets = args.source_sets = source_sets(cfg, defer=True)
     files = [(f"the source file {path}", cfg.root / path) for path in sets.walked_sources]
     files += [(f"the test file {path}", cfg.root / path) for path in sets.walked_tests]
+    results = cfg.get("tests.results")
+    args.junit_files = resolve_glob(cfg.root, results) if results is not None else []
+    files += [(f"the JUnit file {path}", cfg.root / path) for path in args.junit_files]
+    if cfg.snapshot is not None and not _writes_snapshot(args, cfg):
+        files.append(("the file of policy.snapshot", cfg.root / cfg.snapshot))
     return files
 
 
@@ -318,19 +345,6 @@ def _write_zones(target: Path, text: str) -> None:
         raise FatalError(f"cannot write --zones-out {target}: {exc.strerror or exc}") from None
 
 
-def _reject_constant(name: str) -> None:
-    raise ValueError(f"{name} is no JSON number")
-
-
-def _finite(text: str) -> float:
-    """A JSON number with a fraction or an exponent; one too large for a float, such as 1e400, would
-    be an infinity."""
-    value = float(text)
-    if not math.isfinite(value):
-        raise ValueError(f"{text} is no finite number")
-    return value
-
-
 def _snapshot_problem(document: object) -> str | None:
     """What keeps a parsed document from having the shape of a snapshot, or None."""
     if not isinstance(document, dict):
@@ -340,7 +354,7 @@ def _snapshot_problem(document: object) -> str | None:
         return isinstance(value, int) and not isinstance(value, bool)
 
     def sha256(value: object) -> bool:
-        return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+        return isinstance(value, str) and SHA256.fullmatch(value) is not None
 
     def strings(value: object) -> bool:
         return isinstance(value, list) and all(isinstance(item, str) for item in value)
@@ -377,7 +391,7 @@ def read_snapshot(path: Path, *, name: str | None = None) -> dict:
     except OSError as exc:
         raise ReportError(f"{name}: cannot read the snapshot: {exc.strerror or exc}") from None
     try:
-        document = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite)
+        document = strict_json(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise ReportError(f"{name}: the snapshot is not valid UTF-8 (byte {exc.start})") from None
     except ValueError as exc:
@@ -390,12 +404,12 @@ def read_snapshot(path: Path, *, name: str | None = None) -> dict:
     return document
 
 
-def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_hash: str) -> None:
-    """Write the snapshot, unless the one there has a valid shape and the same sources and policy
-    hashes; one that is missing, unreadable or broken is written anew."""
+def _write_snapshot(target: Path, name: str, sources: list[str], sources_hash: str, policy_hash: str) -> None:
+    """Write the snapshot, unless the one there has a valid shape, the same sources and the same
+    sources and policy hashes; one that is missing, unreadable or broken is written anew."""
     try:
         old = read_snapshot(target)
-        if old["sources_sha256"] == sources_hash and old["policy_sha256"] == policy_hash:
+        if old["sources"] == sources and (old["sources_sha256"], old["policy_sha256"]) == (sources_hash, policy_hash):
             return
     except (ReportError, OSError):
         pass
@@ -410,7 +424,7 @@ def _write_snapshot(target: Path, sources: list[str], sources_hash: str, policy_
     try:
         write_json(target, json_text(document))
     except OSError as exc:
-        raise FatalError(f"cannot write the snapshot {target}: {exc.strerror or exc}") from None
+        raise FatalError(f"cannot write the snapshot {name}: {exc.strerror or exc}") from None
 
 
 def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
@@ -427,4 +441,5 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     if args.zones_out is not None:
         _write_zones(Path(args.zones_out), zones_text(checked.classification))
     if snapshot is not None:
-        _write_snapshot(snapshot, checked.sets.sources, sources_hash, policy_hash(cfg, checked))
+        name = snapshot_name(args, cfg)
+        _write_snapshot(snapshot, name, checked.sets.sources, sources_hash, policy_hash(cfg, checked))

@@ -25,14 +25,19 @@ def normalize(path: str) -> str:
     return "" if norm == "." else norm
 
 
-def _exact(root: Path, path: str) -> Path | None:
-    """`root / path` when every part of `path` has exactly that name on disk, else None. It never
-    raises: a folder that cannot be read hides what is in it."""
+def _exact(root: Path, path: str, strict: bool = False) -> Path | None:
+    """`root / path` when every part of `path` has exactly that name on disk, else None. A folder
+    that cannot be read hides what is in it; with `strict` its OSError is raised instead (a part
+    that is missing or is no folder still gives None)."""
     current = root
     for part in [part for part in normalize(path).split("/") if part]:
         try:
             names = os.listdir(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
         except OSError:
+            if strict:
+                raise
             return None
         if part not in names:
             return None
@@ -50,10 +55,11 @@ def exists_exact(root: Path, path: str, *, folder: bool = False) -> bool:
     return os.path.isdir(current) if folder else os.path.isfile(current)  # False on any OSError
 
 
-def present_exact(root: Path, path: str) -> bool:
+def present_exact(root: Path, path: str, *, strict: bool = False) -> bool:
     """Whether anything, a file, a folder or another kind of entry, is at `path` (relative to
-    `root`) with exactly the configured name of every part. It never raises."""
-    return _exact(root, path) is not None
+    `root`) with exactly the configured name of every part. It never raises; with `strict`, a
+    folder on the way that cannot be read raises its OSError rather than hide the entry."""
+    return _exact(root, path, strict) is not None
 
 
 def _is_junction(path: str) -> bool:
@@ -73,11 +79,14 @@ def is_link(path: str) -> bool:
     return os.path.islink(path) or getattr(os.path, "isjunction", _is_junction)(path)
 
 
-def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | None = None) -> list[str]:
+def walk(
+    root: Path, key: str, folders: list[str], errors: list[ConfigError] | None = None, *, skip: tuple[str, ...] = ()
+) -> list[str]:
     """The files under the folders (repository-relative), sorted and without duplicates. A folder
     that does not exist, or one that cannot be read, is a ConfigError naming the key; given a list
     `errors`, it goes there instead and the walk goes on. A configured folder that is a link is
-    walked; a linked folder (a symbolic link or a junction) below it is not."""
+    walked; a linked folder (a symbolic link or a junction) below it is not, nor is a folder below
+    it whose name is in `skip`. A message names a folder repository-relative."""
 
     def fail(error: ConfigError) -> None:
         if errors is None:
@@ -85,7 +94,11 @@ def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | N
         errors.append(error)
 
     def unreadable(exc: OSError) -> None:
-        fail(ConfigError(f"{key}: cannot read {exc.filename}: {exc.strerror or exc}"))
+        try:
+            folder = Path(exc.filename).relative_to(root).as_posix()
+        except (TypeError, ValueError):  # no file name, or one outside the root
+            folder = exc.filename
+        fail(ConfigError(f"{key}: cannot read {folder}: {exc.strerror or exc}"))
 
     found: set[str] = set()
     for i, folder in enumerate(folders):
@@ -95,7 +108,9 @@ def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | N
             continue
         top = root / rel
         for dirpath, dirnames, filenames in os.walk(top, onerror=unreadable, followlinks=False):
-            dirnames[:] = [name for name in dirnames if not is_link(os.path.join(dirpath, name))]
+            dirnames[:] = [
+                name for name in dirnames if name not in skip and not is_link(os.path.join(dirpath, name))
+            ]
             here = Path(dirpath).relative_to(top).as_posix()
             prefix = rel if here == "." else posixpath.join(rel, here)
             for name in filenames:
@@ -107,16 +122,19 @@ def walk(root: Path, key: str, folders: list[str], errors: list[ConfigError] | N
 def resolve_glob(root: Path, glob: str) -> list[str]:
     """The files that match a glob of the profile (repository-relative), sorted and without
     duplicates. Each alternative is walked from its longest literal folder prefix, the leading
-    folders without a `*`; an alternative without any `*` is a single file. The prefix must exist
-    with exactly the names on disk and may be a link; a linked folder below it is not followed.
-    Matching is case-sensitive. A prefix that does not exist gives no files, and a folder that
-    cannot be read hides its files: it never raises for the tree. The glob is one the profile check
-    accepted (well-formed, relative, inside the repository)."""
+    folders without a `*`; an alternative without any `*` names one entry, which is listed when
+    anything is there with exactly that name, a folder too, so that the reader refuses one that is
+    not a file. The prefix must exist with exactly the names on disk and may be a link; a linked
+    folder below it is not followed, nor is a folder named .git at any depth below it (the
+    repository's own data holds no report). Matching is case-sensitive. A prefix that does not
+    exist gives no files, and a folder that cannot be read hides its files: it never raises for the
+    tree. The glob is one the profile check accepted (well-formed, relative, inside the
+    repository)."""
     found: set[str] = set()
     for alternative in alternatives(glob):
         segments = alternative.split("/")
         if "*" not in alternative:
-            if exists_exact(root, alternative):
+            if present_exact(root, alternative):
                 found.add(normalize(alternative))
             continue
         prefix: list[str] = []
@@ -128,7 +146,8 @@ def resolve_glob(root: Path, glob: str) -> list[str]:
         if not exists_exact(root, start, folder=True):
             continue
         hidden: list[ConfigError] = []  # a folder that cannot be read is skipped
-        found.update(path for path in walk(root, "glob", [start], hidden) if matches(alternative, path))
+        walked = walk(root, "glob", [start], hidden, skip=(".git",))
+        found.update(path for path in walked if matches(alternative, path))
     return sorted(found)
 
 

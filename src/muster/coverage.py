@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import re
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from muster import policy
@@ -76,17 +77,10 @@ def arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--today", type=_day, help=argparse.SUPPRESS)
 
 
-def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
-    """The files no output may be: every walked source and test file (the walk is kept in
-    args.source_sets), the JUnit files of tests.results (resolved once, kept in args.junit_files for
-    run()) and the --diff-file. It never raises."""
-    files = policy.protected(args, cfg)
-    results = cfg.get("tests.results")
-    args.junit_files = resolve_glob(cfg.root, results) if results is not None else []
-    files += [(f"the JUnit file {path}", cfg.root / path) for path in args.junit_files]
-    if args.diff_file:
-        files.append((f"--diff-file {args.diff_file}", Path(args.diff_file)))
-    return files
+def option_inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    """The input files the command line names: the --diff-file. It never raises; the command line
+    checks them with the profile, before the profile is read."""
+    return [(f"--diff-file {args.diff_file}", Path(args.diff_file))] if args.diff_file else []
 
 
 def pct(missed_covered: list[int] | tuple[int, int]) -> str:
@@ -132,9 +126,10 @@ def add_to(acc: dict, sf: FileCoverage) -> None:
 
 
 def _percent(fraction: float) -> str:
-    """A threshold as a percentage, as precise as the profile gives it: 0.8 is 80%, 0.825 is 82.5%
-    and 0.8250001 is 82.50001%; ten significant digits drop only the float error of the product."""
-    return f"{fraction * 100:.10g}%"
+    """A threshold as a percentage, exactly as the profile gives it: 0.8 is 80%, 0.825 is 82.5% and
+    0.800000000001 is 80.0000000001%. The decimal point of the value's shortest form is moved, so no
+    float error of a product shows and no digit is rounded away."""
+    return f"{(Decimal(repr(fraction)) * 100).normalize():f}%"
 
 
 def _require(cfg: Config, no_freshness: bool) -> None:
@@ -152,7 +147,10 @@ def _read_diff_file(name: str) -> dict[str, set[int]]:
         raw = Path(name).read_bytes()
     except OSError as exc:
         raise FatalError(f"cannot read --diff-file {name}: {exc.strerror or exc}") from None
-    return parse_diff(raw.decode("utf-8", "replace"), "")
+    try:
+        return parse_diff(raw.decode("utf-8", "replace"), "")
+    except ValueError:  # a line number of more digits than int() converts
+        raise FatalError(f"cannot read --diff-file {name}: a hunk header has a line number too long") from None
 
 
 def _read_snapshot(cfg: Config, problems: list[str], errors: list[str]) -> dict | None:
@@ -277,7 +275,8 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
         if not exists(cfg.root, name):
             problems.append(f"no JaCoCo XML at {name}")
         else:
-            resolver = SourceResolver(cfg.root, cfg.get("source.roots"), frozenset(checked.sets.sources))
+            classified = frozenset(checked.sets.sources)
+            resolver = SourceResolver(cfg.root, cfg.get("source.roots"), classified, checked.sets.walked_sources)
             report = jacoco.load(cfg.root / name, resolver, name=name)
             data["excluded"] = {"count": len(report.excluded), "paths": report.excluded[:SHOWN_PATHS]}
             data["unresolved"] = {"count": len(report.unresolved), "names": report.unresolved[:SHOWN_PATHS]}
@@ -449,15 +448,17 @@ def _delta(
             rep.md.append(f"**Critical delta:** no merge-base with {md_path(args.base)} - not evaluated.")
             return _delta_not_evaluated(rep, "delta not evaluated (no merge-base)", reason)
         roots = cfg.get("source.roots")
+        summary = "delta not evaluated (git error)"
         try:
             changed = parse_diff(diff_since(cfg.root, base_commit, roots), "")
             untracked = [rel for rel in untracked_under(cfg.root, roots) if rel in zones]
+            summary = "delta not evaluated (cannot read a changed file)"
             for rel in untracked:
                 changed[rel] = set(range(1, _line_count(cfg.root, rel) + 1))
         except ReportError as exc:
             rep.annotate("warning", "Critical delta coverage", f"delta not evaluated: {exc}")
             rep.md.append(f"**Critical delta:** delta not evaluated: {exc}")
-            return _delta_not_evaluated(rep, "delta not evaluated (git error)", f"delta not evaluated: {exc}")
+            return _delta_not_evaluated(rep, summary, f"delta not evaluated: {exc}")
         label = f"{md_path(args.base)} (merge-base `{base_commit[:10]}`)"
     files, uncovered, no_data, exempt = [], [], [], []
     standard_count = 0

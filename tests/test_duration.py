@@ -262,6 +262,11 @@ class VerdictTest(DurationCase):
         self.timed_run(20, outcome="failed")
         self.not_measured("INCOMPLETE RUN (task failed: no message)")
 
+    def test_failed_task_with_a_blank_message(self):
+        self.timed_run(20, outcome="failed", failure="  " + chr(10) + chr(9) + " ")
+        run = self.not_measured("INCOMPLETE RUN (task failed: no message)")
+        self.assertIn("Failure: no message", run.summary)
+
     def test_task_that_did_not_run_is_not_measured(self):
         self.timed_run(20, outcome="up-to-date")
         run = self.not_measured("NOT MEASURED (task up-to-date)")
@@ -502,7 +507,7 @@ class BrokenInputTest(DurationCase):
         "wrong type": ('"end_ms": ', '"end_ms": "1", "was": '),
         "boolean": ('"end_ms": ', '"end_ms": true, "was": '),
         "missing key": ('"end_ms": ', '"end": '),
-        "inverted times": ('"end_ms": ', '"end_ms": -1, "was": '),
+        "inverted times": ('"end_ms": ', f'"end_ms": {START_MS - 1}, "was": '),
         "too long a run": ('"end_ms": ', '"end_ms": 1' + "0" * 400 + ', "was": '),
         "end past the year 9999": ('"end_ms": ', '"end_ms": 253402300800000, "was": '),
         "an infinite number in an extra key": ('"end_ms": ', '"was": 1e9999, "end_ms": '),
@@ -562,6 +567,11 @@ class BrokenInputTest(DurationCase):
                 self.replace(REPORT, old, new)
                 self.assert_errored(f"{REPORT}: ")
 
+    def test_inverted_times_are_an_ordering_error(self):
+        self.timed_run(20)
+        self.replace(RECORD, '"end_ms": ', f'"end_ms": {START_MS - 1}, "was": ')
+        self.assert_errored(f"{RECORD}: end_ms {START_MS - 1} is before start_ms {START_MS}")
+
     def test_huge_times_are_an_error_whatever_the_outcome(self):
         for outcome in ("failed", "skipped", None):
             with self.subTest(outcome=outcome):
@@ -582,6 +592,40 @@ class BrokenInputTest(DurationCase):
         counter += '<counter type="LINE" missed="-1" covered="3"/></sourcefile></package></report>'
         self.write(REPORT, sessions_xml([(START_MS, START_MS + 20_000)]).replace("</report>", counter))
         self.assert_errored(f"{REPORT}: <counter> attribute missed")
+
+    def test_broken_counter_outside_a_source_file(self):
+        self.write("muster.toml", PROFILE + WITH_REPORT)
+        self.timed_run(20)
+        counter = '<counter type="LINE" missed="-1" covered="1"/></report>'
+        self.write(REPORT, sessions_xml([(START_MS, START_MS + 20_000)]).replace("</report>", counter))
+        self.assert_errored(f"{REPORT}: <counter> attribute missed")
+
+    def test_literal_results_path_that_is_a_folder(self):
+        literal = f"{RESULTS}/TEST-{SUITE}.xml"
+        for source, profile in (("task-json", PROFILE), ("junit-span", SPAN_PROFILE)):
+            with self.subTest(source=source):
+                self.write("muster.toml", profile.replace(f"{RESULTS}/TEST-*.xml", literal))
+                self.timed_run(20, junit=False)
+                (self.repo / literal).mkdir(parents=True)
+                self.assert_errored(f"{literal}: not a file")
+                self.assertEqual(self.duration().section["errors"], [f"{literal}: not a file"])
+                (self.repo / literal).rmdir()
+
+    @unittest.skipIf(os.name == "nt", "chmod cannot make a folder unreadable on Windows")
+    def test_record_behind_a_folder_that_cannot_be_read(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root reads every folder")
+        self.timed_run(20)
+        folder = self.repo / "build" / "muster"
+        folder.chmod(0)
+        self.addCleanup(folder.chmod, 0o755)
+        try:
+            os.listdir(folder)
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("chmod does not make a folder unreadable here")
+        self.assert_errored(f"{RECORD}: cannot read a folder on its path: ")
 
     def test_junit_file_with_another_root(self):
         self.timed_run(20)
@@ -686,8 +730,8 @@ class OutputClashTest(DurationCase):
 
     def test_source_test_and_junit_files(self):
         self.timed_run(20)
-        self.assert_refused(self.repo / SOURCE, f"the source file {SOURCE}")
-        self.assert_refused(self.repo / TEST, f"the test file {TEST}")
+        self.assert_refused(self.repo / SOURCE, "under the source folder src/main/java")
+        self.assert_refused(self.repo / TEST, "under the test folder src/test/java")
         junit_file = f"{RESULTS}/TEST-{SUITE}.xml"
         self.assert_refused(self.repo / junit_file, f"the JUnit file {junit_file}")
 
@@ -701,12 +745,12 @@ class OutputClashTest(DurationCase):
     def test_files_under_the_folders_that_no_glob_matches(self):
         self.timed_run(20)
         for path, label in (
-            ("src/main/java/org/example/app/notes.txt", "the source file"),
-            ("src/test/java/org/example/app/fixture.txt", "the test file"),
+            ("src/main/java/org/example/app/notes.txt", "under the source folder src/main/java"),
+            ("src/test/java/org/example/app/fixture.txt", "under the test folder src/test/java"),
         ):
             with self.subTest(path=path):
                 self.write(path, "data\n")
-                self.assert_refused(self.repo / path, f"{label} {path}")
+                self.assert_refused(self.repo / path, label)
 
     def test_files_the_profile_names_for_other_commands(self):
         zones = '\n[zones]\ncritical = "policy/critical.txt"\n\n[policy]\nsnapshot = "build/muster/snapshot.json"\n'
@@ -723,6 +767,37 @@ class OutputClashTest(DurationCase):
         junit_file = f"{RESULTS}/TEST-{SUITE}.xml"
         self.assert_refused(self.repo / junit_file, f"the JUnit file {junit_file}")
 
+    def test_output_under_a_source_or_test_folder_on_every_run(self):
+        self.timed_run(20)
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "src/test/java/build"\n')
+        default = self.repo / "src/test/java/build/duration.md"
+        for options, target, message in (
+            (
+                ["--json-out", str(self.repo / "src/main/java/build/duration.json")],
+                self.repo / "src/main/java/build/duration.json",
+                f"--json-out {self.repo / 'src/main/java/build/duration.json'} is under the source folder"
+                " src/main/java",
+            ),
+            (
+                ["--summary-file", str(self.repo / "src/test/java/build/summary.md")],
+                self.repo / "src/test/java/build/summary.md",
+                f"--summary-file {self.repo / 'src/test/java/build/summary.md'} is under the test folder src/test/java",
+            ),
+            ([], default, "the summary src/test/java/build/duration.md is under the test folder src/test/java"),
+        ):
+            for run in ("first", "second"):
+                with self.subTest(target=target.name, run=run):
+                    if run == "second":  # as an earlier run would have left it
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(b"left\n")
+                    code, env = self.json_main("duration", *options)
+                    self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+                    if run == "first":
+                        self.assertFalse(target.exists())
+                    else:
+                        self.assertEqual(target.read_bytes(), b"left\n")
+            target.unlink()
+
     def test_inputs_never_raise_on_an_unchecked_profile(self):
         inputs = cli.ANALYSES["duration"].inputs
         data = {"duration": {"task_json": ["not", "a", "path"]}, "coverage": {"report": "build/x" + chr(0) + ".xml"}}
@@ -738,6 +813,14 @@ class PolicyTextTest(unittest.TestCase):
         found = re.findall(r"a warning above (\d+) seconds and an error above (\d+) seconds", point)
         self.assertEqual(found, [(str(DEFAULT_WARN_S), str(DEFAULT_ERROR_S))])
         self.assertIn("By default a run gets", point)
+
+    def test_policy_text_scopes_the_failed_run_to_the_timing_record(self):
+        text = (REPO_ROOT / "POLICY.md").read_bytes().decode("ascii")
+        point = text.split("## 5. ", 1)[1].split("\n## ", 1)[0]
+        rule = "When the time comes from a timing record of the test task, a failed or interrupted run has no"
+        self.assertIn(rule + " duration verdict.", point)
+        self.assertIn("is a lower bound of the wall time", point)
+        self.assertNotIn("A failed or interrupted run has no duration verdict.", point)
 
 
 if __name__ == "__main__":

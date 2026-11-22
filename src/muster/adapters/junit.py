@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,8 @@ def _seconds(text: str | None, file: str, suite: str) -> float:
 
 
 def _file_suites(root: Path, file: str) -> list[Suite]:
+    if not os.path.isfile(root / file):  # a literal path of tests.results may name a folder
+        raise ReportError(f"{file}: not a file")
     document = read_xml(root / file, file)
     if document.tag not in _ROOTS:
         raise ReportError(f"{file}: not a JUnit report, the root element is <{document.tag}>")

@@ -17,7 +17,7 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-from muster import __version__, cli
+from muster import __version__, cli, policy
 from muster.config import Config, ConfigError, load
 from muster.policy import (
     PolicyError,
@@ -574,7 +574,24 @@ class SnapshotTest(PolicyCase):
         self.snapshot.mkdir(parents=True)
         code, _, err = self.policy("--snapshot")
         self.assertEqual(code, 2)
-        self.assertIn("cannot write the snapshot", err)
+        self.assertIn("muster policy: error: cannot write the snapshot build/muster/snapshot.json: ", err)
+        self.assertNotIn(str(self.root), err)
+
+    def test_snapshot_that_cannot_be_removed_is_named_by_its_repository_path(self):
+        self.written()
+        self.unclassify()
+        unlink = Path.unlink
+
+        def denied(path, missing_ok=False):
+            if path == self.snapshot:
+                raise PermissionError(13, "Permission denied")
+            return unlink(path, missing_ok=missing_ok)
+
+        with mock.patch("pathlib.Path.unlink", denied):
+            code, _, err = self.policy("--snapshot")
+        self.assertEqual(code, 2)
+        self.assertIn("muster: error: cannot remove the snapshot build/muster/snapshot.json: Permission denied", err)
+        self.assertNotIn(str(self.root), err)
 
     def written(self) -> None:
         self.assertEqual(self.policy("--snapshot")[0], 0)
@@ -636,6 +653,16 @@ class SnapshotTest(PolicyCase):
         self.assertEqual(outputs(args, cfg), (expected, None))
         args = cli.build_parser().parse_args(["policy", "--snapshot"])
         self.assertEqual(outputs(args, cfg)[0][0][1], self.repo / "build" / "muster" / "snapshot.json")
+
+
+class SnapshotSourcesTest(PolicyCase):
+    def test_snapshot_with_other_sources_and_equal_hashes_is_written_anew(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        document = json.loads(self.snapshot.read_bytes())
+        sources, document["sources"] = document["sources"], []
+        self.snapshot.write_bytes(json.dumps(document).encode("ascii"))
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        self.assertEqual(json.loads(self.snapshot.read_bytes())["sources"], sources)
 
 
 class OutputClashTest(PolicyCase):
@@ -726,9 +753,55 @@ class OutputClashTest(PolicyCase):
         args = argparse.Namespace()
         with mock.patch("os.scandir", side_effect=listing):
             files = protected(args, load(self.repo))
-        self.assertEqual(str(args.source_sets.error), f"source.roots: cannot read {denied}: Permission denied")
+        message = f"source.roots: cannot read {BASE}/codec: Permission denied"  # repository-relative
+        self.assertEqual(str(args.source_sets.error), message)
         self.assertIn((f"the source file {SOURCES[3]}", self.repo / SOURCES[3]), files)
         self.assertNotIn(f"the source file {SOURCES[2]}", [label for label, _ in files])
+
+    def test_every_analysis_command_protects_the_same_files(self):
+        for name in ("policy", "coverage", "duration"):
+            with self.subTest(command=name):
+                self.assertIs(cli.ANALYSES[name].protected, policy.protected)
+
+    def test_output_is_a_junit_file(self):
+        self.write("muster.toml", PROFILE + '\n[tests]\nresults = "build/test-results/*.xml"\n')
+        junit_file = self.write("build/test-results/TEST-org.example.app.SuiteTest.xml", "<testsuite/>\n")
+        for option in ("--json-out", "--summary-file", "--zones-out"):
+            with self.subTest(option=option):
+                code, _, err = self.policy(option, str(junit_file))
+                self.assertEqual(code, 2)
+                label = "the JUnit file build/test-results/TEST-org.example.app.SuiteTest.xml"
+                self.assertIn(f"{option} {junit_file} is {label}", err)
+                self.assertUntouched({junit_file: b"<testsuite/>\n"})
+
+    def test_configured_snapshot_is_kept_from_a_run_that_does_not_write_it(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        before, target = self.snapshot.read_bytes(), str(self.snapshot)
+        for options in (
+            ["--json-out", target],
+            ["--summary-file", target],
+            ["--zones-out", target],
+            ["--snapshot", "other.json", "--json-out", target],
+        ):
+            with self.subTest(options=options[:-1]):
+                code, _, err = self.policy(*options)
+                self.assertEqual(code, 2)
+                self.assertIn(f"{options[-2]} {target} is the file of policy.snapshot", err)
+                self.assertUntouched({self.snapshot: before})
+        self.assertFalse((self.work / "other.json").exists())
+
+    def test_configured_snapshot_of_an_invalid_profile_is_kept(self):
+        self.assertEqual(self.policy("--snapshot")[0], 0)
+        before = self.snapshot.read_bytes()
+        self.write("muster.toml", PROFILE.replace("schema = 1", "schema = 2"))
+        code, _, err = self.policy("--json-out", str(self.snapshot))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--json-out {self.snapshot} is the file of policy.snapshot", err)
+        self.assertUntouched({self.snapshot: before})
+
+    def test_configured_snapshot_named_as_the_file_of_snapshot_is_written(self):
+        self.assertEqual(self.policy("--snapshot", str(self.snapshot))[0], 0)
+        self.assertTrue(self.snapshot.exists())
 
     def test_outputs_are_checked_when_the_snapshot_cannot_be_named(self):
         self.write("muster.toml", PROFILE.replace('[policy]\nsnapshot = "build/muster/snapshot.json"\n', ""))
@@ -755,7 +828,7 @@ class OutputClashTest(PolicyCase):
         self.link(target, link)
         code, _, err = self.policy("--zones-out", str(link))
         self.assertEqual(code, 2)
-        self.assertIn(f"is the source file {BASE}/codec/Linked.java", err)
+        self.assertIn(f"--zones-out {link} is under the source folder src/main/java", err)
         self.assertTrue(link.is_symlink())
         self.assertUntouched({target: b"class X {}\n"})
 
@@ -815,8 +888,16 @@ class OutputClashTest(PolicyCase):
         target = self.repo / "build" / "muster" / "policy.md"
         code, _, err = self.policy("--zones-out", str(target))
         self.assertEqual(code, 2)
-        self.assertIn(f"--zones-out {target} is the same file as the summary {target}", err)
+        self.assertIn(f"--zones-out {target} is the same file as the summary build/muster/policy.md", err)
         self.assertFalse(target.exists())
+
+    def test_output_dir_summary_that_cannot_be_written_is_named_by_its_repository_path(self):
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "build/muster"\n')
+        with mock.patch("muster.cli.write_markdown", side_effect=PermissionError(13, "Permission denied")):
+            code, _, err = self.policy()
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the summary build/muster/policy.md: Permission denied", err)
+        self.assertNotIn(str(self.root), err)
 
     def test_output_dir_summary_is_a_policy_file(self):
         profile = PROFILE.replace("policy/standard.txt", "policy/policy.md")
@@ -835,7 +916,7 @@ class OutputClashTest(PolicyCase):
                 code, _, err = self.policy(option, str(source))
                 self.assertEqual(code, 2)
                 label = "the snapshot" if option == "--snapshot" else option
-                self.assertIn(f"{label} {source} is the source file {SOURCES[2]}", err)
+                self.assertIn(f"{label} {source} is under the source folder src/main/java", err)
                 self.assertUntouched({source: b"class X {}\n"})
 
     def test_output_is_a_test_file_or_a_full_run_suite(self):
@@ -845,7 +926,7 @@ class OutputClashTest(PolicyCase):
         self.write("muster.toml", PROFILE + entry)
         code, _, err = self.policy("--zones-out", str(test_file))
         self.assertEqual(code, 2)
-        self.assertIn(f"is the test file {TESTS}/codec/KeyParserTest.java", err)
+        self.assertIn(f"--zones-out {test_file} is under the test folder src/test/java", err)
         code, _, err = self.policy("--snapshot", str(suite))
         self.assertEqual(code, 2)
         self.assertIn("is the file of coverage.full_run_suites[0].file", err)
@@ -855,9 +936,9 @@ class OutputClashTest(PolicyCase):
         notes = self.write(f"{BASE}/notes.txt", "data\n")
         fixture = self.write(f"{TESTS}/codec/fixture.txt", "data\n")
         for target, label in (
-            (self.repo / BASE / "package-info.java", f"the source file {BASE}/package-info.java"),
-            (notes, f"the source file {BASE}/notes.txt"),
-            (fixture, f"the test file {TESTS}/codec/fixture.txt"),
+            (self.repo / BASE / "package-info.java", "under the source folder src/main/java"),
+            (notes, "under the source folder src/main/java"),
+            (fixture, "under the test folder src/test/java"),
         ):
             with self.subTest(target=target.name):
                 before = target.read_bytes()
@@ -886,7 +967,7 @@ class OutputClashTest(PolicyCase):
         source = self.repo / SOURCES[2]
         code, _, err = self.policy("--json-out", str(source))
         self.assertEqual(code, 2)
-        self.assertIn(f"is the source file {SOURCES[2]}", err)
+        self.assertIn(f"--json-out {source} is under the source folder src/main/java", err)
         self.assertUntouched({source: b"class X {}\n"})
 
     @unittest.skipUnless(os.path.normcase("A") == "a", "case-insensitive paths only on Windows")
@@ -894,6 +975,71 @@ class OutputClashTest(PolicyCase):
         profile = self.repo / "MUSTER.TOML"
         self.assertEqual(self.policy("--zones-out", str(profile))[0], 2)
         self.assertTrue((self.repo / "muster.toml").read_bytes().startswith(b"schema = 1"))
+
+
+class OutputUnderSourceFolderTest(PolicyCase):
+    """No output may lie under a folder of source.roots or source.tests: refused on the first run,
+    before anything is written, and on every later one, also when an earlier run left the file."""
+
+    def assert_refused_on_every_run(self, target: Path, message: str, *options: str) -> None:
+        for run in ("first", "second"):
+            with self.subTest(target=target.name, run=run):
+                if run == "second":  # as an earlier run would have left it
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"left\n")
+                code, out, err = self.policy(*options)
+                self.assertEqual(code, 2, out + err)
+                self.assertIn(f"muster policy: error: {message}\n", err)
+                if run == "first":
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(target.read_bytes(), b"left\n")
+
+    def link_folder(self, target: Path, link: Path) -> None:
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            if sys.platform != "win32":
+                self.skipTest("cannot create a symbolic link here")
+            __import__("_winapi").CreateJunction(str(target), str(link))  # Windows only; needs no privilege
+
+    def test_snapshot(self):
+        profile = PROFILE.replace('"**/package-info.java"]', '"**/package-info.java", "**/build/**"]')
+        self.write("muster.toml", profile.replace("build/muster/snapshot.json", "src/main/java/build/snapshot.json"))
+        target = self.repo / "src/main/java/build/snapshot.json"
+        message = "the snapshot src/main/java/build/snapshot.json is under the source folder src/main/java"
+        self.assert_refused_on_every_run(target, message, "--snapshot")
+        self.assertNotIn(str(self.root), self.policy("--snapshot")[2])
+
+    def test_every_output_option(self):
+        for option, path, folder in (
+            ("--json-out", "src/main/java/build/out.json", "the source folder src/main/java"),
+            ("--summary-file", "src/test/java/build/summary.md", "the test folder src/test/java"),
+            ("--zones-out", "src/main/java/build/zones.tsv", "the source folder src/main/java"),
+            ("--snapshot", "src/test/java/build/snapshot.json", "the test folder src/test/java"),
+        ):
+            target = self.repo / path
+            label = "the snapshot" if option == "--snapshot" else option
+            self.assert_refused_on_every_run(target, f"{label} {target} is under {folder}", option, str(target))
+
+    def test_summary_of_the_output_folder(self):
+        self.write("muster.toml", PROFILE + '\n[output]\ndir = "src/test/java/build"\n')
+        target = self.repo / "src/test/java/build/policy.md"
+        message = "the summary src/test/java/build/policy.md is under the test folder src/test/java"
+        self.assert_refused_on_every_run(target, message)
+
+    def test_link_that_leads_into_a_source_folder(self):
+        linked = self.work / "linked"
+        self.link_folder(self.repo / "src" / "main" / "java", linked)
+        target = linked / "out.json"
+        message = f"--json-out {target} is under the source folder src/main/java"
+        self.assert_refused_on_every_run(target, message, "--json-out", str(target))
+
+    @unittest.skipUnless(os.path.normcase("A") == "a", "case-insensitive paths only on Windows")
+    def test_other_case_on_windows(self):
+        target = self.repo / "SRC" / "Main" / "java" / "out.json"
+        message = f"--json-out {target} is under the source folder src/main/java"
+        self.assert_refused_on_every_run(target, message, "--json-out", str(target))
 
 
 class OutputDirSummaryTest(PolicyCase):

@@ -10,8 +10,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from muster.adapters import SourceResolver, exists, jacoco, junit, timing
+from muster import config, policy
+from muster.adapters import SourceResolver, exists, jacoco, junit, strict_json, timing
 from muster.config import ConfigError
 from muster.report import ReportError
 
@@ -94,6 +96,12 @@ class SourceResolverTest(AdapterCase):
         resolver = self.resolver([MAIN])
         self.assertEqual(resolver.resolve(TOKEN.replace("Token", "token")), [])
         self.assertEqual(resolver.resolve(TOKEN.replace("auth", "Auth")), [])
+
+    def test_given_files_are_not_walked_again(self):
+        # Nothing is on disk: the walk the policy check made is used as it is.
+        resolver = SourceResolver(self.root, [MAIN], frozenset(), [f"{MAIN}/{TOKEN}"])
+        self.assertEqual(resolver.resolve(TOKEN), [f"{MAIN}/{TOKEN}"])
+        self.assertEqual(resolver.resolve(ENGINE), [])
 
     def test_missing_root_is_a_config_error(self):
         self.make(f"{MAIN}/{TOKEN}")
@@ -229,6 +237,38 @@ class JacocoBrokenTest(AdapterCase):
             "counter without type": token('<counter missed="0" covered="1"/>'),
             "INSTRUCTION counter twice": token('<counter type="INSTRUCTION" missed="0" covered="1"/>' * 2),
             "METHOD counter missed -1": token('<counter type="METHOD" missed="-1" covered="1"/>'),
+            "report counter missed -1": jacoco_xml(
+                package("org/example/app/auth", sourcefile("Token.java"))
+                + '<counter type="LINE" missed="-1" covered="1"/>'
+            ),
+            "group counter without type": jacoco_xml(
+                '<group name="more">'
+                + package("org/example/app/auth", sourcefile("Token.java"))
+                + '<counter missed="0" covered="1"/></group>'
+            ),
+            "package counter twice": jacoco_xml(
+                package(
+                    "org/example/app/auth",
+                    sourcefile("Token.java"),
+                    '<counter type="LINE" missed="0" covered="1"/>' * 2,
+                )
+            ),
+            "class counter covered x": jacoco_xml(
+                package(
+                    "org/example/app/auth",
+                    '<class name="org/example/app/auth/Token"><counter type="LINE" missed="0" covered="x"/></class>',
+                )
+            ),
+            "method counter of 400 digits": jacoco_xml(
+                package(
+                    "org/example/app/auth",
+                    '<class name="org/example/app/auth/Token"><method name="run" desc="()V">'
+                    '<counter type="METHOD" missed="0" covered="1' + "0" * 400 + '"/></method></class>',
+                )
+            ),
+            "counter of a sourcefile outside a package": jacoco_xml(
+                sourcefile("Token.java", '<counter type="LINE" missed="-1" covered="0"/>')
+            ),
             "session start missing": jacoco_xml("", '<sessioninfo id="localhost-1a2b" dump="5000"/>'),
             "session dump x": jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="1000" dump="x"/>'),
             "session start 1_0": jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="1_0" dump="20"/>'),
@@ -336,6 +376,11 @@ class JacocoSessionsTest(AdapterCase):
         path = self.write("jacoco.xml", jacoco_xml(package("org/example/app", sourcefile("auth/Token.java"))))
         with self.assertRaises(ReportError):
             jacoco.read_sessions(path)
+        counter = '<counter type="LINE" missed="-1" covered="1"/>'  # of a package, outside every source file
+        path = self.write("jacoco.xml", jacoco_xml(package("org/example/app/auth", sourcefile("Token.java"), counter)))
+        with self.assertRaises(ReportError) as caught:
+            jacoco.read_sessions(path)
+        self.assertIn("<counter> attribute missed", str(caught.exception))
 
     def test_inverted_session(self):
         path = self.write("jacoco.xml", jacoco_xml("", '<sessioninfo id="localhost-1a2b" start="7000" dump="-1000"/>'))
@@ -503,6 +548,12 @@ class JunitErrorsTest(AdapterCase):
             junit.read_suites(self.root, files)
         self.assertIn("results/TEST-first.xml", str(caught.exception))
 
+    def test_a_folder_is_not_a_file(self):
+        (self.root / "results" / "TEST-folder.xml").mkdir(parents=True)
+        errors: list[str] = []
+        self.assertEqual(junit.read_suites(self.root, ["results/TEST-folder.xml"], errors), [])
+        self.assertEqual(errors, ["results/TEST-folder.xml: not a file"])
+
 
 class WithinTest(unittest.TestCase):
     """A JUnit window against a window in epoch ms, give or take a second, in exact integers."""
@@ -531,6 +582,35 @@ class ExistsTest(AdapterCase):
         with self.assertRaises(ReportError) as caught:
             exists(self.root, "build/folder.xml")
         self.assertEqual(str(caught.exception), "build/folder.xml: not a file")
+
+    def test_folder_on_the_way_that_cannot_be_read(self):
+        self.make("build/muster/report.xml")
+        denied, listdir = str(self.root / "build" / "muster"), os.listdir
+
+        def listing(path="."):
+            if os.fspath(path) == denied:
+                raise PermissionError(13, "Permission denied", path)
+            return listdir(path)
+
+        with mock.patch("os.listdir", side_effect=listing), self.assertRaises(ReportError) as caught:
+            exists(self.root, "build/muster/report.xml")
+        message = "build/muster/report.xml: cannot read a folder on its path: Permission denied"
+        self.assertEqual(str(caught.exception), message)
+        with mock.patch("os.listdir", side_effect=listing):
+            self.assertFalse(exists(self.root, "build/gone/report.xml"))  # a missing folder is no error
+
+
+class StrictJsonTest(unittest.TestCase):
+    def test_every_number_is_finite(self):
+        self.assertEqual(strict_json('{"a": 1.5, "b": [2, -0.25e3]}'), {"a": 1.5, "b": [2, -250.0]})
+        for text in ('{"a": NaN}', "[Infinity]", "[-Infinity]", '{"x": {"y": 1e400}}', "[-1e400]"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                strict_json(text)
+
+    def test_one_copy_of_each_shared_helper(self):
+        self.assertIs(timing.strict_json, strict_json)
+        self.assertIs(policy.strict_json, strict_json)
+        self.assertIs(policy.SHA256, config.SHA256)
 
 
 class TimingTest(AdapterCase):

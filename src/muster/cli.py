@@ -9,11 +9,12 @@ and a bug included. When argparse fails, or a file name it read is empty (or '-'
 --json-out, --format and the summary file are read from argv the way argparse would have read them,
 and --repo and --config from the words before the command; otherwise the parsed values count. No
 output file (the envelope, the summary, the command's own outputs) may be the config file, an input
-of the command, a source or test file of the repository or another output: on such a clash nothing
-is removed or written. A profile that fails its check still names the inputs it can, as far as it
-parses; after a failed parse of argv only the config file and the default one of the repository
-are known. Once that holds, the outputs that must not outlive a failed run are removed before the
-command does anything else, and those removed when the run fails go on any exit 2 or 3.
+of the command (also one its options name), a file under a source or test folder, a protected file
+of the repository or another output: on such a clash nothing is removed or written. A profile that
+fails its check still names every file it can, as far as it parses; after a failed parse of argv
+only the config file and the default one of the repository are known. Once that holds, the outputs
+that must not outlive a failed run are removed before the command does anything else, and those
+removed when the run fails go on any exit 2 or 3.
 """
 
 from __future__ import annotations
@@ -72,17 +73,18 @@ class _Parser(argparse.ArgumentParser):
 # (label, path, removed before the command runs, removed when the run ends with exit 2 or 3)
 Outputs = list[tuple[str, Path, bool, bool]]
 Inputs = list[tuple[str, Path]]  # (label, path)
-Summary = tuple[str, Path, bool]  # (label, path, appended to)
+# (label, path, appended to, the name messages give it: as typed, or repository-relative from the profile)
+Summary = tuple[str, Path, bool, str]
 
 
 @dataclass(frozen=True)
 class Analysis:
     """An analysis command: `run` judges one section into the Report; `arguments` adds its own options.
-    Once the profile is read: `inputs` names the files of the profile, every one the profile names
-    by its path but the command's own outputs (also, best effort, from a profile that failed its
-    check), `protected` the other repository files no output may be, and
-    `outputs` its own output files with the error that keeps one from being named, raised once the
-    others are checked (none of the three may raise)."""
+    `option_inputs` names the input files of its options, checked before the profile is read. Once
+    the profile is read: `inputs` names the files of the profile, every one the profile names by its
+    path but the command's own outputs, `protected` the other repository files no output may be,
+    and `outputs` its own output files with the error that keeps one from being named, raised once
+    the others are checked (none of them may raise)."""
 
     run: Callable[[argparse.Namespace, Config, Report], None]
     help: str
@@ -90,12 +92,21 @@ class Analysis:
     inputs: Callable[[Config], Inputs] = lambda cfg: []
     outputs: Callable[[argparse.Namespace, Config], tuple[Outputs, FatalError | None]] = lambda args, cfg: ([], None)
     protected: Callable[[argparse.Namespace, Config], Inputs] = lambda args, cfg: []
+    option_inputs: Callable[[argparse.Namespace], Inputs] = lambda args: []
 
 
+# Every analysis command protects the same repository files (policy.protected).
 ANALYSES: dict[str, Analysis] = {
     "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.inputs, policy.outputs, policy.protected),
-    "coverage": Analysis(coverage.run, coverage.HELP, coverage.arguments, named_files, protected=coverage.protected),
-    "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=duration.protected),
+    "coverage": Analysis(
+        coverage.run,
+        coverage.HELP,
+        coverage.arguments,
+        named_files,
+        protected=policy.protected,
+        option_inputs=coverage.option_inputs,
+    ),
+    "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=policy.protected),
 }
 
 
@@ -273,8 +284,9 @@ class Invocation:
     fmt: str
     json_out: str | None = None
     summary: tuple[Path, bool] | None = None  # (path, appended to): where the failure line goes
+    summary_name: str = ""  # the summary as messages name it
     summary_written: bool = False
-    remove_on_failure: list[Path] = field(default_factory=list)
+    remove_on_failure: list[tuple[str, Path]] = field(default_factory=list)  # (label, path)
     commit: str | None = None
     base: dict | None = None  # {"ref", "commit"} once --base is parsed; the commit is None without a merge base
     sections: list[Report] = field(default_factory=list)
@@ -297,6 +309,26 @@ def _refuse_clashes(inv: Invocation, named: Inputs, inputs: Inputs, protected: d
             raise UsageError(f"{label} {clash}")
 
 
+def _real(path: Path) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config) -> None:
+    """Refuse an output under a folder of source.roots or source.tests, on every run alike: exit 2,
+    and nothing is removed or written. The paths are compared resolved (ignoring case on Windows),
+    so a link that leads into such a folder counts, and so does a path inside one whose last part is
+    a link."""
+    folders = [("source", folder) for folder in cfg.get("source.roots", [])]
+    folders += [("test", folder) for folder in cfg.get("source.tests", [])]
+    resolved = [(kind, folder, _real(cfg.root / folder)) for kind, folder in folders]
+    for label, path in named:
+        keys = (_real(path), os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name)))
+        for kind, folder, top in resolved:
+            if any(key == top or key.startswith(top.rstrip(os.sep) + os.sep) for key in keys):
+                inv.json_out, inv.summary, inv.remove_on_failure = None, None, []
+                raise UsageError(f"{label} is under the {kind} folder {folder}")
+
+
 def _named(json_out: str | None, summary: Summary | None) -> Inputs:
     named = [(f"--json-out {json_out}", Path(json_out))] if json_out else []
     return named + ([summary[:2]] if summary else [])
@@ -306,6 +338,7 @@ def _arm(inv: Invocation, json_out: str | None, summary: Summary | None) -> None
     """From now on the envelope and the failure line go to these files."""
     inv.json_out = json_out
     inv.summary = None if summary is None else (summary[1], summary[2])
+    inv.summary_name = "" if summary is None else summary[3]
 
 
 def _clear(inv: Invocation, json_out: str | None, summary: Summary | None, outputs: Outputs) -> None:
@@ -342,9 +375,11 @@ def _option_summary(args: argparse.Namespace) -> Summary | None:
     """The summary named on the command line: --summary-file, else $GITHUB_STEP_SUMMARY with --github."""
     summary_file = _file_option("--summary-file", getattr(args, "summary_file", None))
     if summary_file:
-        return f"--summary-file {summary_file}", Path(summary_file), True
+        return f"--summary-file {summary_file}", Path(summary_file), True, summary_file
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY") if getattr(args, "github", False) else None
-    return (f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True) if step_summary else None
+    if not step_summary:
+        return None
+    return f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True, step_summary
 
 
 def _arm_scanned(inv: Invocation) -> None:
@@ -358,10 +393,10 @@ def _arm_scanned(inv: Invocation) -> None:
     summary_file = _scan_option(words, "--summary-file")
     summary = None
     if summary_file:
-        summary = f"--summary-file {summary_file}", Path(summary_file), True
+        summary = f"--summary-file {summary_file}", Path(summary_file), True, summary_file
     elif summary_file is None and "--github" in words and os.environ.get("GITHUB_STEP_SUMMARY"):
         step_summary = os.environ["GITHUB_STEP_SUMMARY"]
-        summary = f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True
+        summary = f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True, step_summary
     named = _named(json_out, summary)
     if named:
         before = _global_words(words)
@@ -399,7 +434,7 @@ def _write_summary(inv: Invocation, rep: Report) -> None:
         text = _markdown_text("\n".join(rep.md).rstrip("\n") + "\n\n")
         write_markdown(target, text, append=append or inv.summary_written)
     except OSError as exc:
-        raise UsageError(f"cannot write the summary {target}: {exc.strerror or exc}") from None
+        raise UsageError(f"cannot write the summary {inv.summary_name}: {exc.strerror or exc}") from None
     inv.summary_written = True
 
 
@@ -419,30 +454,32 @@ def run_analysis(
 ) -> int:
     """Run an analysis command; _commits() has set args.repo_root."""
     root = args.repo_root
-    profile = [("the config file", config_path(root, args.config))]
-    _refuse_clashes(inv, _named(json_out, summary), profile)
+    given = [("the config file", config_path(root, args.config)), *analysis.option_inputs(args)]
+    _refuse_clashes(inv, _named(json_out, summary), given)
     _arm(inv, json_out, summary)
     try:
         cfg = load(root, args.config)
     except ConfigError:
         unchecked = load_unchecked(root, args.config)
-        if unchecked is not None:  # the files an invalid profile names are no output either
-            _refuse_clashes(inv, _named(json_out, summary), profile + analysis.inputs(unchecked))
+        if unchecked is not None:  # no command runs on it, so no file it names is an output
+            _refuse_clashes(inv, _named(json_out, summary), given + named_files(unchecked))
         raise
     if summary is None and cfg.output_dir is not None:
-        target = cfg.root / cfg.output_dir / f"{args.command}.md"
-        summary = f"the summary {target}", target, False
+        name = f"{cfg.output_dir}/{args.command}.md"
+        summary = f"the summary {name}", cfg.root / name, False, name
     named = _named(json_out, summary)
-    inputs = [("the config file", cfg.path), *analysis.inputs(cfg)]
-    _refuse_clashes(inv, named, inputs)  # before protected() reads the tree
+    inputs = [("the config file", cfg.path), *analysis.option_inputs(args), *analysis.inputs(cfg)]
+    _refuse_clashes(inv, named, inputs)
+    outputs, error = analysis.outputs(args, cfg)
+    every = named + [(label, path) for label, path, _, _ in outputs]
+    _refuse_under_folders(inv, every, cfg)  # before protected() reads the tree
     protected = _index(analysis.protected(args, cfg))
     _refuse_clashes(inv, named, inputs, protected)
     _arm(inv, json_out, summary)
-    outputs, error = analysis.outputs(args, cfg)
-    _refuse_clashes(inv, named + [(label, path) for label, path, _, _ in outputs], inputs, protected)
+    _refuse_clashes(inv, every, inputs, protected)
     if error is not None:  # only now: the outputs that could be named are checked, none is removed
         raise error
-    inv.remove_on_failure = [path for _, path, _, on_failure in outputs if on_failure]
+    inv.remove_on_failure = [(label, path) for label, path, _, on_failure in outputs if on_failure]
     _clear(inv, json_out, summary, outputs)
     strict = args.strict or (args.strict_only is not None and args.command in args.strict_only)
     rep = Report(args.command, strict=strict, fail_on_error=args.fail_on_error)
@@ -492,11 +529,11 @@ def _run(inv: Invocation) -> int:
 
 
 def _remove_failed_outputs(inv: Invocation) -> None:
-    for path in inv.remove_on_failure:
+    for label, path in inv.remove_on_failure:
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            print(f"muster: error: cannot remove {path}: {exc.strerror or exc}", file=sys.stderr)
+            print(f"muster: error: cannot remove {label}: {exc.strerror or exc}", file=sys.stderr)
 
 
 def _write_failure_line(inv: Invocation, line: str) -> None:
