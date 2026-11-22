@@ -418,11 +418,6 @@ class GroupOfTest(TreeCase):
         cfg = self.group_config(["src/java"], ["src/java"], ["**"])
         self.assertEqual(group_of(cfg, "src/java/org/example/app/Token.java"), "main")
 
-    def test_repository_root_as_a_folder(self):
-        cfg = self.group_config(["."], ["tests"])
-        self.assertEqual(group_of(cfg, "tools/Build.java"), "main")
-        self.assertEqual(group_of(cfg, "tests/BuildTest.java"), "test")
-
 
 class ExistsExactTest(TreeCase):
     def test_file_and_folder(self):

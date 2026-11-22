@@ -206,17 +206,45 @@ def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int
 
 def binary_counts_since(repo: Path, commit: str, path: str) -> tuple[int, int]:
     """(added, deleted) lines of the one file `path` that git takes as binary, from `commit` to the
-    work tree: the sums of the counts of the hunk headers of its patch with `--text` (a count that
-    a header leaves out is 1). `--numstat` shows `-` for such a file even with `--text`. `path` is
-    relative to `repo` and a literal pathspec."""
+    work tree: the `+` and the `-` lines of its patches with `--text`. `--numstat` shows `-` for
+    such a file even with `--text`. `path` is relative to `repo` and a literal pathspec.
+
+    Only a patch whose `--- a/` or `+++ b/` path is exactly `path` counts: the pathspec also takes
+    the files under a folder of that name, and a type change (a symbolic link replaced by a file)
+    gives two patches of the path, both counted. Inside a hunk the old/new line counts of its header
+    decide where it ends, as in parse_diff(): a `+++ x` or `--- x` there is a changed line, and a
+    context line, which GIT_DIFF_OPTS=--unified=N adds in spite of -U0, is not counted."""
     try:
         out = _literal_git(repo, *DIFF_ARGS, "--relative", commit, "--", path)
     except OSError as exc:
         raise ReportError(f"git diff could not run: {exc.strerror or exc}") from exc
     added = deleted = 0
+    ours = False
+    old_left = new_left = 0
     for line in records(out):
-        match = HUNK_RE.match(line)
-        if match:
-            deleted += 1 if match.group(2) is None else int(match.group(2))
-            added += 1 if match.group(4) is None else int(match.group(4))
+        if line.startswith("diff --git "):
+            ours = False
+            old_left = new_left = 0
+        if old_left > 0 or new_left > 0:
+            tag = line[:1]
+            if tag == "+":
+                added += ours
+                new_left -= 1
+            elif tag == "-":
+                deleted += ours
+                old_left -= 1
+            elif tag == " " or line == "":
+                old_left -= 1
+                new_left -= 1
+            # "\ No newline at end of file" changes no count
+            continue
+        if line.startswith(("--- ", "+++ ")):
+            name = unquote_git_path(line[4:].removesuffix("\t"))  # git adds a tab to a name with a space
+            side = "a/" if line.startswith("-") else "b/"
+            ours = ours or (name.startswith(side) and name[2:] == path)  # /dev/null is no path
+        elif line.startswith("@@"):
+            match = HUNK_RE.match(line)
+            if match:
+                old_left = 1 if match.group(2) is None else int(match.group(2))
+                new_left = 1 if match.group(4) is None else int(match.group(4))
     return added, deleted

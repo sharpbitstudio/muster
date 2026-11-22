@@ -646,6 +646,51 @@ class BinaryCountsSinceTest(ChangesRepoCase):
         with mock.patch.dict(os.environ, {"GIT_GLOB_PATHSPECS": "1"}):
             self.assertEqual(binary_counts_since(profile_root, base, GLOB_FOLDER_FILE), (1, 0))
 
+    def test_file_replaced_by_a_folder_of_the_same_name(self):
+        self.write(self.repo, TOKEN, "one\0\ntwo\n")
+        base = self.commit_all(self.repo, "base")
+        (self.repo / TOKEN).unlink()
+        self.write(self.repo, TOKEN + "/Inner.java", "a\0\nb\nc\n")
+        self.assertEqual(binary_counts_since(self.repo, base, TOKEN), (0, 2))  # Inner.java untracked
+        self.run_git(self.repo, "add", "-A")
+        self.assertEqual(binary_counts_since(self.repo, base, TOKEN), (0, 2))  # Inner.java tracked
+
+    def test_context_lines_from_the_environment_are_not_counted(self):
+        self.write(self.repo, ENGINE, "one\0\ntwo\nthree\nfour\nfive\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(self.repo, ENGINE, "one\0\ntwo\nedited\nfour\nfive\nsix\n")
+        self.assertEqual(binary_counts_since(self.repo, base, ENGINE), (2, 1))
+        with mock.patch.dict(os.environ, {"GIT_DIFF_OPTS": "--unified=3"}):
+            self.assertEqual(binary_counts_since(self.repo, base, ENGINE), (2, 1))
+
+    def test_changed_lines_that_look_like_file_headers(self):
+        self.write(self.repo, ENGINE, "one\0\n-- a/x\n++ b/x\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(self.repo, ENGINE, "one\0\n++ b/y\n-- a/y\n")
+        self.assertEqual(binary_counts_since(self.repo, base, ENGINE), (2, 2))
+
+    def test_path_with_a_space_or_non_ascii_characters(self):
+        for name in ("Key Parser.java", "Key" + chr(0x00E9) + "Parser.java"):
+            path = "src/main/java/org/example/app/codec/" + name
+            with self.subTest(name=name):
+                self.write(self.repo, path, "one\0\ntwo\n")
+                base = self.commit_all(self.repo, "base")
+                self.write(self.repo, path, "one\0\nedited\nthree\n")
+                self.assertEqual(binary_counts_since(self.repo, base, path), (2, 1))
+
+    def test_link_replaced_by_a_binary_file(self):
+        link = self.repo / TOKEN
+        link.parent.mkdir(parents=True)
+        try:
+            os.symlink("Session.java", link)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symbolic link here")
+        base = self.commit_all(self.repo, "base")
+        link.unlink()
+        link.write_bytes(b"one\0\ntwo\nthree\n")
+        # Two patches of the one path: the link's target deleted, the file's lines added.
+        self.assertEqual(binary_counts_since(self.repo, base, TOKEN), (3, 1))
+
 
 class GitNotRunnableTest(GitRepoCase):
     def test_os_error_becomes_report_error(self):

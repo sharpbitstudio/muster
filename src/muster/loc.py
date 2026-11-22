@@ -12,8 +12,9 @@ error; the section still reports what it counted. With --base the change split g
 added and deleted in each group since the merge base: git's numstat of the changed files, and every
 line of an untracked file. A path is grouped by its name, not by the files on disk, so a deleted file
 gives deleted lines and a rename across groups is a deletion and an addition; only a path of the LOC
-set with a language counts. A base without a merge base, or a git failure, leaves the split out with
-a note. The command never has a violation: --strict changes the exit only for an input error.
+set with a language counts, and an untracked one only when the walk of the set took it as a file. A
+base without a merge base, or a git failure, leaves the split out with a note. The command never has
+a violation: --strict changes the exit only for an input error.
 """
 
 from __future__ import annotations
@@ -75,29 +76,41 @@ def _raw_lines(cfg: Config, rel: str) -> int:
         raise ReportError(f"{rel}: cannot read: {exc.strerror or exc}") from None
 
 
-def _change_by_group(cfg: Config, langs: list[Language], commit: str) -> dict[str, list[int]]:
+def _change_by_group(
+    cfg: Config, langs: list[Language], commit: str, loc_files: set[str]
+) -> dict[str, list[int]]:
     """{group: [added, deleted]} raw lines from `commit` to the work tree under the source and the
-    test folders: git's numstat (the hunk headers of a file git takes as binary), plus every line of
-    an untracked file as added. A git failure, or an untracked file that cannot be read, raises
-    ReportError."""
+    test folders: git's numstat, plus every line of an untracked file of the LOC set (`loc_files`,
+    the files walked on disk) as added. A path git takes as binary in any of its numstat rows gets
+    all of its counts from its patch (binary_counts_since), once. A git failure, or an untracked
+    file of the set that cannot be read, raises ReportError."""
     folders = [*cfg.get("source.roots", []), *cfg.get("source.tests", [])]
     change = {group: [0, 0] for group in GROUPS}
-    for added, deleted, path in numstat_since(cfg.root, commit, folders):
+    rows = numstat_since(cfg.root, commit, folders)
+    # binary to git (a NUL byte, a -diff attribute): the patches of the path count, once, for all its rows
+    binary = {path for added, deleted, path in rows if added is None or deleted is None}
+    for added, deleted, path in rows:
         group = _group(cfg, langs, path)
-        if group is None:
+        if group is None or path in binary:
             continue
-        if added is None or deleted is None:  # binary to git: a NUL byte, a -diff attribute
-            added, deleted = binary_counts_since(cfg.root, commit, path)
         change[group][0] += added
         change[group][1] += deleted
-    for path in untracked_under(cfg.root, folders):
+    for path in sorted(binary):
         group = _group(cfg, langs, path)
+        if group is not None:
+            added, deleted = binary_counts_since(cfg.root, commit, path)
+            change[group][0] += added
+            change[group][1] += deleted
+    for path in untracked_under(cfg.root, folders):
+        group = _group(cfg, langs, path) if path in loc_files else None
         if group is not None:
             change[group][0] += _raw_lines(cfg, path)
     return change
 
 
-def _split(args: argparse.Namespace, cfg: Config, rep: Report, langs: list[Language]) -> dict | None:
+def _split(
+    args: argparse.Namespace, cfg: Config, rep: Report, langs: list[Language], loc_files: set[str]
+) -> dict | None:
     """The change split against --base into the Markdown; None, with a note, when there is no merge
     base or git fails. Neither is an input error."""
     commit = getattr(args, "base_commit", None)
@@ -105,7 +118,7 @@ def _split(args: argparse.Namespace, cfg: Config, rep: Report, langs: list[Langu
         rep.md += [f"No merge-base with {md_path(args.base)}: change split not computed.", ""]
         return None
     try:
-        change = _change_by_group(cfg, langs, commit)
+        change = _change_by_group(cfg, langs, commit, loc_files)
     except ReportError as exc:
         rep.md += [f"LOC change split not computed: {exc}", ""]
         return None
@@ -127,11 +140,13 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     groups = {name: {"files": 0, "loc": 0} for name in GROUPS}
     errors: list[str] = []
     uncounted: dict[str, int] = {}
+    example: dict[str, str] = {}  # the first file of each extension without a language, in path order
     for rel in files:
         lang = language_of(rel, langs)
         if lang is None:
             ext = _extension(rel)
             uncounted[ext] = uncounted.get(ext, 0) + 1
+            example.setdefault(ext, rel)
             continue
         try:
             count = count_file(cfg.root / rel, lang)
@@ -143,7 +158,9 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
         acc["loc"] += count
     uncounted = dict(sorted(uncounted.items()))
     for ext, count in uncounted.items():
-        errors.append(f"{ext}: {count} file(s) of the LOC set have no language and are not counted")
+        errors.append(
+            f"{ext}: {count} file(s) of the LOC set have no language and are not counted (e.g. {example[ext]})"
+        )
     rep.md = ["## Lines of code", "", "Lines of code (without blank and comment-only lines); a trend, not a gate.", ""]
     rep.md += ["| group | files | LOC |", "|---|---:|---:|"]
     for name, acc in groups.items():
@@ -158,7 +175,7 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
         rep.md += ["**ERROR**: some files of the LOC set are not counted:", ""]
         rep.md.extend(f"- {error}" for error in errors)
         rep.md.append("")
-    change = _split(args, cfg, rep, langs) if args.base is not None else None
+    change = _split(args, cfg, rep, langs, set(files)) if args.base is not None else None
     for error in errors:
         rep.errored("Lines of code", error)
     ratio_text = f", test/main {test_ratio:.2f}" if test_ratio is not None else ""
