@@ -149,8 +149,8 @@ def _read_diff_file(name: str) -> dict[str, set[int]]:
         raise FatalError(f"cannot read --diff-file {name}: {exc.strerror or exc}") from None
     try:
         return parse_diff(raw.decode("utf-8", "replace"), "")
-    except ValueError:  # a line number of more digits than int() converts
-        raise FatalError(f"cannot read --diff-file {name}: a hunk header has a line number too long") from None
+    except ValueError:  # such as a line number of more digits than int() converts
+        raise FatalError(f"cannot read --diff-file {name}: not a readable unified diff") from None
 
 
 def _read_snapshot(cfg: Config, problems: list[str], errors: list[str]) -> dict | None:
@@ -453,8 +453,11 @@ def _delta(
             changed = parse_diff(diff_since(cfg.root, base_commit, roots), "")
             untracked = [rel for rel in untracked_under(cfg.root, roots) if rel in zones]
             summary = "delta not evaluated (cannot read a changed file)"
-            for rel in untracked:
-                changed[rel] = set(range(1, _line_count(cfg.root, rel) + 1))
+            for rel in untracked:  # a standard or an exempt file needs only its path
+                if zones[rel] == "standard" or rel in checked.classification.exempt_until:
+                    changed.setdefault(rel, set())
+                else:
+                    changed[rel] = set(range(1, _line_count(cfg.root, rel) + 1))
         except ReportError as exc:
             rep.annotate("warning", "Critical delta coverage", f"delta not evaluated: {exc}")
             rep.md.append(f"**Critical delta:** delta not evaluated: {exc}")

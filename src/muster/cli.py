@@ -35,6 +35,7 @@ from muster.config import (
     Config,
     ConfigError,
     config_path,
+    listed_folders,
     load,
     load_unchecked,
     named_files,
@@ -317,9 +318,9 @@ def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config) -> None:
     """Refuse an output under a folder of source.roots or source.tests, on every run alike: exit 2,
     and nothing is removed or written. The paths are compared resolved (ignoring case on Windows),
     so a link that leads into such a folder counts, and so does a path inside one whose last part is
-    a link."""
-    folders = [("source", folder) for folder in cfg.get("source.roots", [])]
-    folders += [("test", folder) for folder in cfg.get("source.tests", [])]
+    a link. On a profile that failed its check only the entries that listed_folders() keeps count."""
+    folders = [("source", folder) for folder in listed_folders(cfg, "source.roots")]
+    folders += [("test", folder) for folder in listed_folders(cfg, "source.tests")]
     resolved = [(kind, folder, _real(cfg.root / folder)) for kind, folder in folders]
     for label, path in named:
         keys = (_real(path), os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name)))
@@ -463,6 +464,7 @@ def run_analysis(
         unchecked = load_unchecked(root, args.config)
         if unchecked is not None:  # no command runs on it, so no file it names is an output
             _refuse_clashes(inv, _named(json_out, summary), given + named_files(unchecked))
+            _refuse_under_folders(inv, _named(json_out, summary), unchecked)
         raise
     if summary is None and cfg.output_dir is not None:
         name = f"{cfg.output_dir}/{args.command}.md"

@@ -803,6 +803,12 @@ class OutputClashTest(PolicyCase):
         self.assertEqual(self.policy("--snapshot", str(self.snapshot))[0], 0)
         self.assertTrue(self.snapshot.exists())
 
+    def test_snapshot_file_is_named_as_typed(self):
+        code, _, err = self.policy("--snapshot", "./snap.json", "--json-out", "snap.json")
+        self.assertEqual(code, 2)
+        self.assertIn("the snapshot ./snap.json is the same file as --json-out snap.json", err)
+        self.assertFalse((self.work / "snap.json").exists())
+
     def test_outputs_are_checked_when_the_snapshot_cannot_be_named(self):
         self.write("muster.toml", PROFILE.replace('[policy]\nsnapshot = "build/muster/snapshot.json"\n', ""))
         same = self.work / "same.txt"

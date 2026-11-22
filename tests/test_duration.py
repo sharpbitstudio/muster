@@ -274,6 +274,12 @@ class VerdictTest(DurationCase):
         self.timed_run(20, outcome=None)
         self.not_measured("NOT MEASURED (task None)")
 
+    def test_outcome_over_several_lines_stays_on_one_line(self):
+        self.timed_run(20, outcome="up-to-date" + chr(10) + "  from cache")
+        run = self.not_measured("NOT MEASURED (task up-to-date from cache)")
+        self.assertIn("`:app:test` task did not run (up-to-date from cache) - not measured.", run.summary)
+        self.assertEqual(run.section["verdict_text"], "duration: NOT MEASURED (task up-to-date from cache)")
+
     def test_missing_record_is_not_measured(self):
         self.suites((SUITE, 1000, 2.0))
         run = self.not_measured("NOT MEASURED (no task timing)")
@@ -470,7 +476,7 @@ class ThresholdTest(DurationCase):
             ("warn_s = 400\n", "duration.error_s: 300 (the default) is below duration.warn_s 400"),
         ):
             self.write("muster.toml", PROFILE + table)
-            for command in ("duration", "policy"):
+            for command in ("coverage", "duration", "policy"):
                 with self.subTest(table=table, command=command):
                     code, env = self.json_main(command)
                     expected = {"kind": "config", "message": f"muster.toml: {message}"}
@@ -518,6 +524,8 @@ class BrokenInputTest(DurationCase):
         "bad time": ('time="2.0">', 'time="2.0s">'),
         "negative time": ('time="2.0">', 'time="-1">'),
         "bad timestamp": ('timestamp="', 'timestamp="T'),
+        # The suite ends at 23:00:02 of its own day, which is past the last date in UTC.
+        "an offset past the last date": ('timestamp="', 'timestamp="9999-12-31T23:00:00-02:00" was="'),
         "not XML": ("</testsuite>", ""),
     }
     JACOCO = {

@@ -78,8 +78,8 @@ def _file_suites(root: Path, file: str) -> list[Suite]:
         if stamp is None:
             continue
         name = element.get("name", "")
-        try:
-            start = parse_timestamp(stamp)
+        try:  # in UTC, so that an end past the last date is caught below and no later step overflows
+            start = parse_timestamp(stamp).astimezone(dt.timezone.utc)
         except (ValueError, OverflowError):
             raise ReportError(f"{file}: suite {name!r} has a bad timestamp {stamp!r}") from None
         suite = Suite(name, file, start, _seconds(element.get("time"), file, name))
