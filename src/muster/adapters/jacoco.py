@@ -10,21 +10,15 @@ session that ends before it starts is an input error.
 
 from __future__ import annotations
 
-import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from muster.adapters import SourceResolver, label, read_xml
+from muster.adapters import LONG_MIN, SourceResolver, label, long_number, read_xml
 from muster.config import ConfigError
 from muster.report import ReportError
 
-_COUNT_RE = re.compile(r"[0-9]+")
-_EPOCH_RE = re.compile(r"-?[0-9]+")
 _LINE_ATTRIBUTES = ("mi", "ci", "mb", "cb")
-# The range of a Java long, which JaCoCo writes: counts from 0, session times in epoch ms.
-LONG_MIN, LONG_MAX = -(2**63), 2**63 - 1
-_LONG_DIGITS = len(str(LONG_MAX))
 
 
 @dataclass(frozen=True)
@@ -44,27 +38,23 @@ class CoverageReport:
     sourcefiles: int  # number of <sourcefile> elements in the report
 
 
-def _attribute(element: ET.Element, key: str, pattern: re.Pattern[str], what: str, low: int, name: str) -> int:
-    """An integer attribute from `low` to LONG_MAX; it is converted only once it is known to fit, as
-    int() refuses a string of more than 4300 digits."""
+def _attribute(element: ET.Element, key: str, low: int, name: str) -> int:
+    """An integer attribute from `low` to LONG_MAX, by the rule of long_number()."""
     value = element.get(key)
     if value is None:
         raise ReportError(f"{name}: <{element.tag}> has no attribute {key}")
-    if not pattern.fullmatch(value):
-        raise ReportError(f"{name}: <{element.tag}> attribute {key} must be {what}, got {value!r}")
-    digits = value.lstrip("-").lstrip("0") or "0"
-    number = None if len(digits) > _LONG_DIGITS else -int(digits) if value.startswith("-") else int(digits)
-    if number is None or not low <= number <= LONG_MAX:
-        raise ReportError(f"{name}: <{element.tag}> attribute {key} must be from {low} to {LONG_MAX}")
-    return number
+    try:
+        return long_number(value, low)
+    except ValueError as exc:
+        raise ReportError(f"{name}: <{element.tag}> attribute {key} {exc}") from None
 
 
 def _count(element: ET.Element, key: str, name: str) -> int:
-    return _attribute(element, key, _COUNT_RE, "a non-negative integer", 0, name)
+    return _attribute(element, key, 0, name)
 
 
 def _epoch(element: ET.Element, key: str, name: str) -> int:
-    return _attribute(element, key, _EPOCH_RE, "an integer", LONG_MIN, name)
+    return _attribute(element, key, LONG_MIN, name)
 
 
 def _report(path: Path, name: str | None) -> tuple[ET.Element, str]:

@@ -12,11 +12,19 @@ from __future__ import annotations
 import json
 import math
 import posixpath
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from muster.paths import exists_exact, normalize, present_exact, walk
 from muster.report import ReportError
+
+# The range of a Java long, which JaCoCo and PIT write: counts and line numbers from 0, session
+# times in epoch ms.
+LONG_MIN, LONG_MAX = -(2**63), 2**63 - 1
+_LONG_DIGITS = len(str(LONG_MAX))
+_UNSIGNED_RE = re.compile(r"[0-9]+")
+_SIGNED_RE = re.compile(r"-?[0-9]+")
 
 
 def label(path: Path) -> str:
@@ -50,6 +58,21 @@ def read_xml(path: Path, name: str) -> ET.Element:
         return ET.fromstring(data)
     except (ET.ParseError, LookupError, RecursionError, ValueError) as exc:
         raise ReportError(f"{name}: not well-formed XML: {exc}") from None
+
+
+def long_number(text: str, low: int) -> int:
+    """The integer in `text`, from `low` to LONG_MAX: ASCII digits, with a leading minus only when
+    `low` is negative. Any other text, and a number out of that range, is a ValueError whose
+    message says what the text must be. The text is converted only once it is known to fit, as
+    int() refuses a string of more than 4300 digits."""
+    signed = low < 0
+    if not (_SIGNED_RE if signed else _UNSIGNED_RE).fullmatch(text):
+        raise ValueError(f"must be {'an integer' if signed else 'a non-negative integer'}, got {text!r}")
+    digits = text.lstrip("-").lstrip("0") or "0"
+    number = None if len(digits) > _LONG_DIGITS else -int(digits) if text.startswith("-") else int(digits)
+    if number is None or not low <= number <= LONG_MAX:
+        raise ValueError(f"must be from {low} to {LONG_MAX}")
+    return number
 
 
 def _not_a_number(text: str):
