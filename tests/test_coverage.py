@@ -31,6 +31,7 @@ from muster.config import (
     DEFAULT_FLOOR_BRANCH,
     DEFAULT_FLOOR_LINE,
     Config,
+    listed_folders,
 )
 from muster.report import ReportError
 
@@ -385,7 +386,7 @@ class ArgumentTest(CoverageCase):
         diff = f"--- a/{ENGINE}\n+++ b/{ENGINE}\n@@ -1 +{'9' * 4301} @@\n+    int one;\n"
         (self.work / "change.diff").write_bytes(diff.encode("ascii"))
         code, env = self.json_main("coverage", "--diff-file", "change.diff")
-        message = "cannot read --diff-file change.diff: a hunk header has a line number too long"
+        message = "cannot read --diff-file change.diff: not a readable unified diff"
         self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
 
     def test_hidden_options_are_not_in_the_help(self):
@@ -674,6 +675,13 @@ class FloorTest(CoverageCase):
         self.assertEqual(run.data["standard"], {"files": 2, "line": [0, 110], "branch": [0, 200]})
         self.assertTrue(run.summary.startswith("## Coverage\n\n**Global floor** (80% line / 65% branch): line"))
 
+    def test_report_with_the_doctype_jacoco_writes(self):
+        self.measure()
+        doctype = '<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">'
+        self.replace(REPORT, "\n<report", f"\n{doctype}\n<report")
+        self.assertFalse((self.repo / "build/jacoco/report.dtd").exists())
+        self.assertEqual(self.passed().data["global"]["files"], 4)
+
     def test_zones_sort_by_number(self):
         self.write("policy/critical.txt", "# Zone 2: money.\nbilling/**\n# Zone 10: access.\nauth/**\n")
         self.measure()
@@ -894,6 +902,29 @@ class DeltaGateTest(CoverageCase):
         self.assertEqual((run.data["delta"]["standard_files"], run.data["delta"]["files"]), (1, []))
         self.assertEqual(run.annotations, [])
         self.assertIn("1 changed standard file(s): outside the delta gate.", run.summary)
+
+    def test_untracked_standard_or_exempt_file_is_not_read(self):
+        exemption = "billing/internal/ledger/Journal.java | generated | 2026-05-30\n"
+        for path, zone in ((ROUTER, "standard"), (JOURNAL, "exempt")):
+            with self.subTest(zone=zone):
+                self.write(path, source_text(3))
+                self.write("policy/exemptions.txt", EXEMPTIONS + (exemption if zone == "exempt" else ""))
+                self.measure()
+                denied = PermissionError(13, "Permission denied")
+                with mock.patch("muster.coverage.count_file_lines", side_effect=denied):
+                    run = self.passed("--base", "main", "--strict")
+                delta = run.data["delta"]
+                self.assertEqual((delta["untracked"], delta["files"]), ([path], []))
+                self.assertEqual(delta["standard_files"], 1 if zone == "standard" else 0)
+                (self.repo / path).unlink()
+
+    def test_inherited_literal_pathspecs_keep_the_delta(self):
+        self.edit(ENGINE, {3: "    int three;"})
+        self.measure({ENGINE: {**lines_of(*range(1, 11)), 3: MISSED}})
+        os.environ["GIT_LITERAL_PATHSPECS"] = "1"  # as a git hook started with --literal-pathspecs passes on
+        run = self.coverage("--base", "main", "--strict")
+        self.assertEqual((run.code, run.section["verdict"], run.section["violation"]), (1, "fail", True))
+        self.assertEqual([item["path"] for item in run.data["delta"]["files"]], [ENGINE])
 
     def test_base_without_changes(self):
         self.measure()
@@ -1256,6 +1287,33 @@ class ProtectedFileTest(CoverageCase):
                     else:
                         self.assertEqual(file.read_bytes(), b"left\n")
             file.unlink()
+
+    def test_output_under_a_source_folder_of_a_profile_that_fails_its_check(self):
+        broken_roots = 'roots = ["src/main/java", "", "../up", 7]'
+        for case, profile in (
+            ("unknown key", PROFILE + "\n[output]\nbogus = 1\n"),
+            ("error_s below the default warn_s", PROFILE + "\n[duration]\nerror_s = 200\n"),
+            ("invalid root entries", PROFILE.replace('roots = ["src/main/java"]', broken_roots)),
+        ):
+            self.write("muster.toml", profile)
+            for target, kind, folder in ((ENGINE, "source", "src/main/java"), (PARSER_TEST, "test", "src/test/java")):
+                for option in ("--json-out", "--summary-file"):
+                    with self.subTest(case=case, file=target, option=option):
+                        file = self.repo / target
+                        before = file.read_bytes()
+                        code, env = self.json_main("coverage", option, str(file))
+                        message = f"{option} {file} is under the {kind} folder {folder}"
+                        self.assertEqual((code, env["error"]), (2, {"kind": "usage", "message": message}))
+                        self.assertEqual(file.read_bytes(), before)
+
+    def test_folders_never_raise_on_an_unchecked_profile(self):
+        roots = ["src/main/java", "", "../up", "/work/src", "back\\slash", "nul" + chr(0), 7, None, ["src"]]
+        data = {"source": {"roots": roots, "tests": "src/test/java"}}
+        unchecked = Config(self.repo, self.repo / "muster.toml", data)
+        self.assertEqual(listed_folders(unchecked, "source.roots"), ["src/main/java"])
+        self.assertEqual(listed_folders(unchecked, "source.tests"), [])
+        not_a_table = Config(self.repo, self.repo / "muster.toml", {"source": 7})
+        self.assertEqual(listed_folders(not_a_table, "source.roots"), [])
 
     def test_default_summary_is_named_by_its_repository_path(self):
         profile = PROFILE.replace('report = "build/jacoco/report.xml"', 'report = "build/coverage.md"')

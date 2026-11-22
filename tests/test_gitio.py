@@ -495,6 +495,41 @@ class UntrackedUnderTest(ChangesRepoCase):
         self.assertEqual(untracked_under(self.profile_root, [GLOB_FOLDER]), [GLOB_FOLDER_FILE])
 
 
+class PathspecVariableTest(ChangesRepoCase):
+    """A pathspec variable in the environment (a git hook started with --literal-pathspecs passes
+    one on) changes neither helper: the folders still match literally."""
+
+    VARIABLES = ("GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+        for path in (ENGINE, GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "one\n")
+        self.base = self.commit_all(self.repo, "base")
+        for path in (ENGINE, GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "edited\n")
+        self.write(self.repo, TOKEN, "one\n")
+        self.write(self.repo, GLOB_FOLDER + "/Session.java", "one\n")
+        self.write(self.repo, "src/main/java/org/example/app/ac/Session.java", "one\n")
+
+    def test_change_under_a_root_is_seen(self):
+        for variable in self.VARIABLES:
+            with self.subTest(variable=variable), mock.patch.dict(os.environ, {variable: "1"}):
+                changed = parse_diff(diff_since(self.repo, self.base, ["src/main/java"]), "")
+                self.assertIn(ENGINE, changed)
+                found = untracked_under(self.repo, ["src/main/java"])
+                self.assertIn(TOKEN, found)
+
+    def test_glob_characters_in_folder_still_match_literally(self):
+        for variable in self.VARIABLES:
+            with self.subTest(variable=variable), mock.patch.dict(os.environ, {variable: "1"}):
+                changed = parse_diff(diff_since(self.repo, self.base, [GLOB_FOLDER]), "")
+                self.assertEqual(changed, {GLOB_FOLDER_FILE: {1}})
+                found = untracked_under(self.repo, [GLOB_FOLDER])
+                self.assertEqual(found, [GLOB_FOLDER + "/Session.java"])
+
+
 class GitNotRunnableTest(GitRepoCase):
     def test_os_error_becomes_report_error(self):
         calls = {

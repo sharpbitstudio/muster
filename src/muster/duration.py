@@ -173,8 +173,9 @@ def _task_json(
         verdict = f"INCOMPLETE RUN (task failed: {failure})"
         rep.md.append(f"{who} task failed or timed out - incomplete run, no verdict. Failure: {failure}")
     elif record.outcome != "success":
-        verdict = f"NOT MEASURED (task {record.outcome})"
-        rep.md.append(f"{who} task did not run ({record.outcome}) - not measured.")
+        outcome = one_line(str(record.outcome))  # a record without outcome reads "None"
+        verdict = f"NOT MEASURED (task {outcome})"
+        rep.md.append(f"{who} task did not run ({outcome}) - not measured.")
     elif reason := _stale(record, suites, sessions):
         verdict = f"NO CURRENT TIMING ({reason})"
         rep.md.append(f"{who} task timing is stale ({reason}) - no current timing, no verdict.")

@@ -4,6 +4,7 @@ file."""
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -11,8 +12,8 @@ from pathlib import Path
 from muster.report import ReportError
 
 
-def git(repo: Path, *args: str, check: bool = True) -> str:
-    proc = subprocess.run(["git", *args], cwd=repo, capture_output=True)
+def git(repo: Path, *args: str, check: bool = True, env: dict[str, str] | None = None) -> str:
+    proc = subprocess.run(["git", *args], cwd=repo, capture_output=True, env=env)
     if check and proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise ReportError(f"git {' '.join(args[:3])} failed: {err[-1] if err else proc.returncode}")
@@ -149,13 +150,24 @@ def ref_problem(ref: str) -> str | None:
     return None
 
 
+# The pathspec variables beside GIT_LITERAL_PATHSPECS, which --literal-pathspecs sets: git refuses
+# the glob and the icase one together with it, and the noglob one is redundant.
+_PATHSPEC_VARIABLES = ("GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+
+
+def _literal_git(repo: Path, *args: str) -> str:
+    """git with every pathspec literal, whatever pathspec variables the environment carries: the
+    option --literal-pathspecs, and the other pathspec variables left out of git's environment."""
+    env = {key: value for key, value in os.environ.items() if key not in _PATHSPEC_VARIABLES}
+    return git(repo, "--literal-pathspecs", *args, env=env)
+
+
 def diff_since(repo: Path, commit: str, folders: list[str]) -> str:
     """The diff from `commit` to the work tree under `folders`, run in `repo`. `repo` may be a
     subfolder of the work tree: `--relative` makes the paths start at `repo`, as the folders do.
     Every folder is a literal pathspec, so glob characters in its name match only themselves."""
-    pathspecs = [":(literal)" + folder for folder in folders]
     try:
-        return git(repo, *DIFF_ARGS, "--relative", commit, "--", *pathspecs)
+        return _literal_git(repo, *DIFF_ARGS, "--relative", commit, "--", *folders)
     except OSError as exc:
         raise ReportError(f"git diff could not run: {exc.strerror or exc}") from exc
 
@@ -163,10 +175,10 @@ def diff_since(repo: Path, commit: str, folders: list[str]) -> str:
 def untracked_under(repo: Path, folders: list[str]) -> list[str]:
     """The untracked files under `folders` that no ignore rule covers, relative to `repo`, sorted.
     Every folder is a literal pathspec."""
-    found: set[str] = set()
     try:
-        for folder in folders:
-            found.update(untracked_files(repo, ":(literal)" + folder))
+        out = _literal_git(
+            repo, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z", "--", *folders
+        )
     except OSError as exc:
         raise ReportError(f"git ls-files could not run: {exc.strerror or exc}") from exc
-    return sorted(found)
+    return sorted({path for path in out.split("\0") if path})

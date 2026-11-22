@@ -89,13 +89,18 @@ def _unsafe(text: str) -> bool:
     return "\\" in text or "\0" in text or text.startswith("/")
 
 
-def _report_name(package: ET.Element, sourcefile: ET.Element, name: str) -> str:
-    """`package/file`, or the file alone in the default package, after each part is checked."""
+def _package_name(package: ET.Element, name: str) -> str:
+    """The checked name of a package; an empty name is the default package."""
     folder = package.get("name")
     if folder is None:
         raise ReportError(f"{name}: <package> has no attribute name")
     if _unsafe(folder) or (folder and any(seg in ("", ".", "..") for seg in folder.split("/"))):
         raise ReportError(f"{name}: bad package name {folder!r}")
+    return folder
+
+
+def _report_name(folder: str, sourcefile: ET.Element, name: str) -> str:
+    """`package/file`, or the file alone in the default package, after the file name is checked."""
     file = sourcefile.get("name")
     if file is None:
         raise ReportError(f"{name}: <sourcefile> in package {folder!r} has no attribute name")
@@ -112,6 +117,8 @@ def _coverage(sourcefile: ET.Element, report_name: str, name: str) -> FileCovera
         kind = counter.get("type")
         if kind is None:
             raise ReportError(f"{name}: {report_name} has a <counter> without attribute type")
+        if not kind:
+            raise ReportError(f"{name}: {report_name} has a <counter> with an empty type")
         if kind in counters:
             raise ReportError(f"{name}: {report_name} has two counters of type {kind!r}")
         counters[kind] = (_count(counter, "missed", name), _count(counter, "covered", name))
@@ -127,14 +134,16 @@ def _coverage(sourcefile: ET.Element, report_name: str, name: str) -> FileCovera
 
 def _check_counters(root: ET.Element, name: str) -> None:
     """Every <counter> of the document, at any level (the report, a group, a package, a class, a
-    method), has a type, no type twice in one element, and valid counts; only those of the source
-    files are kept."""
+    method), has a type that is not empty, no type twice in one element, and valid counts; only
+    those of the source files are kept."""
     for element in root.iter():
         kinds: set[str] = set()
         for counter in element.findall("counter"):
             kind = counter.get("type")
             if kind is None:
                 raise ReportError(f"{name}: <{element.tag}> has a <counter> without attribute type")
+            if not kind:
+                raise ReportError(f"{name}: <{element.tag}> has a <counter> with an empty type")
             if kind in kinds:
                 raise ReportError(f"{name}: <{element.tag}> has two counters of type {kind!r}")
             kinds.add(kind)
@@ -151,8 +160,9 @@ def _read(path: Path, name: str | None) -> tuple[list[tuple[int, int]], list[tup
     entries: list[tuple[str, FileCoverage]] = []
     seen: set[str] = set()
     for package in root.iter("package"):
+        folder = _package_name(package, name)  # also for a package without source files
         for sourcefile in package.findall("sourcefile"):
-            report_name = _report_name(package, sourcefile, name)
+            report_name = _report_name(folder, sourcefile, name)
             if report_name in seen:
                 raise ReportError(f"{name}: source file {report_name} occurs twice")
             seen.add(report_name)

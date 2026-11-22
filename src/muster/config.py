@@ -508,6 +508,15 @@ def named_files(cfg: Config, *, leave_out: tuple[str, ...] = ()) -> list[tuple[s
     return [(label, cfg.root / value) for label, value in usable]
 
 
+def listed_folders(cfg: Config, key: str) -> list[str]:
+    """The entries of the folder list `key` (source.roots, source.tests): on a checked profile all
+    of them. It never raises, not even on a profile that failed its check, where it leaves out a
+    value that is not a list and every entry that is not a canonical repository-relative path."""
+    value = cfg.get(key)
+    entries = value if isinstance(value, list) else []
+    return [entry for entry in entries if isinstance(entry, str) and _path_problem(entry) is None]
+
+
 def require(cfg: Config, *keys: str) -> None:
     """Raises ConfigError naming the first of the dotted keys that the profile does not set."""
     for key in keys:

@@ -157,6 +157,15 @@ class JacocoLoadTest(AdapterCase):
         self.assertEqual(report.files[f"{MAIN}/{TOKEN}"], jacoco.FileCoverage({1: (1, 0, 0, 0)}, (0, 0), (0, 0)))
         self.assertEqual(report.files[f"{MAIN}/Launcher.java"], jacoco.FileCoverage({}, (0, 2), (0, 0)))
 
+    def test_report_with_the_doctype_jacoco_writes(self):
+        doctype = '<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">'
+        token = sourcefile("Token.java", '<line nr="1" mi="0" ci="2" mb="0" cb="0"/>')
+        xml = jacoco_xml(package("org/example/app/auth", token)).replace("\n<report", "\n" + doctype + "\n<report", 1)
+        self.assertIn(doctype, xml)
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("the DTD is fetched")):
+            report = self.load(xml)  # report.dtd is not there and is not looked for
+        self.assertEqual(report.files[f"{MAIN}/{TOKEN}"].lines, {1: (0, 2, 0, 0)})
+
     def test_counters_are_kept_as_given(self):
         # The LINE counter says 5 missed, 9 covered; the single <line> says otherwise. Both are kept.
         token = sourcefile(
@@ -277,6 +286,19 @@ class JacocoBrokenTest(AdapterCase):
             "session dump of 4301 digits": jacoco_xml("", '<sessioninfo start="0" dump="' + "9" * 4301 + '"/>'),
             "session dump before start": jacoco_xml("", '<sessioninfo start="7000" dump="-1000"/>'),
             "package name missing": jacoco_xml(f"<package>{sourcefile('Token.java')}</package>"),
+            "package name missing without source files": jacoco_xml(
+                package("org/example/app/auth", sourcefile("Token.java")) + "<package/>"
+            ),
+            "package name missing with only classes": jacoco_xml(
+                '<package><class name="org/example/app/auth/Token"/></package>'
+            ),
+            "counter with an empty type": token('<counter type="" missed="0" covered="1"/>'),
+            "report counter with an empty type": jacoco_xml(
+                package("org/example/app/auth", sourcefile("Token.java")) + '<counter type="" missed="0" covered="1"/>'
+            ),
+            "package counter with an empty type": jacoco_xml(
+                package("org/example/app/auth", sourcefile("Token.java"), '<counter type="" missed="0" covered="1"/>')
+            ),
             "package empty segment": named("org//example/app/auth"),
             "package dot segment": named("org/./example/app/auth"),
             "package dotdot segment": named("org/../example/app/auth"),
@@ -510,6 +532,13 @@ class JunitSuitesTest(AdapterCase):
             "not XML": "<testsuite",
             "bad timestamp": suite_xml("org.example.app.auth.TokenTest", "10.11.2026"),
             "timestamp out of range": suite_xml("org.example.app.auth.TokenTest", "2026-13-10T08:00:00"),
+            "offset past the last date": suite_xml("org.example.app.auth.TokenTest", "9999-12-31T23:59:59-02:00", "0"),
+            "offset before the first date": suite_xml(
+                "org.example.app.auth.TokenTest", "0001-01-01T00:00:00+02:00", "0"
+            ),
+            "end past the last date in UTC": suite_xml(
+                "org.example.app.auth.TokenTest", "9999-12-31T21:00:00-02:00", "7200"
+            ),
             "time nan": timed("nan"),
             "time inf": timed("inf"),
             "time -1": timed("-1"),

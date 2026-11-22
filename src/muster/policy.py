@@ -66,7 +66,7 @@ def snapshot_path(args: argparse.Namespace, cfg: Config) -> Path | None:
 def snapshot_name(args: argparse.Namespace, cfg: Config) -> str:
     """The snapshot to write as messages name it: FILE as typed, else policy.snapshot as the profile
     names it (repository-relative)."""
-    return cfg.snapshot if args.snapshot is _FROM_CONFIG else str(Path(args.snapshot))
+    return cfg.snapshot if args.snapshot is _FROM_CONFIG else args.snapshot
 
 
 def _policy_files(cfg: Config) -> list[tuple[str, str]]:
