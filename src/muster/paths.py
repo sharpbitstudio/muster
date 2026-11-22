@@ -2,7 +2,9 @@
 
 The classification set is every file under [source].roots that matches an include glob and neither
 an exclude nor a generated glob; the test set is every file under [source].tests that matches an
-include glob and no generated glob. Both are found by walking the folders, so a comparison is
+include glob and no generated glob. The LOC set is every file under [source].roots and
+[source].tests that matches an include glob and neither a generated nor a [loc].exclude glob;
+[source].exclude does not apply to it. The sets are found by walking the folders, so a comparison is
 case-sensitive on every system, and a configured file or folder exists only when every part of its
 path has exactly that name on disk.
 """
@@ -183,3 +185,51 @@ def root_of(path: str, roots: list[str]) -> str | None:
     """The folder of `roots` that holds `path`; the deepest one when roots nest."""
     holding = [root for root in map(normalize, roots) if not root or path.startswith(root + "/")]
     return max(holding, key=len, default=None)
+
+
+@dataclass(frozen=True)
+class LocSet:
+    files: list[str]  # the LOC set, sorted
+    walked: list[str]  # every file under [source].roots and [source].tests, sorted
+    error: ConfigError | None = None  # the first folder that was missing or unreadable
+
+
+def _counted(cfg: Config, path: str) -> bool:
+    """Whether a file under [source].roots or [source].tests is in the LOC set by the globs."""
+    return (
+        matches_any(cfg.get("source.include", []), path)
+        and not matches_any(cfg.get("source.generated", []), path)
+        and not matches_any(cfg.loc_exclude, path)
+    )
+
+
+def loc_set(cfg: Config, *, defer: bool = False) -> LocSet:
+    """The LOC set of the profile and every file walked for it, before any glob. A missing or
+    unreadable folder raises its ConfigError, or with `defer` is kept in `error` while the other
+    folders are still walked."""
+    errors: list[ConfigError] | None = [] if defer else None
+    walked_roots = walk(cfg.root, "source.roots", cfg.get("source.roots", []), errors)
+    walked_tests = walk(cfg.root, "source.tests", cfg.get("source.tests", []), errors)
+    walked = sorted({*walked_roots, *walked_tests})
+    return LocSet([path for path in walked if _counted(cfg, path)], walked, errors[0] if errors else None)
+
+
+def in_loc_set(cfg: Config, path: str) -> bool:
+    """Whether the repository-relative `path` belongs to the LOC set by its name alone: under a
+    folder of [source].roots or [source].tests, and kept by the globs. The file need not exist, so
+    a file that a change deleted is judged as well."""
+    folders = [*cfg.get("source.roots", []), *cfg.get("source.tests", [])]
+    return root_of(path, folders) is not None and _counted(cfg, path)
+
+
+def group_of(cfg: Config, path: str) -> str | None:
+    """The group of the repository-relative `path` for `loc`, by the deepest folder of
+    [source].roots and [source].tests that holds it: "main" under a folder of roots; under a folder
+    of tests "test-support" when a [loc].test_support glob matches the path, else "test"; None
+    outside every folder. A folder listed in both lists counts as one of roots, so test_support
+    applies only below a folder that is no more than a tests folder."""
+    root = root_of(path, cfg.get("source.roots", []))
+    tests = root_of(path, cfg.get("source.tests", []))
+    if tests is None or (root is not None and len(root) >= len(tests)):
+        return None if root is None else "main"
+    return "test-support" if matches_any(cfg.loc_test_support, path) else "test"

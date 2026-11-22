@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from muster.globs import alternatives
+from muster.lang import BUILT_IN, Language, languages
 from muster.report import FatalError
 
 SCHEMA_VERSION = 1
@@ -380,10 +381,66 @@ def _check_duration(data: dict) -> None:
         )
 
 
+def _extension_problem(value: str) -> str | None:
+    return (
+        "must start with ." if not value.startswith(".")
+        else "must not contain / or \\" if "/" in value or "\\" in value
+        else "must have a character after the ." if value == "."
+        else None
+    )  # fmt: skip
+
+
+def _check_languages(data: dict) -> None:
+    """Every [[language]] entry is unambiguous: a name that is not empty and not taken by an earlier
+    entry; a new language with at least one extension; every extension a file-name suffix that no
+    other language has, the built-in ones included, and listed once in its entry; comment markers
+    that are not empty, and on a built-in language only its own ones."""
+    owners = {ext: f"the built-in language {name}" for name, lang in BUILT_IN.items() for ext in lang.extensions}
+    seen: dict[str, int] = {}
+    for i, entry in enumerate(data.get("language", [])):
+        key, name = f"language[{i}]", entry["name"]
+        if name == "":
+            raise ConfigError(f"{key}.name: must not be empty")
+        if name in seen:
+            raise ConfigError(f"{key}.name: {json.dumps(name)} is already the name of language[{seen[name]}]")
+        seen[name] = i
+        built_in = BUILT_IN.get(name)
+        extensions = entry.get("extensions", _MISSING)
+        if built_in is None and extensions is _MISSING:
+            raise ConfigError(f"{key}: missing key extensions; a new language needs at least one")
+        if built_in is None and not extensions:
+            raise ConfigError(f"{key}.extensions: must not be empty for a new language")
+        listed: dict[str, int] = {}
+        for j, ext in enumerate([] if extensions is _MISSING else extensions):
+            ext_key, shown = f"{key}.extensions[{j}]", json.dumps(ext)
+            problem = _extension_problem(ext)
+            if problem:
+                raise ConfigError(f"{ext_key}: {problem}, got {shown}")
+            if ext in listed:
+                raise ConfigError(f"{ext_key}: {shown} is already {key}.extensions[{listed[ext]}]")
+            listed[ext] = j
+            owner = owners.setdefault(ext, key)
+            if owner != key and not (built_in is not None and ext in built_in.extensions):
+                raise ConfigError(f"{ext_key}: {shown} is already an extension of {owner}")
+        if entry.get("line_comment") == "":
+            raise ConfigError(f"{key}.line_comment: must not be empty")
+        for j, marker in enumerate(entry.get("block_comment", [])):
+            if marker == "":
+                raise ConfigError(f"{key}.block_comment[{j}]: must not be empty")
+        if built_in is not None:
+            if "line_comment" in entry and entry["line_comment"] != built_in.line_comment:
+                shown = json.dumps(built_in.line_comment)
+                raise ConfigError(f"{key}.line_comment: must be {shown} on the built-in language {name}, or left out")
+            if "block_comment" in entry and tuple(entry["block_comment"]) != built_in.block_comment:
+                shown = json.dumps(list(built_in.block_comment or ()))
+                raise ConfigError(f"{key}.block_comment: must be {shown} on the built-in language {name}, or left out")
+
+
 def validate(data: dict) -> None:
     """Raises ConfigError naming the first problem of a parsed muster.toml."""
     _check_table("", data, SCHEMA)
     _check_duration(data)
+    _check_languages(data)
 
 
 def config_path(root: Path, value: str) -> Path:
@@ -477,6 +534,19 @@ class Config:
     @property
     def own_test_forbidden(self) -> list[str]:
         return self.get("mutation.own_test_forbidden", [])
+
+    @property
+    def loc_exclude(self) -> list[str]:
+        return self.get("loc.exclude", [])
+
+    @property
+    def loc_test_support(self) -> list[str]:
+        return self.get("loc.test_support", [])
+
+    @property
+    def languages(self) -> list[Language]:
+        """The built-in languages and those of the [[language]] entries (muster.lang)."""
+        return languages(self.get("language", []))
 
 
 # Every key of the schema that names one file by a literal path; each entry of
