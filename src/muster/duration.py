@@ -14,39 +14,24 @@ limitation: a JUnit file left over from an earlier run widens the span.
 
 Above the warning threshold the section gets a warning, never a violation; above the error
 threshold an error annotation, which is a violation only under --strict. A run that is not measured
-is never a violation. A file that cannot be read is an input error, and the section then has no
-verdict.
+is never a violation. A file that cannot be read, or a configured path that is there but is not a
+file, is an input error, and the section then has no verdict.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 from pathlib import Path
 
 from muster import policy
-from muster.adapters import jacoco, junit, timing
+from muster.adapters import exists, jacoco, junit, timing
 from muster.adapters.timing import TimingRecord
 from muster.config import Config, require
-from muster.paths import exists_exact, resolve_glob
+from muster.paths import resolve_glob
 from muster.report import Report, ReportError, md_path, one_line
 
 HELP = "test task duration against the budget"
-TOLERANCE_MS = 1000  # clock rounding between the build, the JUnit XML and the coverage agent
 SPAN_NOTE = "; JUnit span, a lower bound: a file left over from an earlier run widens it"
-_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-_MICROSECOND = dt.timedelta(microseconds=1)
-
-
-def inputs(cfg: Config) -> list[tuple[str, Path]]:
-    """The timing record and the coverage report that the profile names (label, path). Like
-    policy.inputs, it never raises, not even on a profile that failed its check."""
-    named = []
-    for key in ("duration.task_json", "coverage.report"):
-        value = cfg.get(key)
-        if isinstance(value, str) and value and "\0" not in value:
-            named.append((f"the file of {key}", cfg.root / value))
-    return named
 
 
 def protected(args: argparse.Namespace, cfg: Config) -> list[tuple[str, Path]]:
@@ -74,11 +59,6 @@ def threshold_text(seconds: float) -> str:
     return f"> {seconds} s"
 
 
-def _micros(moment: dt.datetime) -> int:
-    """The moment in whole microseconds since the epoch, exactly."""
-    return (moment - _EPOCH) // _MICROSECOND
-
-
 def _span(suites: list[junit.Suite]) -> tuple[float, int] | None:
     """(seconds from the first start to the last end, number of suites); None for no suites."""
     bounds = junit.span(suites)
@@ -91,23 +71,16 @@ def _span(suites: list[junit.Suite]) -> tuple[float, int] | None:
 def _stale(record: TimingRecord, suites: list[junit.Suite], sessions: list[tuple[int, int]] | None) -> str | None:
     """Why a successful task record is not from the run whose results are on disk, or None: the
     JUnit suites, and the coverage sessions when there is a report, lie within the start and the end
-    of the task, give or take TOLERANCE_MS. The times are compared as exact integers."""
-    first, last = record.start_ms - TOLERANCE_MS, record.end_ms + TOLERANCE_MS
+    of the task, give or take junit.TOLERANCE_MS. The times are compared as exact integers."""
     if not suites:
         return "no JUnit XML for the recorded run"
     start, end, _ = junit.span(suites)
-    if _micros(start) < first * 1000 or _micros(end) > last * 1000:
+    if not junit.within(start, end, record.start_ms, record.end_ms):
         return "the JUnit XML is not from the recorded task run"
+    first, last = record.start_ms - junit.TOLERANCE_MS, record.end_ms + junit.TOLERANCE_MS
     if sessions is not None and any(begin < first or dump > last for begin, dump in sessions):
         return "the JaCoCo sessions are not from the recorded task run"
     return None
-
-
-def _task_seconds(record: TimingRecord, name: str) -> float:
-    try:
-        return (record.end_ms - record.start_ms) / 1000
-    except OverflowError:  # too many digits for a float
-        raise ReportError(f"{name}: end_ms - start_ms is too large") from None
 
 
 def _level(cfg: Config, seconds: float) -> tuple[str | None, str]:
@@ -161,11 +134,7 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     files = getattr(args, "junit_files", None)
     files = resolve_glob(cfg.root, cfg.get("tests.results")) if files is None else files
     errors: list[str] = []
-    suites: list[junit.Suite] = []
-    try:
-        suites = junit.read_suites(cfg.root, files)
-    except ReportError as exc:
-        errors.append(str(exc))
+    suites = junit.read_suites(cfg.root, files, errors)
     if source == "junit-span":
         if errors:
             _errored(rep, errors, data)
@@ -174,17 +143,17 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
         return
     name = cfg.get("duration.task_json")
     record = sessions = seconds = None
-    if exists_exact(cfg.root, name):
-        try:
+    try:
+        if exists(cfg.root, name):
             record = timing.load(cfg.root / name, cfg.duration_task, name=name)
-            if record.outcome == "success":
-                seconds = _task_seconds(record, name)
-        except ReportError as exc:
-            errors.append(str(exc))
-    report = cfg.get("coverage.report")
-    if seconds is not None and report is not None and exists_exact(cfg.root, report):
+    except ReportError as exc:
+        errors.append(str(exc))
+    if record is not None and record.outcome == "success":
+        seconds = (record.end_ms - record.start_ms) / 1000  # the record holds times a datetime holds
+        report = cfg.get("coverage.report")
         try:
-            sessions = jacoco.read_sessions(cfg.root / report, name=report)
+            if report is not None and exists(cfg.root, report):
+                sessions = jacoco.read_sessions(cfg.root / report, name=report)
         except ReportError as exc:
             errors.append(str(exc))
     if errors:

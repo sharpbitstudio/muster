@@ -14,7 +14,17 @@ from pathlib import Path
 from unittest import mock
 
 from muster import globs
-from muster.config import Config, ConfigError, _exact_case, config_path, load, require, validate
+from muster.config import (
+    FILE_KEYS,
+    Config,
+    ConfigError,
+    _exact_case,
+    config_path,
+    load,
+    named_files,
+    require,
+    validate,
+)
 
 DRIVE = "C" + ":"
 
@@ -804,6 +814,32 @@ class ConfigAccessTest(unittest.TestCase):
         self.assertIsNone(cfg.get("zones.critical"))
         self.assertEqual(cfg.get("source.roots", []), [])
         self.assertEqual(cfg.get("zones.base.deeper", "none"), "none")
+
+
+class NamedFilesTest(unittest.TestCase):
+    def config(self, data: dict) -> Config:
+        return Config(Path("/work/repo"), Path("/work/repo/muster.toml"), data)
+
+    def test_every_key_that_names_one_file(self):
+        walked = {"zones.base", "output.dir", "tests.results", "coverage.full_run_suites[].file"}
+        self.assertEqual(sorted(FILE_KEYS), sorted(set(PATH_KEYS) - walked))
+
+    def test_files_of_the_example(self):
+        named = named_files(self.config(tomllib.loads(EXAMPLE)))
+        labels = [f"the file of {key}" for key in FILE_KEYS] + ["the file of coverage.full_run_suites[0].file"]
+        self.assertEqual([label for label, _ in named], labels)
+        self.assertEqual(dict(named)["the file of mutation.tool_versions.file"], Path("/work/repo/build/versions.toml"))
+        left = named_files(self.config(tomllib.loads(EXAMPLE)), leave_out=("policy.snapshot",))
+        self.assertEqual([label for label, _ in left], [label for label in labels if "policy.snapshot" not in label])
+
+    def test_never_raises_on_a_profile_that_failed_its_check(self):
+        for data in (
+            {"zones": "a string", "mutation": {"tool_versions": ["file"]}, "coverage": {"full_run_suites": "x"}},
+            {"zones": {"critical": 7}, "coverage": {"full_run_suites": ["x", {"file": None}, {"file": ""}]}},
+            {"policy": {"snapshot": "build/x" + chr(0) + ".json"}, "mutation": {"report": ["a"]}},
+        ):
+            with self.subTest(data=data):
+                self.assertEqual(named_files(self.config(data)), [])
 
 
 class RequireTest(unittest.TestCase):

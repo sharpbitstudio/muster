@@ -157,7 +157,7 @@ def diff_since(repo: Path, commit: str, folders: list[str]) -> str:
     try:
         return git(repo, *DIFF_ARGS, "--relative", commit, "--", *pathspecs)
     except OSError as exc:
-        raise ReportError(f"git diff could not run: {exc}") from exc
+        raise ReportError(f"git diff could not run: {exc.strerror or exc}") from exc
 
 
 def untracked_under(repo: Path, folders: list[str]) -> list[str]:
@@ -168,5 +168,5 @@ def untracked_under(repo: Path, folders: list[str]) -> list[str]:
         for folder in folders:
             found.update(untracked_files(repo, ":(literal)" + folder))
     except OSError as exc:
-        raise ReportError(f"git ls-files could not run: {exc}") from exc
+        raise ReportError(f"git ls-files could not run: {exc.strerror or exc}") from exc
     return sorted(found)

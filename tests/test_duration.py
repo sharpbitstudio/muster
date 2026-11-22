@@ -54,7 +54,7 @@ task_json = "build/muster/test-task.json"
 task = ":app:test"
 """
 SOURCE_TABLE = '[source]\nroots = ["src/main/java"]\ntests = ["src/test/java"]\ninclude = ["**/*.java"]\n\n'
-WITH_REPORT ='\n[coverage]\nreport = "build/jacoco/report.xml"\n'
+WITH_REPORT = '\n[coverage]\nreport = "build/jacoco/report.xml"\n'
 TASK_JSON_LINE = 'task_json = "build/muster/test-task.json"\n'
 SPAN_PROFILE = PROFILE.replace(TASK_JSON_LINE, 'source = "junit-span"\n')
 SPAN_NOTE = "; JUnit span, a lower bound: a file left over from an earlier run widens it"
@@ -283,7 +283,8 @@ class VerdictTest(DurationCase):
     def test_data_carries_the_checked_record_only(self):
         self.timed_run(20, worker="localhost", attempt=2)
         data = self.duration().data
-        record = {"task": TASK, "start_ms": START_MS, "end_ms": START_MS + 20_000, "outcome": "success", "failure": None}
+        end_ms = START_MS + 20_000
+        record = {"task": TASK, "start_ms": START_MS, "end_ms": end_ms, "outcome": "success", "failure": None}
         expected = {
             "task_seconds": 20.0,
             "junit_span_seconds": 18.0,
@@ -307,7 +308,8 @@ class VerdictTest(DurationCase):
         for options, code in (([], 0), (["--strict"], 1)):
             run = self.duration(*options)
             self.assertEqual((run.code, run.section["verdict"]), (code, "error"))
-            self.assertEqual(run.section["errors"], [f"{RECORD}: a record of task ':lib:test', expected task ':app:test'"])
+            message = f"{RECORD}: a record of task ':lib:test', expected task ':app:test'"
+            self.assertEqual(run.section["errors"], [message])
 
     def test_auxiliary_junit_span_over_two_files(self):
         self.timed_run(100, junit=False)
@@ -352,7 +354,8 @@ class StaleRecordTest(DurationCase):
     def test_coverage_sessions_outside_and_inside_the_window(self):
         self.write("muster.toml", PROFILE + WITH_REPORT)
         self.timed_run(100)
-        self.write(REPORT, sessions_xml([(START_MS + 500, START_MS + 99_000), (START_MS + 200_000, START_MS + 201_000)]))
+        sessions = [(START_MS + 500, START_MS + 99_000), (START_MS + 200_000, START_MS + 201_000)]
+        self.write(REPORT, sessions_xml(sessions))
         self.not_measured("NO CURRENT TIMING (the JaCoCo sessions are not from the recorded task run)")
         self.write(REPORT, sessions_xml([(START_MS + 500, START_MS + 99_000)]))
         self.assertEqual(self.duration().verdict, "duration: PASS 100.0 s (within budget)")
@@ -447,7 +450,8 @@ class ThresholdTest(DurationCase):
         self.assertEqual(self.duration().verdict, "duration: ERROR 61.0 s (> 1 min)")
 
     def test_threshold_text(self):
-        for value, text in ((240, "> 4 min"), (240.0, "> 4 min"), (250, "> 250 s"), (0.5, "> 0.5 s"), (90.25, "> 90.25 s")):
+        cases = ((240, "> 4 min"), (240.0, "> 4 min"), (250, "> 250 s"), (0.5, "> 0.5 s"), (90.25, "> 90.25 s"))
+        for value, text in cases:
             with self.subTest(value=value):
                 self.assertEqual(duration.threshold_text(value), text)
 
@@ -464,7 +468,8 @@ class ThresholdTest(DurationCase):
             for command in ("duration", "policy"):
                 with self.subTest(table=table, command=command):
                     code, env = self.json_main(command)
-                    self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": f"muster.toml: {message}"}))
+                    expected = {"kind": "config", "message": f"muster.toml: {message}"}
+                    self.assertEqual((code, env["error"]), (2, expected))
 
 
 class DurationKeyTest(DurationCase):
@@ -499,6 +504,8 @@ class BrokenInputTest(DurationCase):
         "missing key": ('"end_ms": ', '"end": '),
         "inverted times": ('"end_ms": ', '"end_ms": -1, "was": '),
         "too long a run": ('"end_ms": ', '"end_ms": 1' + "0" * 400 + ', "was": '),
+        "end past the year 9999": ('"end_ms": ', '"end_ms": 253402300800000, "was": '),
+        "an infinite number in an extra key": ('"end_ms": ', '"was": 1e9999, "end_ms": '),
         "not JSON": ("{", "{not json"),
     }
     JUNIT = {
@@ -512,6 +519,8 @@ class BrokenInputTest(DurationCase):
         "missing attribute": (' dump="', ' ended="'),
         "wrong type": (' start="', ' start="1.5'),
         "not XML": ("</report>", ""),
+        "more digits than int() reads": (' start="', ' start="' + "9" * 4301),
+        "a session that ends before it starts": (' start="', ' start="9'),
     }
 
     def assert_errored(self, prefix: str) -> None:
@@ -552,6 +561,54 @@ class BrokenInputTest(DurationCase):
                 self.write(REPORT, sessions_xml([(START_MS, START_MS + 20_000)]))
                 self.replace(REPORT, old, new)
                 self.assert_errored(f"{REPORT}: ")
+
+    def test_huge_times_are_an_error_whatever_the_outcome(self):
+        for outcome in ("failed", "skipped", None):
+            with self.subTest(outcome=outcome):
+                self.timed_run(20, outcome=outcome)
+                self.replace(RECORD, '"end_ms": ', '"end_ms": 1' + "0" * 400 + ', "was": ')
+                self.assert_errored(f"{RECORD}: end_ms must be from 0 to ")
+
+    def test_inverted_session_inside_the_task(self):
+        self.write("muster.toml", PROFILE + WITH_REPORT)
+        self.timed_run(20)
+        self.write(REPORT, sessions_xml([(START_MS + 5000, START_MS + 1000)]))
+        self.assert_errored(f"{REPORT}: <sessioninfo> dump {START_MS + 1000} is before start {START_MS + 5000}")
+
+    def test_broken_counter_of_the_coverage_report(self):
+        self.write("muster.toml", PROFILE + WITH_REPORT)
+        self.timed_run(20)
+        counter = '<package name="org/example/app"><sourcefile name="Engine.java">'
+        counter += '<counter type="LINE" missed="-1" covered="3"/></sourcefile></package></report>'
+        self.write(REPORT, sessions_xml([(START_MS, START_MS + 20_000)]).replace("</report>", counter))
+        self.assert_errored(f"{REPORT}: <counter> attribute missed")
+
+    def test_junit_file_with_another_root(self):
+        self.timed_run(20)
+        suite = suite_xml(SUITE, START_MS + 1000, 2.0).split("?>", 1)[1]
+        self.write(f"{RESULTS}/TEST-other.xml", f'<report name="app">{suite}</report>')
+        self.assert_errored(f"{RESULTS}/TEST-other.xml: not a JUnit report")
+
+    def test_every_broken_junit_file_is_listed(self):
+        self.timed_run(20)
+        self.write(f"{RESULTS}/TEST-other.xml", "<testsuite")
+        self.replace(f"{RESULTS}/TEST-{SUITE}.xml", "</testsuite>", "")
+        errors = self.duration().section["errors"]
+        files = [f"{RESULTS}/TEST-{SUITE}.xml", f"{RESULTS}/TEST-other.xml"]
+        self.assertEqual([error.split(":")[0] for error in errors], files)
+
+    def test_record_or_report_that_is_a_folder(self):
+        self.write("muster.toml", PROFILE + WITH_REPORT)
+        self.timed_run(20)
+        for path in (RECORD, REPORT):
+            with self.subTest(path=path):
+                (self.repo / path).unlink(missing_ok=True)
+                (self.repo / path).mkdir(parents=True)
+                self.assert_errored(f"{path}: not a file")
+                self.assertEqual(self.duration().section["errors"], [f"{path}: not a file"])
+                (self.repo / path).rmdir()
+                if path == RECORD:
+                    self.timed_run(20)
 
     def test_every_error_is_listed(self):
         self.timed_run(20)
@@ -641,6 +698,25 @@ class OutputClashTest(DurationCase):
         self.assert_refused(self.repo / RECORD, "the file of duration.task_json")
         self.assert_refused(self.repo / REPORT, "the file of coverage.report")
 
+    def test_files_under_the_folders_that_no_glob_matches(self):
+        self.timed_run(20)
+        for path, label in (
+            ("src/main/java/org/example/app/notes.txt", "the source file"),
+            ("src/test/java/org/example/app/fixture.txt", "the test file"),
+        ):
+            with self.subTest(path=path):
+                self.write(path, "data\n")
+                self.assert_refused(self.repo / path, f"{label} {path}")
+
+    def test_files_the_profile_names_for_other_commands(self):
+        zones = '\n[zones]\ncritical = "policy/critical.txt"\n\n[policy]\nsnapshot = "build/muster/snapshot.json"\n'
+        self.write("muster.toml", PROFILE + zones)
+        self.write("policy/critical.txt", "billing/**\n")
+        self.write("build/muster/snapshot.json", "{}\n")
+        self.timed_run(20)
+        self.assert_refused(self.repo / "policy/critical.txt", "the file of zones.critical")
+        self.assert_refused(self.repo / "build/muster/snapshot.json", "the file of policy.snapshot")
+
     def test_junit_file_without_a_source_table(self):
         self.write("muster.toml", PROFILE.replace(SOURCE_TABLE, ""))
         self.timed_run(20)
@@ -648,10 +724,11 @@ class OutputClashTest(DurationCase):
         self.assert_refused(self.repo / junit_file, f"the JUnit file {junit_file}")
 
     def test_inputs_never_raise_on_an_unchecked_profile(self):
+        inputs = cli.ANALYSES["duration"].inputs
         data = {"duration": {"task_json": ["not", "a", "path"]}, "coverage": {"report": "build/x" + chr(0) + ".xml"}}
-        self.assertEqual(duration.inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
+        self.assertEqual(inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
         data = {"duration": "a string", "coverage": 7}
-        self.assertEqual(duration.inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
+        self.assertEqual(inputs(Config(self.repo, self.repo / "muster.toml", data)), [])
 
 
 class PolicyTextTest(unittest.TestCase):

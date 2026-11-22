@@ -479,6 +479,35 @@ class Config:
         return self.get("mutation.own_test_forbidden", [])
 
 
+# Every key of the schema that names one file by a literal path; each entry of
+# coverage.full_run_suites names one more. The folders and the globs are walked instead.
+FILE_KEYS = (
+    "zones.critical",
+    "zones.standard",
+    "zones.exemptions",
+    "mutation.targets",
+    "coverage.report",
+    "policy.snapshot",
+    "duration.task_json",
+    "mutation.report",
+    "mutation.tool_versions.file",
+)
+
+
+def named_files(cfg: Config, *, leave_out: tuple[str, ...] = ()) -> list[tuple[str, Path]]:
+    """Every file the profile names by a literal path (label, path): the keys of FILE_KEYS but those
+    in `leave_out`, then the file of each coverage.full_run_suites entry. It never raises, not even
+    on a profile that failed its check, where it takes the string values it finds: the command line
+    protects them before a command can report any error."""
+    named = [(f"the file of {key}", cfg.get(key)) for key in FILE_KEYS if key not in leave_out]
+    suites = cfg.get("coverage.full_run_suites")
+    for i, suite in enumerate(suites if isinstance(suites, list) else []):
+        if isinstance(suite, dict):
+            named.append((f"the file of coverage.full_run_suites[{i}].file", suite.get("file")))
+    usable = [(label, value) for label, value in named if isinstance(value, str) and value and "\0" not in value]
+    return [(label, cfg.root / value) for label, value in usable]
+
+
 def require(cfg: Config, *keys: str) -> None:
     """Raises ConfigError naming the first of the dotted keys that the profile does not set."""
     for key in keys:

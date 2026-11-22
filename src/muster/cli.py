@@ -28,7 +28,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from muster import __version__, coverage, duration, policy
-from muster.config import DEFAULT_CONFIG, SECTIONS, Config, ConfigError, config_path, load, load_unchecked
+from muster.config import (
+    DEFAULT_CONFIG,
+    SECTIONS,
+    Config,
+    ConfigError,
+    config_path,
+    load,
+    load_unchecked,
+    named_files,
+)
 from muster.gitio import find_repo_root, git, merge_base
 from muster.report import (
     FatalError,
@@ -69,8 +78,9 @@ Summary = tuple[str, Path, bool]  # (label, path, appended to)
 @dataclass(frozen=True)
 class Analysis:
     """An analysis command: `run` judges one section into the Report; `arguments` adds its own options.
-    Once the profile is read: `inputs` names the files the command reads (also, best effort, from a
-    profile that failed its check), `protected` the other repository files no output may be, and
+    Once the profile is read: `inputs` names the files of the profile, every one the profile names
+    by its path but the command's own outputs (also, best effort, from a profile that failed its
+    check), `protected` the other repository files no output may be, and
     `outputs` its own output files with the error that keeps one from being named, raised once the
     others are checked (none of the three may raise)."""
 
@@ -84,10 +94,8 @@ class Analysis:
 
 ANALYSES: dict[str, Analysis] = {
     "policy": Analysis(policy.run, policy.HELP, policy.arguments, policy.inputs, policy.outputs, policy.protected),
-    "coverage": Analysis(
-        coverage.run, coverage.HELP, coverage.arguments, coverage.inputs, protected=coverage.protected
-    ),
-    "duration": Analysis(duration.run, duration.HELP, inputs=duration.inputs, protected=duration.protected),
+    "coverage": Analysis(coverage.run, coverage.HELP, coverage.arguments, named_files, protected=coverage.protected),
+    "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=duration.protected),
 }
 
 
@@ -395,14 +403,22 @@ def _write_summary(inv: Invocation, rep: Report) -> None:
     inv.summary_written = True
 
 
+def _commits(inv: Invocation, args: argparse.Namespace) -> None:
+    """The repository root, HEAD and, with --base, the merge base, found once right after argv
+    parses: the envelope carries them on every later exit, a usage error included, and the section
+    uses the same merge base."""
+    args.repo_root = _repo_root(args.repo)
+    inv.commit = _head_commit(args.repo_root)
+    if getattr(args, "base", None) is not None:
+        args.base_commit = _merge_base(args.repo_root, args.base)
+        inv.base = {"ref": args.base, "commit": args.base_commit}
+
+
 def run_analysis(
     args: argparse.Namespace, inv: Invocation, analysis: Analysis, json_out: str | None, summary: Summary | None
 ) -> int:
-    root = _repo_root(args.repo)
-    inv.commit = _head_commit(root)
-    if getattr(args, "base", None) is not None:  # the section and the envelope share one merge base
-        args.base_commit = _merge_base(root, args.base)
-        inv.base = {"ref": args.base, "commit": args.base_commit}
+    """Run an analysis command; _commits() has set args.repo_root."""
+    root = args.repo_root
     profile = [("the config file", config_path(root, args.config))]
     _refuse_clashes(inv, _named(json_out, summary), profile)
     _arm(inv, json_out, summary)
@@ -458,6 +474,8 @@ def _run(inv: Invocation) -> int:
     try:
         args = build_parser().parse_args(inv.argv)  # --help exits here, before any output is checked
         inv.command, inv.fmt = args.command, args.format
+        if args.command != "version":
+            _commits(inv, args)
         json_out = _file_option("--json-out", args.json_out)
         summary = _option_summary(args)
     except UsageError:  # bad arguments, or an empty file name: the envelope goes where argv says

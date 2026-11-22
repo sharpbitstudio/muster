@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import posixpath
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from muster.config import Config, ConfigError
@@ -25,20 +25,35 @@ def normalize(path: str) -> str:
     return "" if norm == "." else norm
 
 
-def exists_exact(root: Path, path: str, *, folder: bool = False) -> bool:
-    """Whether `path` (relative to `root`) is a file, or a folder, whose every part has exactly the
-    configured name. Path.exists() alone would accept another case on Windows and macOS. It never
+def _exact(root: Path, path: str) -> Path | None:
+    """`root / path` when every part of `path` has exactly that name on disk, else None. It never
     raises: a folder that cannot be read hides what is in it."""
     current = root
     for part in [part for part in normalize(path).split("/") if part]:
         try:
             names = os.listdir(current)
         except OSError:
-            return False
+            return None
         if part not in names:
-            return False
+            return None
         current = current / part
+    return current
+
+
+def exists_exact(root: Path, path: str, *, folder: bool = False) -> bool:
+    """Whether `path` (relative to `root`) is a file, or a folder, whose every part has exactly the
+    configured name. Path.exists() alone would accept another case on Windows and macOS. It never
+    raises: a folder that cannot be read hides what is in it."""
+    current = _exact(root, path)
+    if current is None:
+        return False
     return os.path.isdir(current) if folder else os.path.isfile(current)  # False on any OSError
+
+
+def present_exact(root: Path, path: str) -> bool:
+    """Whether anything, a file, a folder or another kind of entry, is at `path` (relative to
+    `root`) with exactly the configured name of every part. It never raises."""
+    return _exact(root, path) is not None
 
 
 def _is_junction(path: str) -> bool:
@@ -122,27 +137,27 @@ class SourceSets:
     sources: list[str]  # the classification set, sorted
     tests: frozenset[str]  # the test set
     error: ConfigError | None = None  # the first folder that was missing or unreadable
+    walked_sources: list[str] = field(default_factory=list)  # every file under [source].roots, sorted
+    walked_tests: list[str] = field(default_factory=list)  # every file under [source].tests, sorted
 
 
 def source_sets(cfg: Config, *, defer: bool = False) -> SourceSets:
-    """The classification set and the test set of the profile's [source] table. A missing or
-    unreadable folder raises its ConfigError, or with `defer` is kept in `error` while the other
-    folders are still walked."""
+    """The classification set and the test set of the profile's [source] table, and every file
+    walked for them, before any glob. A missing or unreadable folder raises its ConfigError, or with
+    `defer` is kept in `error` while the other folders are still walked."""
     errors: list[ConfigError] | None = [] if defer else None
     include = cfg.get("source.include", [])
     exclude = cfg.get("source.exclude", [])
     generated = cfg.get("source.generated", [])
+    walked_sources = walk(cfg.root, "source.roots", cfg.get("source.roots", []), errors)
+    walked_tests = walk(cfg.root, "source.tests", cfg.get("source.tests", []), errors)
     sources = [
         path
-        for path in walk(cfg.root, "source.roots", cfg.get("source.roots", []), errors)
+        for path in walked_sources
         if matches_any(include, path) and not matches_any(exclude, path) and not matches_any(generated, path)
     ]
-    tests = frozenset(
-        path
-        for path in walk(cfg.root, "source.tests", cfg.get("source.tests", []), errors)
-        if matches_any(include, path) and not matches_any(generated, path)
-    )
-    return SourceSets(sources, tests, errors[0] if errors else None)
+    tests = frozenset(path for path in walked_tests if matches_any(include, path) and not matches_any(generated, path))
+    return SourceSets(sources, tests, errors[0] if errors else None, walked_sources, walked_tests)
 
 
 def root_of(path: str, roots: list[str]) -> str | None:

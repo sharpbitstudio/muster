@@ -343,7 +343,8 @@ class ParseDiffTest(unittest.TestCase):
             "-old",
             "+new",
         )
-        self.assertEqual(parse_diff(text, "src/main/java/"), {"org/example/app/billing/internal/ledger/Engine.java": {1}})
+        expected = {"org/example/app/billing/internal/ledger/Engine.java": {1}}
+        self.assertEqual(parse_diff(text, "src/main/java/"), expected)
 
     def test_context_lines_of_merged_hunk_are_not_changes(self):
         text = diff_text(
@@ -504,6 +505,18 @@ class GitNotRunnableTest(GitRepoCase):
             with self.subTest(helper=name), mock.patch("muster.gitio.subprocess.run", side_effect=FileNotFoundError):
                 with self.assertRaises(ReportError):
                     call()
+
+    def test_message_gives_the_reason_of_the_os_error(self):
+        calls = {
+            "git diff": lambda: diff_since(self.root, "HEAD", ["src/main/java"]),
+            "git ls-files": lambda: untracked_under(self.root, ["src/main/java"]),
+        }
+        error = FileNotFoundError(2, "synthetic reason")
+        for name, call in calls.items():
+            with self.subTest(helper=name), mock.patch("muster.gitio.subprocess.run", side_effect=error):
+                with self.assertRaises(ReportError) as caught:
+                    call()
+                self.assertEqual(str(caught.exception), f"{name} could not run: synthetic reason")
 
     def test_missing_folder_becomes_report_error(self):
         gone = self.root / "gone"

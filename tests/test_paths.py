@@ -12,7 +12,17 @@ from pathlib import Path
 from unittest import mock
 
 from muster.config import Config, ConfigError
-from muster.paths import _is_junction, exists_exact, is_link, normalize, resolve_glob, root_of, source_sets, walk
+from muster.paths import (
+    _is_junction,
+    exists_exact,
+    is_link,
+    normalize,
+    present_exact,
+    resolve_glob,
+    root_of,
+    source_sets,
+    walk,
+)
 
 
 class TreeCase(unittest.TestCase):
@@ -259,6 +269,15 @@ class SourceSetsTest(TreeCase):
         self.assertIsNone(source_sets(self.config(roots=["src"], include=["**/*.py"]), defer=True).error)
 
 
+class WalkedFilesTest(TreeCase):
+    def test_every_walked_file_before_the_globs(self):
+        self.make("src/main.py", "src/notes.txt", "src/gen/schema.py", "tests/test_main.py", "tests/data.json")
+        sets = source_sets(self.config(roots=["src"], tests=["tests"], include=["**/*.py"], generated=["src/gen/**"]))
+        self.assertEqual(sets.sources, ["src/main.py"])
+        self.assertEqual(sets.walked_sources, ["src/gen/schema.py", "src/main.py", "src/notes.txt"])
+        self.assertEqual(sets.walked_tests, ["tests/data.json", "tests/test_main.py"])
+
+
 class ExistsExactTest(TreeCase):
     def test_file_and_folder(self):
         self.make("src/test/java/FullRunSuite.java")
@@ -274,6 +293,13 @@ class ExistsExactTest(TreeCase):
         self.assertFalse(exists_exact(self.root, "Src/test/java/FullRunSuite.java"))
         self.assertFalse(exists_exact(self.root, "src/test/java/Gone.java"))
         self.assertFalse(exists_exact(self.root, "src/test/java/FullRunSuite.java/inner"))
+
+    def test_present_is_a_file_a_folder_or_another_entry(self):
+        self.make("src/test/java/FullRunSuite.java")
+        self.assertTrue(present_exact(self.root, "src/test/java/FullRunSuite.java"))
+        self.assertTrue(present_exact(self.root, "src/test/java"))
+        self.assertFalse(present_exact(self.root, "src/test/Java"))
+        self.assertFalse(present_exact(self.root, "src/test/java/Gone.java"))
 
 
 class HelperTest(unittest.TestCase):
