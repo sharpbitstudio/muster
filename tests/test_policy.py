@@ -29,6 +29,7 @@ from muster.policy import (
     protected,
     read_snapshot,
     report_invalid,
+    snapshot_problems,
     sources_sha256,
 )
 from muster.report import FatalError, Report, ReportError
@@ -1237,6 +1238,86 @@ class CheckPolicyTest(PolicyCase):
         self.assertEqual((rep.violation, rep.violations), (True, ["first", "second"]))
         self.assertEqual(
             rep.annotations, ["::error title=Invalid policy::first", "::error title=Invalid policy::second"]
+        )
+
+
+class CheckedTargetsTest(PolicyCase):
+    def setUp(self):
+        super().setUp()
+        self.write("muster.toml", PROFILE + MUTATION)
+
+    def check(self):
+        return check_policy(argparse.Namespace(), load(self.repo), date(2026, 5, 19))
+
+    def test_valid_list_gives_the_paths_in_file_order(self):
+        self.write(f"{TESTS}/queue/DispatcherTest.java", "class X {}\n")
+        self.write("policy/mutation.txt", "# pure logic\nqueue/Dispatcher.java\n\ncodec/KeyParser.java\n")
+        checked = self.check()
+        self.assertEqual(checked.violations, [])
+        self.assertEqual(checked.target_files, (f"{BASE}/queue/Dispatcher.java", f"{BASE}/codec/KeyParser.java"))
+        self.assertEqual(checked.targets, 2)
+
+    def test_invalid_list_gives_no_path(self):
+        self.write("policy/mutation.txt", "codec/KeyParser.java\nqueue/Dispatcher.java\n")
+        checked = self.check()
+        self.assertEqual(len(checked.violations), 1)
+        self.assertEqual((checked.target_files, checked.targets), ((), 2))
+
+    def test_no_target_list(self):
+        self.write("muster.toml", PROFILE)
+        checked = self.check()
+        self.assertEqual((checked.target_files, checked.targets), (None, None))
+
+    def test_count_takes_malformed_and_duplicate_lines(self):
+        lines = "# pure logic\ncodec/KeyParser.java\n\ncodec/*.java\n  codec/KeyParser.java\n"
+        self.write("policy/mutation.txt", lines)
+        checked = self.check()
+        self.assertEqual(len(checked.violations), 2)
+        self.assertEqual((checked.target_files, checked.targets), ((), 3))
+
+
+class SnapshotProblemsTest(PolicyCase):
+    def setUp(self):
+        super().setUp()
+        self.cfg = load(self.repo)
+        self.checked = check_policy(argparse.Namespace(), self.cfg, date(2026, 5, 19))
+
+    def problems(self, *, policy_sha256: str | None = None, sources: list[str] = SOURCES) -> list[str]:
+        digest = policy_hash(self.cfg, self.checked) if policy_sha256 is None else policy_sha256
+        return snapshot_problems(self.cfg, self.checked, {"policy_sha256": digest, "sources": list(sources)})
+
+    def test_no_snapshot(self):
+        self.assertEqual(snapshot_problems(self.cfg, self.checked, None), [])
+
+    def test_equal_snapshot(self):
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(self.problems(sources=list(reversed(SOURCES))), [])
+
+    def test_policy_changed(self):
+        changed = "the policy changed after the snapshot (policy_sha256 differs)"
+        self.assertEqual(self.problems(policy_sha256="0" * 64), [changed])
+
+    def test_sources_added(self):
+        self.assertEqual(
+            self.problems(sources=SOURCES[2:]),
+            [f"the source set changed after the snapshot: 2 added (e.g. {BASE}/auth/Token.java)"],
+        )
+
+    def test_sources_gone(self):
+        self.assertEqual(
+            self.problems(sources=[*SOURCES, f"{BASE}/queue/Retry.java"]),
+            [f"the source set changed after the snapshot: 1 gone (e.g. {BASE}/queue/Retry.java)"],
+        )
+
+    def test_policy_changed_and_sources_added_and_gone_in_order(self):
+        recorded = [*SOURCES[1:], f"{BASE}/codec/Gone.java", f"{BASE}/auth/Old.java"]
+        self.assertEqual(
+            self.problems(policy_sha256="0" * 64, sources=recorded),
+            [
+                "the policy changed after the snapshot (policy_sha256 differs)",
+                f"the source set changed after the snapshot: 1 added (e.g. {BASE}/auth/Token.java),"
+                f" 2 gone (e.g. {BASE}/auth/Old.java)",
+            ],
         )
 
 

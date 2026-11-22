@@ -10,7 +10,17 @@ from datetime import date
 
 from muster.gitio import records
 from muster.policy import utc_today
-from muster.zones import Names, Targets, classify, expand, glob_error, parse_date, target_violations, trim
+from muster.zones import (
+    Names,
+    Targets,
+    classify,
+    expand,
+    glob_error,
+    parse_date,
+    target_files,
+    target_violations,
+    trim,
+)
 
 BASE = "src/main/java/org/example/app"
 CRITICAL = "policy/critical.txt"
@@ -680,6 +690,29 @@ class TargetTest(unittest.TestCase):
                 " in no folder ([source].tests is not set)"
             ],
         )
+
+
+class TargetFilesTest(unittest.TestCase):
+    def test_entries_in_file_order_under_the_base(self):
+        lines = ["queue/Dispatcher.java", "  codec/KeyParser.java \r", "billing/Engine.java"]
+        self.assertEqual(
+            target_files(lines, BASE),
+            [f"{BASE}/queue/Dispatcher.java", f"{BASE}/codec/KeyParser.java", f"{BASE}/billing/Engine.java"],
+        )
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        lines = ["# pure logic", "", " \t ", "  # indented comment", "codec/KeyParser.java", "#codec/Gone.java", "\r"]
+        self.assertEqual(target_files(lines, BASE), [f"{BASE}/codec/KeyParser.java"])
+
+    def test_entries_are_not_checked(self):
+        lines = ["codec/*.java", "codec/KeyParser.java", "codec/KeyParser.java", "Root.java"]
+        self.assertEqual(target_files(lines, BASE), [f"{BASE}/{line}" for line in lines])
+
+    def test_empty_base(self):
+        self.assertEqual(target_files(["codec/KeyParser.java"], ""), ["codec/KeyParser.java"])
+
+    def test_no_entry(self):
+        self.assertEqual(target_files(["# nothing yet", ""], BASE), [])
 
 
 if __name__ == "__main__":
