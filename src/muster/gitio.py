@@ -188,7 +188,8 @@ def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int
     """(added, deleted, path) of every file changed from `commit` to the work tree under `folders`,
     in git's order, run in `repo` with paths relative to it (`--relative`). A count is None where
     git shows `-`, for a file it takes as binary (binary_counts_since() counts its lines). A rename
-    is a deletion and an addition (`--no-renames`). Every folder is a literal pathspec."""
+    is a deletion and an addition (`--no-renames`). Every folder is a literal pathspec. A record
+    that is not `added<TAB>deleted<TAB>path` raises ReportError."""
     try:
         out = _literal_git(
             repo, "-c", "core.quotePath=false", "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff",
@@ -199,8 +200,11 @@ def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int
     changes: list[tuple[int | None, int | None, str]] = []
     for record in out.split("\0"):
         if record:
-            added, deleted, path = record.split("\t", 2)
-            changes.append((None if added == "-" else int(added), None if deleted == "-" else int(deleted), path))
+            try:
+                added, deleted, path = record.split("\t", 2)
+                changes.append((None if added == "-" else int(added), None if deleted == "-" else int(deleted), path))
+            except ValueError:
+                raise ReportError(f"git diff --numstat gave an unexpected record: {record!r}") from None
     return changes
 
 

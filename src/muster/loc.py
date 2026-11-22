@@ -5,7 +5,8 @@ neither a generated nor a [loc].exclude glob (muster.paths). A file is in the gr
 folder that holds it: "main" under a folder of roots; under a folder of tests "test-support" when a
 [loc].test_support glob matches it, else "test". A line of code keeps a character other than white
 space outside comments, as the language of the file counts it (muster.lang); a line ends at a line
-feed only.
+feed only. A LOC set without a file under [source].roots is a configuration error, as for `policy`:
+the globs left nothing to count (a set without test files is fine).
 
 A file of the set without a language, or one that cannot be read, is not counted and is an input
 error; the section still reports what it counted. With --base the change split gives the raw lines
@@ -26,7 +27,7 @@ from muster.config import Config, ConfigError, require
 from muster.coverage import ref_argument
 from muster.gitio import binary_counts_since, count_file_lines, numstat_since, untracked_under
 from muster.lang import Language, count_file, language_of
-from muster.paths import group_of, in_loc_set, loc_set
+from muster.paths import group_of, in_loc_set, loc_set, root_of
 from muster.report import Report, ReportError, md_path
 
 HELP = "lines of code: main, test, test-support (trend only)"
@@ -136,6 +137,12 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     files, error = _loc_files(args, cfg)
     if error is not None:
         raise ConfigError(f"{cfg.name}: {error}")
+    roots = cfg.get("source.roots", [])
+    if not any(root_of(rel, roots) is not None for rel in files):  # a file without a language is a member
+        raise ConfigError(
+            f"{cfg.name}: no file under source.roots is in the LOC set"
+            " (source.include minus source.generated and [loc].exclude)"
+        )
     langs = cfg.languages
     groups = {name: {"files": 0, "loc": 0} for name in GROUPS}
     errors: list[str] = []

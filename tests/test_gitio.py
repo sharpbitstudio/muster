@@ -609,6 +609,13 @@ class NumstatSinceTest(ChangesRepoCase):
                 self.assertEqual(numstat_since(self.repo, base, [GLOB_FOLDER]), [(1, 1, GLOB_FOLDER_FILE)])
                 self.assertIn((1, 1, ENGINE), numstat_since(self.repo, base, ["src/main/java"]))
 
+    def test_malformed_record_is_a_report_error(self):
+        for out in (f"1\t2\t{ENGINE}\0no tabs\0", f"one\ttwo\t{ENGINE}\0", "1\t2\0"):
+            with self.subTest(out=out), mock.patch("muster.gitio._literal_git", return_value=out):
+                with self.assertRaises(ReportError) as caught:
+                    numstat_since(self.repo, "HEAD", ["src/main/java"])
+                self.assertTrue(str(caught.exception).startswith("git diff --numstat gave an unexpected record: "))
+
 
 class BinaryCountsSinceTest(ChangesRepoCase):
     def setUp(self):

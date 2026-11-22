@@ -6,7 +6,9 @@ adds extensions to it and keeps its counter. The profile check (muster.config) r
 that would make the languages ambiguous, so the entries here are already checked.
 
 A file has the language of the longest extension that ends its name, compared case-sensitively; a
-name with no such extension, or one that is nothing but the extension (a dot-file), has none.
+name with no such extension, or one that is nothing but the longest of them (a dot-file such as
+`.java` or `.d.ts`), has none. Java gets the text with each CR before a LF dropped, the line rule of
+the generic counter (gitio.records()); a lone CR stays inside its line.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ class Language:
     def count(self, text: str) -> int:
         """The lines of code in `text`."""
         if self.counter is not None:
-            return self.counter(text)
+            return self.counter(text.replace("\r\n", "\n"))
         return generic_loc(records(text), self.line_comment, self.block_comment)
 
 
@@ -61,9 +63,12 @@ def generic_loc(lines: list[str], line_comment: str | None, block_comment: tuple
     for line in lines:
         code = False
         i = 0
-        # A marker that find() misses from some place on is not in the rest of the line, so it is
-        # not looked for again there: a long line with many blocks is scanned in linear time.
+        # Where find() last found each marker: it is looked for again only once i has passed that
+        # place, and a marker it misses from some place on is not in the rest of the line, so it is
+        # not looked for again at all. Each part of the line is searched for each marker at most
+        # once: a long line with many blocks is scanned in linear time.
         absent = {marker for marker in (line_comment, start) if not marker}
+        ahead: dict[str, int] = {}
         while True:  # each pass ends the line or moves past a marker, which is never empty
             if in_block:
                 close = line.find(end, i)
@@ -76,7 +81,9 @@ def generic_loc(lines: list[str], line_comment: str | None, block_comment: tuple
             found = []
             for marker in (line_comment, start):
                 if marker not in absent:
-                    place = line.find(marker, i)
+                    place = ahead.get(marker, -1)
+                    if place < i:
+                        place = ahead[marker] = line.find(marker, i)
                     if place < 0:
                         absent.add(marker)
                     else:
@@ -114,14 +121,15 @@ def languages(entries: Iterable[dict[str, Any]]) -> list[Language]:
 
 def language_of(path: str, langs: Iterable[Language]) -> Language | None:
     """The language of the longest extension that ends the file name of `path`, or None. The name
-    must be longer than the extension: a dot-file such as `.java` has no language."""
+    must be longer than that extension: a dot-file such as `.java` has no language, and with both
+    `.d.ts` and `.ts` registered neither has `.d.ts`."""
     name = path.rsplit("/", 1)[-1]
     best: tuple[int, Language] | None = None
     for lang in langs:
         for ext in lang.extensions:
-            if len(name) > len(ext) and name.endswith(ext) and (best is None or len(ext) > best[0]):
+            if name.endswith(ext) and (best is None or len(ext) > best[0]):
                 best = (len(ext), lang)
-    return best[1] if best else None
+    return best[1] if best and best[0] < len(name) else None
 
 
 def count_file(path: Path, lang: Language) -> int:

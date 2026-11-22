@@ -81,6 +81,11 @@ class GenericCounterTest(unittest.TestCase):
         self.assertEqual(c_like("/* a */ " * 5000 + "/* open", "inside", "close */"), 0)
         self.assertEqual(c_like("/* a */ " * 5000 + "// note */ y", "x = 1;"), 1)
 
+    def test_long_line_with_many_blocks_before_a_far_line_comment(self):
+        self.assertEqual(c_like("/* a */ x; " * 50000 + "// tail"), 1)
+        self.assertEqual(c_like("/* a */ " * 50000 + "// tail", "/* b */ " * 50000 + "y // tail"), 1)
+        self.assertEqual(c_like("// head /* a */ " * 50000, "x /* " + "// inside " * 50000 + "*/"), 1)
+
     def test_block_with_the_same_start_and_end(self):
         lines = ['"""', "a docstring", '"""', 'x = 1  """ inline """', '""" once """ y']
         self.assertEqual(generic_loc(lines, "#", ('"""', '"""')), 2)
@@ -116,6 +121,15 @@ class JavaCounterTest(unittest.TestCase):
         joined = "int a;" + chr(0x2028) + "int b;" + chr(0x0C) + "int c;\n// done\n"
         self.assertEqual(java_loc(joined), 1)
 
+    def test_crlf_and_lf_give_the_same_count(self):
+        java = BUILT_IN[JAVA]
+        # A string whose backslash runs into the line end: the escape takes the CR, not the LF.
+        unclosed = 'String s = "abc\\\n// inside literal";\nint a;\n'
+        self.assertEqual(java.count(unclosed), 3)
+        for text in (self.SAMPLE, unclosed, "int a;\r\r\n// note\r\n"):
+            with self.subTest(text=text[:20]):
+                self.assertEqual(java.count(text.replace("\n", "\r\n")), java.count(text))
+
     def test_built_in_java_uses_the_java_counter(self):
         java = BUILT_IN[JAVA]
         self.assertIs(java.counter, java_loc)
@@ -144,6 +158,11 @@ class LanguageOfTest(unittest.TestCase):
         self.assertEqual(self.name("web/src/types/api.ts"), "typescript")
         reordered = list(reversed(self.langs))
         self.assertEqual(language_of("web/src/types/api.d.ts", reordered).name, "declarations")
+        # A name that is the longest extension has no language, not that of a shorter one.
+        for langs in (self.langs, reordered):
+            self.assertIsNone(language_of("web/src/types/.d.ts", langs))
+        self.assertIsNone(self.name("web/src/types/.ts"))
+        self.assertEqual(self.name("web/src/types/x.d.ts"), "declarations")
 
     def test_case_sensitive(self):
         self.assertEqual(self.name("src/main/java/org/example/app/Token.java"), "java")
