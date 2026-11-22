@@ -42,7 +42,8 @@ SKIPPED_NOTE = "; freshness not checked"
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
-def _ref(text: str) -> str:
+def ref_argument(text: str) -> str:
+    """The argparse type of --base: a ref git could read as an option, or an empty one, is a usage error."""
     problem = ref_problem(text)
     if problem:
         raise argparse.ArgumentTypeError(f"the ref {text!r} {problem}")
@@ -68,7 +69,10 @@ def _day(text: str) -> date:
 
 def arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--base", metavar="REF", type=_ref, help="ref for the delta gate (diff against git merge-base <base> HEAD)"
+        "--base",
+        metavar="REF",
+        type=ref_argument,
+        help="ref for the delta gate (diff against git merge-base <base> HEAD)",
     )
     # Hidden, for tests: a unified diff instead of git (paths relative to the profile root, with a/
     # and b/ prefixes), no freshness checks, and the day that exemptions are judged on.
