@@ -579,20 +579,26 @@ class ScannedOutputClashTest(CliCase):
     # The best-effort paths (version, an argument error) and a run of a command.
     REPO_COMMANDS = ((["version"], 0), (["loc", "--base="], 2), (["loc"], 2))
 
-    def test_repo_that_cannot_be_resolved_is_never_a_bug(self):
-        # Resolving --repo raises OSError for a busy named pipe on Windows, and RuntimeError for a
-        # link loop on Python 3.11 and 3.12; here the resolution of the repository folder raises.
+    # Resolving a folder raises OSError for a busy named pipe on Windows, and RuntimeError for a
+    # link loop on Python 3.11 and 3.12.
+    RESOLVE_FAILURES = (OSError(231, "All pipe instances are busy"), RuntimeError("a synthetic link loop"))
+
+    def resolve_raising_for(self, folder: Path, failure: Exception):
+        """Path.resolve patched to raise `failure` for `folder` only."""
         resolve = Path.resolve
-        for failure in (OSError(231, "All pipe instances are busy"), RuntimeError("a synthetic link loop")):
 
-            def raising(path, *args, **kwargs):
-                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(self.repo)):
-                    raise failure
-                return resolve(path, *args, **kwargs)
+        def raising(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(folder)):
+                raise failure
+            return resolve(path, *args, **kwargs)
 
+        return mock.patch.object(Path, "resolve", autospec=True, side_effect=raising)
+
+    def test_repo_that_cannot_be_resolved_is_never_a_bug(self):
+        for failure in self.RESOLVE_FAILURES:
             for command, expected in self.REPO_COMMANDS:
                 with self.subTest(failure=type(failure).__name__, command=command):
-                    with mock.patch.object(Path, "resolve", autospec=True, side_effect=raising) as patched:
+                    with self.resolve_raising_for(self.repo, failure) as patched:
                         code, _, err = self.run_main("--repo", str(self.repo), *command, "--json-out", "out.json")
                     self.assertTrue(patched.called)
                     self.assertEqual(code, expected, err)
@@ -603,6 +609,22 @@ class ScannedOutputClashTest(CliCase):
                         prefix = f"--repo {self.repo}: cannot resolve the folder: "
                         self.assertTrue(env["error"]["message"].startswith(prefix), env["error"])
                     (self.work / "out.json").unlink()
+
+    def test_working_directory_that_cannot_be_resolved_is_never_a_bug(self):
+        for failure in self.RESOLVE_FAILURES:
+            with self.subTest(failure=type(failure).__name__):
+                with (
+                    mock.patch.object(cli, "find_repo_root", side_effect=failure) as found,
+                    self.resolve_raising_for(self.work, failure) as patched,
+                ):
+                    code, _, err = self.run_main("loc", "--json-out", "out.json")
+                self.assertTrue(found.called and patched.called)
+                self.assertEqual(code, 2, err)
+                env = self.read_json(self.work / "out.json")
+                self.assertEqual((env["exit_code"], env["error"]["kind"]), (2, "usage"))
+                prefix = "the working directory: cannot resolve the folder: "
+                self.assertTrue(env["error"]["message"].startswith(prefix), env["error"])
+                (self.work / "out.json").unlink()
 
     def test_repo_that_is_a_link_loop(self):
         loop = self.root / "loop"
@@ -619,6 +641,34 @@ class ScannedOutputClashTest(CliCase):
                 if command == ["loc"]:  # cannot resolve (Python 3.11, 3.12), else cannot read the profile
                     self.assertIn(env["error"]["kind"], ("usage", "config"))
                 (self.work / "out.json").unlink()
+
+
+class OutputOrderTest(CliCase):
+    """A normal run compares each output in turn: an earlier clash is refused before a later output
+    can fail to resolve."""
+
+    def test_clash_before_an_output_that_cannot_be_resolved(self):
+        self.config.write_bytes(b'schema = 1\n\n[source]\nroots = ["src/main/java"]\n')
+        source = self.repo / "src/main/java/org/example/app/Engine.java"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"class Engine {}\n")
+        summary = self.work / "summary.md"
+        summary.write_bytes(b"earlier step\n")
+        realpath = os.path.realpath
+
+        def raising(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(summary)):
+                raise OSError(231, "All pipe instances are busy")
+            return realpath(path, *args, **kwargs)
+
+        argv = ["--repo", str(self.repo), "coverage", "--json-out", str(source), "--summary-file", str(summary)]
+        with mock.patch("os.path.realpath", side_effect=raising):
+            code, _, err = self.run_main(*argv)
+        self.assertEqual(code, 2, err)
+        self.assertIn(f"error: --json-out {source} is under the source folder src/main/java\n", err)
+        self.assertEqual(source.read_bytes(), b"class Engine {}\n")
+        self.assertEqual(summary.read_bytes(), b"earlier step\n")
+        self.assertEqual(os.listdir(self.work), ["summary.md"])
 
 
 class InternalErrorTest(CliCase):
