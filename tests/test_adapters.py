@@ -1,4 +1,4 @@
-"""Tests of muster.adapters: the source resolver and the JaCoCo, JUnit and timing adapters.
+"""Tests of muster.adapters: the source resolver and the JaCoCo, PIT, JUnit and timing adapters.
 
 Every tree and every report is built in a temporary folder. Non-ASCII and control characters are
 built at run time with chr().
@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from muster import config, policy
-from muster.adapters import SourceResolver, exists, jacoco, junit, strict_json, timing
+from muster.adapters import SourceResolver, exists, jacoco, junit, pit, strict_json, timing
 from muster.config import ConfigError
 from muster.report import ReportError
 
@@ -428,6 +428,388 @@ class JacocoSessionsTest(AdapterCase):
         with self.assertRaises(ReportError) as caught:
             jacoco.read_sessions(path, name="build/reports/jacoco.xml")
         self.assertNamedOnly(str(caught.exception), "build/reports/jacoco.xml")
+
+
+MATH = "org.pitest.mutationtest.engine.gregor.mutators.MathMutator"
+NEGATE = "org.pitest.mutationtest.engine.gregor.mutators.NegateConditionalsMutator"
+LEDGER = "org.example.app.billing.internal.ledger"
+# The elements of a killed mutant in Token.java, in the order PIT writes them; a test overrides one
+# by its name, and None leaves it out.
+TOKEN_MUTATION = {
+    "sourceFile": "Token.java",
+    "mutatedClass": "org.example.app.auth.Token",
+    "mutatedMethod": "expires",
+    "methodDescription": "(J)Z",
+    "lineNumber": "12",
+    "mutator": MATH,
+    "indexes": "<index>4</index>",
+    "blocks": "<block>1</block>",
+    "killingTest": "org.example.app.auth.TokenTest.[method:expiresAfterTheDeadline()]",
+    "description": "Replaced long subtraction with addition",
+}
+
+
+def mutation(status: str | None = "KILLED", detected: str | None = "true", more: str = "", **elements) -> str:
+    attributes = ' numberOfTestsRun="3"'
+    if detected is not None:
+        attributes = f' detected="{detected}"' + attributes
+    if status is not None:
+        attributes += f' status="{status}"'
+    fields = dict(TOKEN_MUTATION, **elements)
+    body = "".join(f"<{tag}>{text}</{tag}>" for tag, text in fields.items() if text is not None)
+    return f"<mutation{attributes}>{body}{more}</mutation>"
+
+
+def mutations_xml(*mutations: str) -> str:
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n<mutations partial="false">{"".join(mutations)}</mutations>\n'
+
+
+def in_ledger(cls: str, source: str = "Engine.java", **fields) -> str:
+    return mutation(mutatedClass=f"{LEDGER}.{cls}", sourceFile=source, **fields)
+
+
+class PitLoadTest(AdapterCase):
+    def setUp(self):
+        super().setUp()
+        self.make(f"{MAIN}/{ENGINE}", f"{MAIN}/{TOKEN}", f"{MAIN}/Launcher.java", f"{MAIN}/{PARSER}")
+        self.classified = [f"{MAIN}/{ENGINE}", f"{MAIN}/{TOKEN}", f"{MAIN}/Launcher.java"]
+
+    def load(self, *mutations: str, roots: list[str] | None = None) -> pit.MutationReport:
+        path = self.write("build/reports/pit/mutations.xml", mutations_xml(*mutations))
+        return pit.load(path, self.resolver(roots or [MAIN], self.classified))
+
+    def test_killed_mutant_has_every_field(self):
+        [mutant] = self.load(mutation()).mutants
+        self.assertEqual(
+            mutant,
+            pit.Mutant(
+                id=("org.example.app.auth.Token", "expires", "(J)Z", 12, MATH, (4,)),
+                file=f"{MAIN}/{TOKEN}",
+                line=12,
+                mutator="MathMutator",
+                status_raw="KILLED",
+                status="killed",
+                detected=True,
+                killing_tests=["org.example.app.auth.TokenTest.[method:expiresAfterTheDeadline()]"],
+                description="Replaced long subtraction with addition",
+                meta={
+                    "class": "org.example.app.auth.Token",
+                    "method": "expires",
+                    "descriptor": "(J)Z",
+                    "indexes": (4,),
+                    "mutator_full": MATH,
+                    "report_name": TOKEN,
+                },
+            ),
+        )
+
+    def test_descriptor_indexes_and_killing_test_land_in_id_meta_and_killing_tests(self):
+        given = mutation(
+            methodDescription="(Ljava/lang/String;I)J",
+            indexes="<index>7</index><index>0</index><index>19</index>",
+            killingTest="org.example.app.auth.TokenTest.[method:renews()]",
+        )
+        empty = mutation(status="SURVIVED", detected="false", killingTest="", indexes="")
+        self_closed = mutation(status="SURVIVED", detected="false", indexes=None).replace(
+            "<killingTest>org.example.app.auth.TokenTest.[method:expiresAfterTheDeadline()]</killingTest>",
+            "<killingTest/>",
+        )
+        absent = mutation(
+            status="NO_COVERAGE",
+            detected="false",
+            mutatedMethod=None,
+            methodDescription=None,
+            indexes=None,
+            killingTest=None,
+            description=None,
+        )
+        self.assertIn("<killingTest/>", self_closed)
+        report = self.load(given, empty, self_closed, absent)
+        first, second, third, fourth = report.mutants
+        descriptor = "(Ljava/lang/String;I)J"
+        self.assertEqual(first.id, ("org.example.app.auth.Token", "expires", descriptor, 12, MATH, (7, 0, 19)))
+        self.assertEqual((first.meta["descriptor"], first.meta["indexes"]), (descriptor, (7, 0, 19)))
+        self.assertEqual(first.killing_tests, ["org.example.app.auth.TokenTest.[method:renews()]"])
+        for mutant in (second, third):
+            self.assertEqual((mutant.killing_tests, mutant.meta["indexes"], mutant.id[5]), ([], (), ()))
+        self.assertEqual(fourth.id, ("org.example.app.auth.Token", "", "", 12, MATH, ()))
+        self.assertEqual((fourth.meta["method"], fourth.meta["descriptor"], fourth.meta["indexes"]), ("", "", ()))
+        self.assertEqual((fourth.killing_tests, fourth.description), ([], ""))
+
+    def test_statuses_are_normalized_and_detected_is_read_as_given(self):
+        cases = (
+            ("KILLED", "true", "killed"),
+            ("SURVIVED", "false", "survived"),
+            ("NO_COVERAGE", "false", "no-coverage"),
+            ("TIMED_OUT", "true", "other"),
+            ("MEMORY_ERROR", "true", "other"),
+            ("RUN_ERROR", "false", "other"),
+            ("NON_VIABLE", "false", "other"),
+            ("killed", "false", "other"),
+            ("", "true", "other"),
+            (None, "false", "other"),
+        )
+        report = self.load(*(mutation(status=status, detected=detected) for status, detected, _ in cases))
+        for (status, detected, normalized), mutant in zip(cases, report.mutants, strict=True):
+            with self.subTest(status=status):
+                self.assertEqual(mutant.status_raw, status or "?")
+                self.assertEqual(mutant.status, normalized)
+                self.assertIs(mutant.detected, detected == "true")
+
+    def test_numbers_without_white_space_at_their_ends_and_at_the_bounds_of_a_long(self):
+        most = 2**63 - 1
+        report = self.load(
+            mutation(lineNumber=f" \t{most}\n", indexes="<index>\n  " + "0" * 5000 + "3 </index><index>0</index>")
+        )
+        [mutant] = report.mutants
+        self.assertEqual((mutant.line, mutant.meta["indexes"]), (most, (3, 0)))
+
+    def test_numbers_share_the_rule_of_the_jacoco_adapter(self):
+        self.assertIs(pit.long_number, jacoco.long_number)
+
+    def test_description_and_killing_test_are_kept_as_given(self):
+        tab, delete, accented = chr(9), chr(0x7F), chr(0xE9)
+        description = f"Replaced{tab}long subtraction{delete} with addition {accented}"
+        killing = f"org.example.app.auth.TokenTest.[method:{accented}{tab}renews()]"
+        [mutant] = self.load(mutation(description=description, killingTest=killing)).mutants
+        self.assertEqual((mutant.description, mutant.killing_tests), (description, [killing]))
+
+    def test_unread_attributes_and_elements_are_ignored(self):
+        more = "<blocks><block>x</block></blocks><succeedingTests/><succeedingTests/><index>x</index>"
+        broken = mutation(more=more).replace('numberOfTestsRun="3"', 'numberOfTestsRun="many"')
+        xml = mutations_xml(broken).replace('partial="false"', 'partial="maybe"')
+        path = self.write("build/reports/pit/mutations.xml", xml)
+        [mutant] = pit.load(path, self.resolver([MAIN], self.classified)).mutants
+        self.assertEqual(mutant.meta["indexes"], (4,))
+
+    def test_the_same_mutant_twice_is_two_mutants(self):
+        report = self.load(mutation(), mutation())
+        self.assertEqual(len(report.mutants), 2)
+        self.assertEqual(report.mutants[0], report.mutants[1])
+
+    def test_name_under_no_root_is_unresolved(self):
+        report = self.load(
+            mutation(mutatedClass="org.example.app.queue.Dispatcher", sourceFile="Dispatcher.java"),
+            mutation(),
+            mutation(mutatedClass="org.example.app.queue.Dispatcher", sourceFile="Dispatcher.java", lineNumber="40"),
+            mutation(mutatedClass="org.example.app.auth.Session", sourceFile="Session.java"),
+        )
+        self.assertEqual(report.unresolved, ["org/example/app/auth/Session.java", DISPATCHER])
+        self.assertEqual([mutant.file for mutant in report.mutants], [None, f"{MAIN}/{TOKEN}", None, None])
+        self.assertEqual(report.mutants[0].meta["report_name"], DISPATCHER)
+
+    def test_one_hit_outside_the_classified_set_is_the_file(self):
+        report = self.load(mutation(mutatedClass="org.example.app.codec.KeyParser", sourceFile="KeyParser.java"))
+        self.assertNotIn(f"{MAIN}/{PARSER}", self.classified)
+        self.assertEqual(report.mutants[0].file, f"{MAIN}/{PARSER}")
+        self.assertEqual(report.unresolved, [])
+
+    def test_name_in_another_case_is_unresolved(self):
+        report = self.load(mutation(sourceFile="token.java"))
+        self.assertEqual((report.mutants[0].file, report.unresolved), (None, ["org/example/app/auth/token.java"]))
+
+    def test_name_under_two_roots_is_a_config_error(self):
+        self.make(f"{EXTRA}/{TOKEN}")
+        with self.assertRaises(ConfigError) as caught:
+            self.load(mutation(), roots=[MAIN, EXTRA])
+        message = str(caught.exception)
+        for part in (TOKEN, f"{MAIN}/{TOKEN}", f"{EXTRA}/{TOKEN}"):
+            self.assertIn(part, message)
+
+    def test_two_names_found_as_one_file_is_a_config_error(self):
+        nested = f"{MAIN}/org"
+        inner = mutation(mutatedClass="example.app.auth.Token")
+        orders = ((mutation(), inner, (TOKEN, "example/app/auth/Token.java")), (inner, mutation(), None))
+        for first, second, names in orders:
+            with self.subTest(first=first[:80]):
+                with self.assertRaises(ConfigError) as caught:
+                    self.load(first, second, roots=[MAIN, nested])
+                message = str(caught.exception)
+                for part in (TOKEN, "example/app/auth/Token.java", f"{MAIN}/{TOKEN}"):
+                    self.assertIn(part, message)
+                if names is not None:
+                    self.assertIn(f"{names[0]} and {names[1]} are both {MAIN}/{TOKEN}", message)
+
+    def test_nested_class_and_secondary_type_belong_to_the_file_of_the_source(self):
+        report = self.load(
+            in_ledger("Engine"),
+            in_ledger("Engine$Cursor", lineNumber="31"),
+            in_ledger("Engine$Cursor$1", lineNumber="33"),
+            in_ledger("Journal", lineNumber="88"),
+        )
+        self.assertEqual([mutant.file for mutant in report.mutants], [f"{MAIN}/{ENGINE}"] * 4)
+        self.assertEqual({mutant.meta["report_name"] for mutant in report.mutants}, {ENGINE})
+        self.assertEqual(
+            [mutant.meta["class"] for mutant in report.mutants],
+            [f"{LEDGER}.Engine", f"{LEDGER}.Engine$Cursor", f"{LEDGER}.Engine$Cursor$1", f"{LEDGER}.Journal"],
+        )
+        self.assertEqual(report.unresolved, [])
+
+    def test_default_package(self):
+        report = self.load(
+            mutation(mutatedClass="Launcher", sourceFile="Launcher.java"),
+            mutation(mutatedClass="Launcher$Options", sourceFile="Launcher.java"),
+            mutation(mutatedClass="Banner", sourceFile="Banner.java"),
+        )
+        names = [mutant.meta["report_name"] for mutant in report.mutants]
+        self.assertEqual(names, ["Launcher.java"] * 2 + ["Banner.java"])
+        self.assertEqual([mutant.file for mutant in report.mutants], [f"{MAIN}/Launcher.java"] * 2 + [None])
+        self.assertEqual(report.unresolved, ["Banner.java"])
+
+    def test_unresolved_name_with_the_text_of_a_resolved_path(self):
+        # The second name is the path the first resolves to; under the root it is no file.
+        report = self.load(mutation(), mutation(mutatedClass="src.main.java.org.example.app.auth.Token"))
+        self.assertEqual(report.mutants[1].meta["report_name"], f"{MAIN}/{TOKEN}")
+        self.assertEqual([mutant.file for mutant in report.mutants], [f"{MAIN}/{TOKEN}", None])
+        self.assertEqual(report.unresolved, [f"{MAIN}/{TOKEN}"])
+
+
+class PitBrokenTest(AdapterCase):
+    def test_broken_inputs(self):
+        self.make(f"{MAIN}/{TOKEN}")
+        resolver = self.resolver([MAIN], [f"{MAIN}/{TOKEN}"])
+        delete, c1, tab = chr(0x7F), chr(0x85), chr(9)
+        cases = {
+            "not XML": ("<mutations><mutation", "not well-formed XML"),
+            "empty file": ("", "not well-formed XML"),
+            "unknown encoding": ('<?xml version="1.0" encoding="no-such-codec"?><mutations/>', "not well-formed XML"),
+            "empty root": ("<mutations/>", "has no mutations"),
+            "empty root with an attribute": ('<mutations partial="true">\n</mutations>', "has no mutations"),
+            "root without mutation elements": ("<mutations><mutant/></mutations>", "has no mutations"),
+            "another root": ('<report name="app"/>', "not a PIT report, the root element is <report>"),
+            "another root with mutation elements": (
+                f"<report>{mutation()}</report>",
+                "not a PIT report, the root element is <report>",
+            ),
+            "lineNumber x": (mutations_xml(mutation(lineNumber="x")), "<lineNumber> must be a non-negative integer"),
+            "lineNumber 1.5": (mutations_xml(mutation(lineNumber="1.5")), "<lineNumber>"),
+            "lineNumber +3": (mutations_xml(mutation(lineNumber="+3")), "<lineNumber>"),
+            "lineNumber 1_0": (mutations_xml(mutation(lineNumber="1_0")), "<lineNumber>"),
+            "lineNumber non-ASCII digit": (mutations_xml(mutation(lineNumber=chr(0x0663))), "<lineNumber>"),
+            "lineNumber -1": (mutations_xml(mutation(lineNumber="-1")), "<lineNumber> must be a non-negative integer"),
+            "lineNumber past a long": (mutations_xml(mutation(lineNumber=str(2**63))), "must be from 0 to"),
+            "lineNumber of 5000 digits": (mutations_xml(mutation(lineNumber="7" * 5000)), "must be from 0 to"),
+            "lineNumber of spaces": (mutations_xml(mutation(lineNumber="  ")), "<lineNumber>"),
+            "index x": (mutations_xml(mutation(indexes="<index>x</index>")), "<index>"),
+            "index -3": (mutations_xml(mutation(indexes="<index>1</index><index>-3</index>")), "<index>"),
+            "index past a long": (mutations_xml(mutation(indexes=f"<index>{2**63}</index>")), "must be from 0 to"),
+            "index of 4301 digits": (mutations_xml(mutation(indexes="<index>" + "9" * 4301 + "</index>")), "<index>"),
+            "index empty": (mutations_xml(mutation(indexes="<index/>")), "<index>"),
+            "index of spaces": (mutations_xml(mutation(indexes="<index> </index>")), "<index>"),
+            "detected yes": (mutations_xml(mutation(detected="yes")), "detected"),
+            "detected True": (mutations_xml(mutation(detected="True")), "detected"),
+            "detected with a space": (mutations_xml(mutation(detected="true ")), "detected"),
+            "detected empty": (mutations_xml(mutation(detected="")), "detected"),
+            "detected missing": (mutations_xml(mutation(detected=None)), "no attribute detected"),
+            "KILLED not detected": (mutations_xml(mutation(detected="false")), "contradicts"),
+            "SURVIVED detected": (mutations_xml(mutation(status="SURVIVED", detected="true")), "contradicts"),
+            "NO_COVERAGE detected": (mutations_xml(mutation(status="NO_COVERAGE", detected="true")), "contradicts"),
+            "status with a control character": (mutations_xml(mutation(status=f"KILLED{delete}")), "status"),
+            "status with a tab": (mutations_xml(mutation(status="KILLED&#9;")), "status"),
+            "mutator with a control character": (mutations_xml(mutation(mutator=MATH + c1)), "<mutator>"),
+            "mutatedMethod with a tab": (mutations_xml(mutation(mutatedMethod=f"exp{tab}ires")), "<mutatedMethod>"),
+            "methodDescription with a control character": (
+                mutations_xml(mutation(methodDescription=f"(J){delete}Z")),
+                "<methodDescription>",
+            ),
+            "mutator without a simple name": (mutations_xml(mutation(mutator="org.pitest.")), "no simple name"),
+            "mutator of dots": (mutations_xml(mutation(mutator="org.pitest..")), "no simple name"),
+            "mutatedClass empty segment": (
+                mutations_xml(mutation(mutatedClass="org.example..app.auth.Token")),
+                "empty segment",
+            ),
+            "mutatedClass leading dot": (
+                mutations_xml(mutation(mutatedClass=".org.example.app.auth.Token")),
+                "segment",
+            ),
+            "mutatedClass trailing dot": (mutations_xml(mutation(mutatedClass="org.example.app.auth.")), "segment"),
+            "mutatedClass with a slash": (
+                mutations_xml(mutation(mutatedClass="org.example/app.auth.Token")),
+                "segment",
+            ),
+            "mutatedClass with a backslash": (
+                mutations_xml(mutation(mutatedClass="org.example\\app.auth.Token")),
+                "segment",
+            ),
+            "mutatedClass with a colon": (
+                mutations_xml(mutation(mutatedClass="org.example:app.auth.Token")),
+                "segment",
+            ),
+            "mutatedClass with a control character": (
+                mutations_xml(mutation(mutatedClass=f"org.example{c1}.app.auth.Token")),
+                "segment",
+            ),
+            "sourceFile with a slash": (mutations_xml(mutation(sourceFile="auth/Token.java")), "<sourceFile>"),
+            "sourceFile with a backslash": (mutations_xml(mutation(sourceFile="auth\\Token.java")), "<sourceFile>"),
+            "sourceFile with a colon": (mutations_xml(mutation(sourceFile="Token.java:stream")), "<sourceFile>"),
+            "sourceFile dot": (mutations_xml(mutation(sourceFile=".")), "<sourceFile>"),
+            "sourceFile dotdot": (mutations_xml(mutation(sourceFile="..")), "<sourceFile>"),
+            "sourceFile with a control character": (
+                mutations_xml(mutation(sourceFile=f"Token{delete}.java")),
+                "<sourceFile>",
+            ),
+            "sourceFile NUL reference": (mutations_xml(mutation(sourceFile="Token&#0;.java")), "not well-formed XML"),
+        }
+        for tag in ("sourceFile", "mutatedClass", "mutator", "lineNumber"):
+            cases[f"{tag} missing"] = (mutations_xml(mutation(**{tag: None})), f"has no <{tag}>")
+            cases[f"{tag} empty"] = (mutations_xml(mutation(**{tag: ""})), f"has an empty <{tag}>")
+            cases[f"{tag} self-closed"] = (mutations_xml(mutation(**{tag: None}, more=f"<{tag}/>")), f"<{tag}>")
+        for tag, text in TOKEN_MUTATION.items():
+            if tag != "blocks":
+                more = f"<{tag}>{text}</{tag}>"
+                cases[f"{tag} twice"] = (mutations_xml(mutation(more=more)), f"has <{tag}> twice")
+        cases["second mutation broken"] = (mutations_xml(mutation(), mutation(lineNumber="x")), "mutation 2: ")
+        for case, (content, part) in cases.items():
+            with self.subTest(case):
+                path = self.write("build/reports/pit/mutations.xml", content)
+                with self.assertRaises(ReportError) as caught:
+                    pit.load(path, resolver)
+                self.assertIn(path.as_posix(), str(caught.exception))
+                self.assertIn(part, str(caught.exception))
+
+    def test_messages_have_the_texts_of_the_other_adapters(self):
+        (self.root / MAIN).mkdir(parents=True)
+        resolver = self.resolver([MAIN])
+        cases = (
+            ("<mutations/>", "build/mutations.xml has no mutations"),
+            (
+                mutations_xml(mutation(lineNumber="-1")),
+                "build/mutations.xml: mutation 1: <lineNumber> must be a non-negative integer, got '-1'",
+            ),
+            (
+                mutations_xml(mutation(indexes=f"<index>{2**63}</index>")),
+                f"build/mutations.xml: mutation 1: <index> must be from 0 to {2**63 - 1}",
+            ),
+            (
+                mutations_xml(mutation(status="SURVIVED")),
+                "build/mutations.xml: mutation 1: status SURVIVED contradicts detected=true",
+            ),
+        )
+        for content, message in cases:
+            with self.subTest(message):
+                path = self.write("build/mutations.xml", content)
+                with self.assertRaises(ReportError) as caught:
+                    pit.load(path, resolver, name="build/mutations.xml")
+                self.assertEqual(str(caught.exception), message)
+        path = self.write("build/mutations.xml", "<mutations")
+        with self.assertRaises(ReportError) as caught:
+            pit.load(path, resolver, name="build/mutations.xml")
+        self.assertTrue(str(caught.exception).startswith("build/mutations.xml: not well-formed XML: "))
+
+    def test_a_folder_instead_of_a_file(self):
+        folder = self.root / "build" / "mutations.xml"
+        folder.mkdir(parents=True)
+        (self.root / MAIN).mkdir(parents=True)
+        with self.assertRaises(ReportError) as caught:
+            pit.load(folder, self.resolver([MAIN]))
+        self.assertIn(f"{folder.as_posix()}: cannot read: ", str(caught.exception))
+
+    def test_given_name_replaces_the_path(self):
+        (self.root / MAIN).mkdir(parents=True)
+        path = self.write("build/reports/pit/mutations.xml", mutations_xml(mutation(sourceFile="..")))
+        with self.assertRaises(ReportError) as caught:
+            pit.load(path, self.resolver([MAIN]), name="build/reports/pit/mutations.xml")
+        self.assertNamedOnly(str(caught.exception), "build/reports/pit/mutations.xml")
 
 
 def suite_xml(name: str, timestamp: str | None, time: str | None = "1.5") -> str:
