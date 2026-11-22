@@ -3,7 +3,10 @@
 Every path is synthetic. A Windows drive path is built at run time.
 """
 
+import contextlib
 import copy
+import io
+import json
 import math
 import os
 import sys
@@ -13,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from muster import globs
+from muster import cli, globs
 from muster.config import (
     FILE_KEYS,
     Config,
@@ -464,6 +467,143 @@ class RequiredEntryKeyTest(ValidateCase):
                 self.assertEqual(self.error(data), message)
 
 
+def languages_doc(*entries: dict) -> dict:
+    return {"language": list(entries)}
+
+
+PYTHON = {"name": "python", "extensions": [".py"], "line_comment": "#"}
+
+
+class LanguageEntryTest(ValidateCase):
+    def test_refusals_name_the_key(self):
+        cases = [
+            ({"name": ""}, "language[0].name: must not be empty"),
+            ({"name": "", "extensions": [".py"]}, "language[0].name: must not be empty"),
+            ({"name": "python"}, "language[0]: missing key extensions; a new language needs at least one"),
+            ({"name": "python", "extensions": []}, "language[0].extensions: must not be empty for a new language"),
+            ({"name": "python", "extensions": ["py"]}, 'language[0].extensions[0]: must start with ., got "py"'),
+            ({"name": "python", "extensions": [".py", ""]}, 'language[0].extensions[1]: must start with ., got ""'),
+            (
+                {"name": "python", "extensions": [".tools/py"]},
+                'language[0].extensions[0]: must not contain / or \\, got ".tools/py"',
+            ),
+            (
+                {"name": "python", "extensions": [".py\\x"]},
+                'language[0].extensions[0]: must not contain / or \\, got ".py\\\\x"',
+            ),
+            (
+                {"name": "python", "extensions": ["."]},
+                'language[0].extensions[0]: must have a character after the ., got "."',
+            ),
+            (
+                {"name": "python", "extensions": [".py", ".pyi", ".py"]},
+                'language[0].extensions[2]: ".py" is already language[0].extensions[0]',
+            ),
+            (
+                {"name": "java", "extensions": [".java", ".java"]},
+                'language[0].extensions[1]: ".java" is already language[0].extensions[0]',
+            ),
+            (
+                {"name": "javalike", "extensions": [".jl", ".java"]},
+                'language[0].extensions[1]: ".java" is already an extension of the built-in language java',
+            ),
+            ({**PYTHON, "line_comment": ""}, "language[0].line_comment: must not be empty"),
+            ({**PYTHON, "block_comment": ["", "*/"]}, "language[0].block_comment[0]: must not be empty"),
+            ({**PYTHON, "block_comment": ['"""', ""]}, "language[0].block_comment[1]: must not be empty"),
+            (
+                {"name": "java", "line_comment": "#"},
+                'language[0].line_comment: must be "//" on the built-in language java, or left out',
+            ),
+            ({"name": "java", "line_comment": ""}, "language[0].line_comment: must not be empty"),
+            (
+                {"name": "java", "block_comment": ["/*", "*)"]},
+                'language[0].block_comment: must be ["/*", "*/"] on the built-in language java, or left out',
+            ),
+            (
+                {"name": "java", "block_comment": ["*/", "/*"]},
+                'language[0].block_comment: must be ["/*", "*/"] on the built-in language java, or left out',
+            ),
+        ]
+        for entry, message in cases:
+            with self.subTest(entry=entry):
+                self.assertEqual(self.error(languages_doc(entry)), message)
+
+    def test_refusals_across_entries(self):
+        cases = [
+            ((PYTHON, PYTHON), 'language[1].name: "python" is already the name of language[0]'),
+            (
+                ({"name": "java"}, PYTHON, {"name": "java"}),
+                'language[2].name: "java" is already the name of language[0]',
+            ),
+            (
+                (PYTHON, {"name": "scripts", "extensions": [".sh", ".py"]}),
+                'language[1].extensions[1]: ".py" is already an extension of language[0]',
+            ),
+            (
+                (PYTHON, {"name": "java", "extensions": [".py"]}),
+                'language[1].extensions[0]: ".py" is already an extension of language[0]',
+            ),
+            (
+                ({"name": "java", "extensions": [".jav"]}, {"name": "old", "extensions": [".jav"]}),
+                'language[1].extensions[0]: ".jav" is already an extension of language[0]',
+            ),
+        ]
+        for entries, message in cases:
+            with self.subTest(message=message):
+                self.assertEqual(self.error(languages_doc(*entries)), message)
+
+    def test_accepted_entries(self):
+        accepted_docs = [
+            tomllib.loads(EXAMPLE),
+            languages_doc({"name": "java"}),
+            languages_doc(
+                {"name": "java", "extensions": [".java"], "line_comment": "//", "block_comment": ["/*", "*/"]}
+            ),
+            languages_doc({"name": "java", "extensions": [".jav", ".java"]}, PYTHON),
+            languages_doc(
+                {"name": "typescript", "extensions": [".ts"], "line_comment": "//", "block_comment": ["/*", "*/"]},
+                {"name": "declarations", "extensions": [".d.ts"]},
+            ),
+            languages_doc({"name": "Java", "extensions": [".jav"]}),  # names are case-sensitive
+            languages_doc({"name": "upper", "extensions": [".PY"]}, PYTHON),  # extensions too
+            languages_doc({"name": "docs", "extensions": [".py.txt"]}, PYTHON),
+        ]
+        for data in accepted_docs:
+            with self.subTest(data=data.get("language")):
+                validate(data)
+
+    def test_profile_languages(self):
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), languages_doc({"name": "java"}, PYTHON))
+        found = [(lang.name, lang.extensions) for lang in cfg.languages]
+        self.assertEqual(found, [("java", (".java",)), ("python", (".py",))])
+
+
+class LanguageEntryCommandTest(unittest.TestCase):
+    """Every command reads the profile through the same check: a bad [[language]] entry makes
+    even the policy command, which counts no lines, exit 2."""
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ))
+        for key in [key for key in os.environ if key.startswith("GIT_") or key == "GITHUB_STEP_SUMMARY"]:
+            del os.environ[key]
+        os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.root)
+
+    def test_policy_exits_two(self):
+        profile = ["[[language]]", 'name = "python"', 'extensions = [".py"]']
+        profile += ["[[language]]", 'name = "java"', 'line_comment = "#"']
+        (self.root / "muster.toml").write_bytes("".join(line + "\n" for line in profile).encode("ascii"))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["--repo", str(self.root), "policy", "--format", "json"])
+        envelope = json.loads(out.getvalue())
+        message = 'muster.toml: language[1].line_comment: must be "//" on the built-in language java, or left out'
+        self.assertEqual((code, envelope["exit_code"]), (2, 2))
+        self.assertEqual(envelope["error"], {"kind": "config", "message": message})
+
+
 class PathTest(ValidateCase):
     BAD = [
         ("/work/src", "starts with /"),
@@ -807,6 +947,13 @@ class ConfigAccessTest(unittest.TestCase):
         self.assertEqual(cfg.mutation_targets, "policy/mutation.txt")
         self.assertEqual(cfg.own_test, "{stem}Test{ext}")
         self.assertEqual(cfg.own_test_forbidden, ["*IntegrationTest*"])
+
+    def test_loc_keys(self):
+        self.assertEqual((self.config({}).loc_exclude, self.config({}).loc_test_support), ([], []))
+        cfg = self.config(tomllib.loads(EXAMPLE))
+        self.assertEqual(cfg.loc_exclude, [])
+        self.assertEqual(cfg.loc_test_support, ["app/src/test/java/org/example/app/support/**", "**/*Fixture*.java"])
+        self.assertEqual([lang.name for lang in cfg.languages], ["java"])
 
     def test_get(self):
         cfg = self.config({"zones": {"base": ""}})

@@ -1,6 +1,6 @@
 """Git helpers: running git, finding the repository and the merge base, reading git output, and
-the changes since a base: the added lines of a diff, the untracked files and the line count of a
-file."""
+the changes since a base: the added lines of a diff, the added and deleted line counts of each file,
+the untracked files and the line count of a file."""
 
 from __future__ import annotations
 
@@ -182,3 +182,41 @@ def untracked_under(repo: Path, folders: list[str]) -> list[str]:
     except OSError as exc:
         raise ReportError(f"git ls-files could not run: {exc.strerror or exc}") from exc
     return sorted({path for path in out.split("\0") if path})
+
+
+def numstat_since(repo: Path, commit: str, folders: list[str]) -> list[tuple[int | None, int | None, str]]:
+    """(added, deleted, path) of every file changed from `commit` to the work tree under `folders`,
+    in git's order, run in `repo` with paths relative to it (`--relative`). A count is None where
+    git shows `-`, for a file it takes as binary (binary_counts_since() counts its lines). A rename
+    is a deletion and an addition (`--no-renames`). Every folder is a literal pathspec."""
+    try:
+        out = _literal_git(
+            repo, "-c", "core.quotePath=false", "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff",
+            "--no-textconv", "--relative", commit, "--", *folders,
+        )  # fmt: skip
+    except OSError as exc:
+        raise ReportError(f"git diff could not run: {exc.strerror or exc}") from exc
+    changes: list[tuple[int | None, int | None, str]] = []
+    for record in out.split("\0"):
+        if record:
+            added, deleted, path = record.split("\t", 2)
+            changes.append((None if added == "-" else int(added), None if deleted == "-" else int(deleted), path))
+    return changes
+
+
+def binary_counts_since(repo: Path, commit: str, path: str) -> tuple[int, int]:
+    """(added, deleted) lines of the one file `path` that git takes as binary, from `commit` to the
+    work tree: the sums of the counts of the hunk headers of its patch with `--text` (a count that
+    a header leaves out is 1). `--numstat` shows `-` for such a file even with `--text`. `path` is
+    relative to `repo` and a literal pathspec."""
+    try:
+        out = _literal_git(repo, *DIFF_ARGS, "--relative", commit, "--", path)
+    except OSError as exc:
+        raise ReportError(f"git diff could not run: {exc.strerror or exc}") from exc
+    added = deleted = 0
+    for line in records(out):
+        match = HUNK_RE.match(line)
+        if match:
+            deleted += 1 if match.group(2) is None else int(match.group(2))
+            added += 1 if match.group(4) is None else int(match.group(4))
+    return added, deleted

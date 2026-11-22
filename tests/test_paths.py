@@ -15,7 +15,10 @@ from muster.config import Config, ConfigError
 from muster.paths import (
     _is_junction,
     exists_exact,
+    group_of,
+    in_loc_set,
     is_link,
+    loc_set,
     normalize,
     present_exact,
     resolve_glob,
@@ -283,6 +286,142 @@ class WalkedFilesTest(TreeCase):
         self.assertEqual(sets.sources, ["src/main.py"])
         self.assertEqual(sets.walked_sources, ["src/gen/schema.py", "src/main.py", "src/notes.txt"])
         self.assertEqual(sets.walked_tests, ["tests/data.json", "tests/test_main.py"])
+
+
+MAIN = "src/main/java/org/example/app"
+TESTS = "src/test/java/org/example/app"
+
+
+class LocSetTest(TreeCase):
+    def loc_config(self, loc: dict | None = None, **source) -> Config:
+        data = {"source": source} if loc is None else {"source": source, "loc": loc}
+        return Config(self.root, self.root / "muster.toml", data)
+
+    def setUp(self):
+        super().setUp()
+        self.make(
+            f"{MAIN}/auth/Token.java",
+            f"{MAIN}/auth/package-info.java",
+            f"{MAIN}/gen/Schema.java",
+            f"{MAIN}/legacy/OldToken.java",
+            f"{MAIN}/notes.txt",
+            f"{TESTS}/auth/TokenTest.java",
+            f"{TESTS}/gen/SchemaTest.java",
+            f"{TESTS}/legacy/OldTokenTest.java",
+            f"{TESTS}/fixtures/data.json",
+            "build/generated/Other.java",
+        )
+        self.cfg = self.loc_config(
+            {"exclude": ["**/legacy/**"]},
+            roots=["src/main/java"],
+            tests=["src/test/java"],
+            include=["**/*.java"],
+            exclude=["**/package-info.java"],
+            generated=["**/gen/**"],
+        )
+
+    def test_roots_and_tests_are_walked(self):
+        found = loc_set(self.cfg)
+        expected = [f"{MAIN}/auth/Token.java", f"{MAIN}/auth/package-info.java", f"{TESTS}/auth/TokenTest.java"]
+        self.assertEqual(found.files, expected)  # source.exclude does not apply; generated and loc.exclude do
+        walked = [
+            f"{MAIN}/auth/Token.java",
+            f"{MAIN}/auth/package-info.java",
+            f"{MAIN}/gen/Schema.java",
+            f"{MAIN}/legacy/OldToken.java",
+            f"{MAIN}/notes.txt",
+            f"{TESTS}/auth/TokenTest.java",
+            f"{TESTS}/fixtures/data.json",
+            f"{TESTS}/gen/SchemaTest.java",
+            f"{TESTS}/legacy/OldTokenTest.java",
+        ]
+        self.assertEqual(found.walked, walked)
+        self.assertIsNone(found.error)
+
+    def test_tests_folder_nested_under_a_root_is_listed_once(self):
+        cfg = self.loc_config(roots=["src"], tests=["src/test/java"], include=["**/*.java"])
+        found = loc_set(cfg)
+        self.assertEqual(len(found.files), len(set(found.files)))
+        self.assertIn(f"{TESTS}/auth/TokenTest.java", found.files)
+        self.assertEqual(found.walked, sorted(set(found.walked)))
+
+    def test_globs_are_case_sensitive(self):
+        self.make(f"{MAIN}/auth/Upper.JAVA")
+        self.assertNotIn(f"{MAIN}/auth/Upper.JAVA", loc_set(self.cfg).files)
+
+    def test_missing_folder(self):
+        cfg = self.loc_config(roots=["src/main/java"], tests=["src/test/kotlin"], include=["**/*.java"])
+        with self.assertRaises(ConfigError) as caught:
+            loc_set(cfg)
+        self.assertEqual(str(caught.exception), "source.tests[0]: folder src/test/kotlin does not exist")
+        deferred = loc_set(cfg, defer=True)
+        self.assertEqual(str(deferred.error), "source.tests[0]: folder src/test/kotlin does not exist")
+        self.assertEqual(deferred.files[0], f"{MAIN}/auth/Token.java")
+
+    def test_predicate_on_a_path_alone(self):
+        cases = {
+            f"{MAIN}/auth/Gone.java": True,
+            f"{MAIN}/auth/package-info.java": True,
+            f"{TESTS}/auth/GoneTest.java": True,
+            f"{MAIN}/gen/Gone.java": False,
+            f"{TESTS}/legacy/GoneTest.java": False,
+            f"{MAIN}/auth/gone.txt": False,
+            "build/generated/Other.java": False,
+            "src/main/javax/Gone.java": False,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertIs(in_loc_set(self.cfg, path), expected)
+        self.assertFalse((self.root / MAIN / "auth" / "Gone.java").exists())
+        for path in loc_set(self.cfg).files:
+            self.assertTrue(in_loc_set(self.cfg, path))
+
+
+class GroupOfTest(TreeCase):
+    def group_config(self, roots: list[str], tests: list[str], support: list[str] | None = None) -> Config:
+        data = {"source": {"roots": roots, "tests": tests, "include": ["**/*.java"]}}
+        if support is not None:
+            data["loc"] = {"test_support": support}
+        return Config(Path("/work/repo"), Path("/work/repo/muster.toml"), data)
+
+    def test_main_test_and_test_support(self):
+        cfg = self.group_config(["src/main/java"], ["src/test/java"], [f"{TESTS}/support/**", "**/*Fixture*.java"])
+        cases = {
+            f"{MAIN}/auth/Token.java": "main",
+            f"{TESTS}/auth/TokenTest.java": "test",
+            f"{TESTS}/support/Clock.java": "test-support",
+            f"{TESTS}/auth/TokenFixture.java": "test-support",
+            "build/generated/Other.java": None,
+            "src/main/javax/Token.java": None,
+        }
+        for path, group in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(group_of(cfg, path), group)
+
+    def test_tests_folder_nested_under_a_root(self):
+        cfg = self.group_config(["src"], ["src/test/java"], ["**/support/**"])
+        self.assertEqual(group_of(cfg, "src/main/java/org/example/app/Token.java"), "main")
+        self.assertEqual(group_of(cfg, "src/test/kotlin/org/example/app/TokenTest.java"), "main")
+        self.assertEqual(group_of(cfg, f"{TESTS}/TokenTest.java"), "test")
+        self.assertEqual(group_of(cfg, f"{TESTS}/support/Clock.java"), "test-support")
+
+    def test_test_support_glob_under_a_root_is_main(self):
+        cfg = self.group_config(["src/main/java"], ["src/test/java"], ["**/*Fixture*.java", "src/main/java/**"])
+        self.assertEqual(group_of(cfg, f"{MAIN}/auth/TokenFixture.java"), "main")
+
+    def test_root_nested_under_a_tests_folder(self):
+        cfg = self.group_config(["tests/fixtures/app"], ["tests"], ["tests/**"])
+        self.assertEqual(group_of(cfg, "tests/fixtures/app/Token.java"), "main")
+        self.assertEqual(group_of(cfg, "tests/fixtures/Clock.java"), "test-support")
+
+    def test_folder_in_both_lists_is_a_root(self):
+        cfg = self.group_config(["src/java"], ["src/java"], ["**"])
+        self.assertEqual(group_of(cfg, "src/java/org/example/app/Token.java"), "main")
+
+    def test_repository_root_as_a_folder(self):
+        cfg = self.group_config(["."], ["tests"])
+        self.assertEqual(group_of(cfg, "tools/Build.java"), "main")
+        self.assertEqual(group_of(cfg, "tests/BuildTest.java"), "test")
 
 
 class ExistsExactTest(TreeCase):

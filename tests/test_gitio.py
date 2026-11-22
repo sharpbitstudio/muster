@@ -15,11 +15,13 @@ from pathlib import Path
 from unittest import mock
 
 from muster.gitio import (
+    binary_counts_since,
     count_file_lines,
     diff_since,
     find_repo_root,
     git,
     merge_base,
+    numstat_since,
     parse_diff,
     records,
     ref_problem,
@@ -530,6 +532,121 @@ class PathspecVariableTest(ChangesRepoCase):
                 self.assertEqual(found, [GLOB_FOLDER + "/Session.java"])
 
 
+MOVED_CHECK = "src/main/java/org/example/app/auth/TokenCheck.java"
+
+
+class NumstatSinceTest(ChangesRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+
+    def test_added_modified_and_deleted_files(self):
+        self.write(self.repo, ENGINE, "one\ntwo\nthree\n")
+        self.write(self.repo, TOKEN, "one\ntwo\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(self.repo, ENGINE, "one\nedited\nthree\nfour\nfive\n")
+        (self.repo / TOKEN).unlink()
+        self.write(self.repo, KEY_PARSER, "one\ntwo\nthree\n")
+        self.run_git(self.repo, "add", "-N", KEY_PARSER)
+        found = sorted(numstat_since(self.repo, base, ["src/main/java"]), key=lambda change: change[2])
+        self.assertEqual(found, [(0, 2, TOKEN), (3, 1, ENGINE), (3, 0, KEY_PARSER)])
+
+    def test_rename_across_folders_is_a_deletion_and_an_addition(self):
+        self.write(self.repo, TOKEN_CHECK, "one\ntwo\nthree\nfour\n")
+        base = self.commit_all(self.repo, "base")
+        (self.repo / MOVED_CHECK).parent.mkdir(parents=True)
+        self.run_git(self.repo, "mv", TOKEN_CHECK, MOVED_CHECK)
+        self.run_git(self.repo, "config", "--local", "diff.renames", "true")
+        found = numstat_since(self.repo, base, ["src/main/java", "src/test/java"])
+        self.assertEqual(sorted(found, key=lambda change: change[2]), [(4, 0, MOVED_CHECK), (0, 4, TOKEN_CHECK)])
+
+    def test_binary_file_has_no_counts(self):
+        self.write(self.repo, DISPATCHER, "one\n")
+        base = self.commit_all(self.repo, "base")
+        (self.repo / DISPATCHER).write_bytes(b"one\n\0two\n")
+        self.assertEqual(numstat_since(self.repo, base, ["src/main/java"]), [(None, None, DISPATCHER)])
+
+    def test_paths_relative_to_profile_root_in_subfolder(self):
+        profile_root = self.repo / "app"
+        self.write(profile_root, ENGINE, "one\n")
+        self.write(self.repo, DISPATCHER, "one\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(profile_root, ENGINE, "edited\n")
+        self.write(self.repo, DISPATCHER, "edited\n")
+        self.assertEqual(numstat_since(profile_root, base, ["src/main/java"]), [(1, 1, ENGINE)])
+
+    def test_glob_characters_in_folder_match_literally(self):
+        for path in (GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "one\n")
+        base = self.commit_all(self.repo, "base")
+        for path in (GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "edited\nmore\n")
+        self.assertEqual(numstat_since(self.repo, base, [GLOB_FOLDER]), [(2, 1, GLOB_FOLDER_FILE)])
+
+    def test_path_with_non_ascii_characters_or_a_tab(self):
+        name = "src/main/java/org/example/app/codec/Key" + chr(0x00E9) + chr(0x4E2D) + "Parser.java"
+        self.write(self.repo, ENGINE, "one\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(self.repo, name, "one\n")
+        self.run_git(self.repo, "add", "-N", "--", name)
+        self.assertEqual(numstat_since(self.repo, base, ["src/main/java"]), [(1, 0, name)])
+        tabbed = "src/main/java/org/example/app/codec/Key" + chr(9) + "Parser.java"
+        try:
+            self.write(self.repo, tabbed, "one\ntwo\n")
+        except OSError:
+            self.skipTest("the file system takes no tab in a file name")
+        self.run_git(self.repo, "add", "-N", "--", tabbed)
+        self.assertEqual(sorted(numstat_since(self.repo, base, ["src/main/java"])), [(1, 0, name), (2, 0, tabbed)])
+
+    def test_pathspec_variables_change_nothing(self):
+        for path in (ENGINE, GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "one\n")
+        base = self.commit_all(self.repo, "base")
+        for path in (ENGINE, GLOB_FOLDER_FILE, *GLOB_SIBLINGS):
+            self.write(self.repo, path, "edited\n")
+        for variable in PathspecVariableTest.VARIABLES:
+            with self.subTest(variable=variable), mock.patch.dict(os.environ, {variable: "1"}):
+                self.assertEqual(numstat_since(self.repo, base, [GLOB_FOLDER]), [(1, 1, GLOB_FOLDER_FILE)])
+                self.assertIn((1, 1, ENGINE), numstat_since(self.repo, base, ["src/main/java"]))
+
+
+class BinaryCountsSinceTest(ChangesRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+
+    def test_file_marked_as_no_diff(self):
+        self.write(self.repo, "src/main/java/.gitattributes", "*.java -diff\n")
+        self.write(self.repo, ENGINE, "one\ntwo\nthree\nfour\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(self.repo, ENGINE, "one\nedited\nthree\nfour\nfive\nsix\n")
+        self.assertEqual(numstat_since(self.repo, base, ["src/main/java"]), [(None, None, ENGINE)])
+        self.assertEqual(binary_counts_since(self.repo, base, ENGINE), (3, 1))
+
+    def test_file_with_a_nul_byte(self):
+        self.write(self.repo, TOKEN, "one\ntwo\nthree\n")
+        base = self.commit_all(self.repo, "base")
+        (self.repo / TOKEN).write_bytes(b"one\nt\0wo\n")
+        self.assertEqual(binary_counts_since(self.repo, base, TOKEN), (1, 2))
+
+    def test_deleted_file(self):
+        self.write(self.repo, TOKEN, "one\0\ntwo\nthree\n")
+        base = self.commit_all(self.repo, "base")
+        (self.repo / TOKEN).unlink()
+        self.assertEqual(binary_counts_since(self.repo, base, TOKEN), (0, 3))
+
+    def test_path_is_literal_and_relative_to_profile_root(self):
+        profile_root = self.repo / "app"
+        self.write(profile_root, GLOB_FOLDER_FILE, "one\0\n")
+        self.write(profile_root, "src/main/java/org/example/app/ac/Token.java", "one\0\n")
+        base = self.commit_all(self.repo, "base")
+        self.write(profile_root, GLOB_FOLDER_FILE, "one\0\ntwo\n")
+        self.write(profile_root, "src/main/java/org/example/app/ac/Token.java", "edited\0\nmore\nlines\n")
+        self.assertEqual(binary_counts_since(profile_root, base, GLOB_FOLDER_FILE), (1, 0))
+        with mock.patch.dict(os.environ, {"GIT_GLOB_PATHSPECS": "1"}):
+            self.assertEqual(binary_counts_since(profile_root, base, GLOB_FOLDER_FILE), (1, 0))
+
+
 class GitNotRunnableTest(GitRepoCase):
     def test_os_error_becomes_report_error(self):
         calls = {
@@ -552,6 +669,18 @@ class GitNotRunnableTest(GitRepoCase):
                 with self.assertRaises(ReportError) as caught:
                     call()
                 self.assertEqual(str(caught.exception), f"{name} could not run: synthetic reason")
+
+    def test_line_count_helpers_give_the_reason_of_the_os_error(self):
+        calls = {
+            "numstat_since": lambda: numstat_since(self.root, "HEAD", ["src/main/java"]),
+            "binary_counts_since": lambda: binary_counts_since(self.root, "HEAD", ENGINE),
+        }
+        error = FileNotFoundError(2, "synthetic reason")
+        for name, call in calls.items():
+            with self.subTest(helper=name), mock.patch("muster.gitio.subprocess.run", side_effect=error):
+                with self.assertRaises(ReportError) as caught:
+                    call()
+                self.assertEqual(str(caught.exception), "git diff could not run: synthetic reason")
 
     def test_missing_folder_becomes_report_error(self):
         gone = self.root / "gone"
