@@ -6,6 +6,7 @@ Every run happens in temporary folders, with git's global and system configurati
 repository is on branch `feature`, cut from `main` with nothing committed since.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -17,9 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-from muster import cli, gitio, policy
-from muster.config import Config
-from muster.report import ReportError
+from muster import cli, gitio, loc, policy
+from muster.config import Config, load
+from muster.report import Report, ReportError
 
 IDENTITY = (
     "-c", "user.name=Test",
@@ -248,6 +249,14 @@ class CountTest(LocCase):
         self.assertEqual(outcome.counts()["main"], (2, 12))
         self.assertEqual(outcome.data["uncounted"], {})
 
+    def test_run_walks_the_set_itself_without_the_walk_of_the_command_line(self):
+        self.write(f"{MAIN}/gen/Schema.java", java_lines(5))
+        self.write(CLOCK, java_lines(4))
+        rep = Report("loc", strict=False, fail_on_error=False)
+        loc.run(argparse.Namespace(base=None), load(self.repo), rep)
+        self.assertEqual(rep.data["groups"], self.quiet().data["groups"])
+        self.assertEqual(rep.data["groups"]["test-support"], {"files": 1, "loc": 4})
+
 
 class GroupTest(LocCase):
     def test_main_test_and_test_support(self):
@@ -364,11 +373,11 @@ class ChangeSplitTest(LocCase):
         self.assertEqual(outcome.data["change"], None)
         self.assertIn(f"LOC change split not computed: {CLOCK}: cannot read: Permission denied\n", outcome.summary)
 
-    def link(self, target: str, path: str) -> None:
-        """A symbolic link at `path` to `target`, relative to the link's folder."""
+    def link(self, target: str, path: str, folder: bool = False) -> None:
+        """A symbolic link at `path` to `target` (a folder with `folder`), relative to the link's folder."""
         (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.symlink(target, self.repo / path)
+            os.symlink(target, self.repo / path, target_is_directory=folder)
         except (OSError, NotImplementedError):
             self.skipTest("cannot create a symbolic link here")
 
@@ -378,6 +387,37 @@ class ChangeSplitTest(LocCase):
         outcome = self.quiet("--base", "main")
         self.assertEqual(outcome.data["change"], {"main": [0, 0], "test": [0, 0], "test-support": [2, 0]})
         self.assertEqual(outcome.counts()["main"], (2, 13))
+
+    def test_untracked_link_to_a_folder_adds_nothing(self):
+        self.write(f"{MAIN}/assets/readme.txt", "a\nb\n")
+        self.link("assets", f"{MAIN}/Linked.java", folder=True)
+        self.write(CLOCK, java_lines(2))  # untracked
+        outcome = self.quiet("--base", "main")
+        self.assertEqual(outcome.data["change"], {"main": [0, 0], "test": [0, 0], "test-support": [2, 0]})
+        self.assertEqual(outcome.counts()["main"], (2, 13))
+
+    def test_ignored_file_is_in_the_table_and_not_in_the_split(self):
+        self.write(".gitignore", "Ignored.java\n")
+        self.write(f"{MAIN}/Ignored.java", java_lines(5))
+        self.write(CLOCK, java_lines(2))  # untracked
+        outcome = self.quiet("--base", "main")
+        self.assertEqual(outcome.counts()["main"], (3, 18))
+        self.assertEqual(outcome.data["change"], {"main": [0, 0], "test": [0, 0], "test-support": [2, 0]})
+
+    def test_input_error_keeps_the_split_and_the_ratio(self):
+        self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.java", "**/*.txt"]\n'))
+        self.edit(ENGINE, {3: "    int changed;", 4: "    int again;"})
+        error = f".txt: 1 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/notes.txt)"
+        for options, violation in ((["--strict"], True), (["--fail-on-error"], False)):
+            with self.subTest(options=options):
+                outcome = self.loc("--base", "main", *options)
+                self.assertEqual(outcome.code, 1, outcome.out + outcome.err)
+                self.assertEqual((outcome.section["verdict"], outcome.section["errors"]), ("error", [error]))
+                self.assertEqual(outcome.section["violation"], violation)
+                self.assertEqual(outcome.data["change"], {"main": [2, 2], "test": [0, 0], "test-support": [0, 0]})
+                self.assertIn("| main | 2 | 2 |\n", outcome.summary)
+                self.assertIn("test/main 0.46; (test + test-support)/main 0.46.\n", outcome.summary)
+                self.assertEqual(outcome.data["test_ratio"], 6 / 13)
 
     def test_link_replaced_by_a_binary_file_counts_once(self):
         self.link("Engine.java", f"{MAIN}/Shape.java")
@@ -492,8 +532,30 @@ class ProfileTest(LocCase):
         message = "muster.toml: source.tests[0]: folder src/test/kotlin does not exist"
         self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": message}))
 
+    def test_set_without_a_main_file_is_a_config_error(self):
+        message = (
+            "muster.toml: no file under source.roots is in the LOC set"
+            " (source.include minus source.generated and [loc].exclude)"
+        )
+        typo = PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.jav"]\n')
+        every_main_file = PROFILE + 'exclude = ["src/main/**"]\n'  # in [loc]; the test files stay
+        for profile in (typo, every_main_file):
+            with self.subTest(profile=profile):
+                self.write("muster.toml", profile)
+                code, env = self.json_main("loc")
+                self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": message}))
+
+    def test_main_files_without_a_language_are_an_input_error(self):
+        self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.txt", "**/*Test.java"]\n'))
+        self.write(f"{MAIN}/notes.txt", "a\n")
+        outcome = self.loc()
+        self.assertEqual((outcome.code, outcome.env["error"]), (0, None))
+        error = f".txt: 1 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/notes.txt)"
+        self.assertEqual(outcome.section["errors"], [error])
+        self.assertEqual(outcome.counts(), {"main": (0, 0), "test": (1, 2), "test-support": (0, 0)})
+
     def test_option_shaped_base_is_a_usage_error(self):
-        for argv in (["--base=-x"], ["--base="], ["--base", "-x"]):
+        for argv in (["--base=-x"], ["--base="], ["--base", "-x"], ["--base", "main" + chr(0)]):
             with self.subTest(argv=argv):
                 code, env = self.json_main("loc", *argv)
                 self.assertEqual((code, env["error"]["kind"], env["base"]), (2, "usage", None))
