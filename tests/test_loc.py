@@ -485,6 +485,21 @@ class InputErrorTest(LocCase):
         self.assertEqual(outcome.data["uncounted"], {"(no extension)": 3, ".gz": 1, ".txt": 2})
         self.assertEqual(outcome.counts(), {"main": (1, 10), "test": (1, 2), "test-support": (0, 0)})
 
+    def test_name_that_is_exactly_an_extension_has_no_extension(self):
+        languages = '\n[[language]]\nname = "script"\nextensions = [".ts"]\nline_comment = "//"\n'
+        languages += '\n[[language]]\nname = "declarations"\nextensions = [".d.ts"]\n'
+        include = 'include = ["**/*.java", "**/*.ts", "**/.d.ts", "**/.ts"]\n'
+        self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, include) + languages)
+        self.write(f"{MAIN}/.d.ts", "let a;\n")
+        self.write(f"{MAIN}/.ts", "let b;\n")
+        self.write(f"{MAIN}/api.d.ts", "let c;\n")
+        self.write(f"{TESTS}/.java", "int a;\n")
+        outcome = self.assert_errored(
+            [f"(no extension): 3 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/.d.ts)"]
+        )
+        self.assertEqual(outcome.data["uncounted"], {"(no extension)": 3})
+        self.assertEqual(outcome.counts(), {"main": (2, 11), "test": (1, 2), "test-support": (0, 0)})
+
     def test_file_that_cannot_be_read_by_the_counter(self):
         denied = PermissionError(13, "Permission denied")
         with mock.patch("muster.lang.open", side_effect=denied, create=True):
@@ -533,17 +548,21 @@ class ProfileTest(LocCase):
         self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": message}))
 
     def test_set_without_a_main_file_is_a_config_error(self):
-        message = (
-            "muster.toml: no file under source.roots is in the LOC set"
-            " (source.include minus source.generated and [loc].exclude)"
-        )
         typo = PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.jav"]\n')
         every_main_file = PROFILE + 'exclude = ["src/main/**"]\n'  # in [loc]; the test files stay
-        for profile in (typo, every_main_file):
+        # The tests folder nested under the root: its files are under source.roots, but not main.
+        nested = PROFILE.replace(ROOTS_LINE, 'roots = ["src"]\n')
+        only_tests = nested.replace(INCLUDE_LINE, 'include = ["**/*Test.java"]\n')
+        for profile in (typo, every_main_file, nested + 'exclude = ["src/main/**"]\n', only_tests):
             with self.subTest(profile=profile):
                 self.write("muster.toml", profile)
                 code, env = self.json_main("loc")
-                self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": message}))
+                self.assertEqual((code, env["error"]), (2, {"kind": "config", "message": self.NO_MAIN_FILE}))
+
+    NO_MAIN_FILE = (
+        "muster.toml: no main file is in the LOC set"
+        " (source.include minus source.generated and [loc].exclude, under source.roots)"
+    )
 
     def test_main_files_without_a_language_are_an_input_error(self):
         self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.txt", "**/*Test.java"]\n'))

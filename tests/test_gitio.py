@@ -610,11 +610,22 @@ class NumstatSinceTest(ChangesRepoCase):
                 self.assertIn((1, 1, ENGINE), numstat_since(self.repo, base, ["src/main/java"]))
 
     def test_malformed_record_is_a_report_error(self):
-        for out in (f"1\t2\t{ENGINE}\0no tabs\0", f"one\ttwo\t{ENGINE}\0", "1\t2\0"):
+        digit = chr(0x0663)  # ARABIC-INDIC DIGIT THREE: str.isdigit() takes it, int() too
+        malformed = (
+            f"1\t2\t{ENGINE}\0no tabs\0", f"one\ttwo\t{ENGINE}\0", "1\t2\0", f"-1\t2\t{ENGINE}\0",
+            f"1_0\t2\t{ENGINE}\0", f"1\t+1\t{ENGINE}\0", f"{digit}\t2\t{ENGINE}\0", "1\t2\t\0", f"1\t--\t{ENGINE}\0",
+        )  # fmt: skip
+        for out in malformed:
             with self.subTest(out=out), mock.patch("muster.gitio._literal_git", return_value=out):
                 with self.assertRaises(ReportError) as caught:
                     numstat_since(self.repo, "HEAD", ["src/main/java"])
                 self.assertTrue(str(caught.exception).startswith("git diff --numstat gave an unexpected record: "))
+
+    def test_record_keeps_the_tabs_of_its_path(self):
+        out = f"1\t2\t{ENGINE}\0-\t-\tsrc/main/java/odd\tname.java\0"
+        with mock.patch("muster.gitio._literal_git", return_value=out):
+            found = numstat_since(self.repo, "HEAD", ["src/main/java"])
+        self.assertEqual(found, [(1, 2, ENGINE), (None, None, "src/main/java/odd\tname.java")])
 
 
 class BinaryCountsSinceTest(ChangesRepoCase):

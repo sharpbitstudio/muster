@@ -52,10 +52,12 @@ def generic_loc(lines: list[str], line_comment: str | None, block_comment: tuple
     """The lines that keep a character other than white space outside comments.
 
     Each line is scanned once, left to right. Outside a block comment the marker that occurs first
-    wins (the longer one when two start at the same place): a line comment ends the line, a block
-    start opens a block. Inside a block only the block end is looked for, and a block goes on over
-    the following lines until its end. The counter does not know strings: a marker inside a string
-    reads as a comment. A language without markers counts the lines that are not blank.
+    wins (the longer one when two start at the same place, and the line comment at the same place
+    and length, so a line_comment equal to the block start leaves the block without effect): a
+    line comment ends the line, a block start opens a block. Inside a block only the block end is
+    looked for, and a block goes on over the following lines until its end. The counter does not
+    know strings: a marker inside a string reads as a comment. A language without markers counts
+    the lines that are not blank.
     """
     start, end = block_comment if block_comment else (None, None)
     count = 0

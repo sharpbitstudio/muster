@@ -5,8 +5,9 @@ neither a generated nor a [loc].exclude glob (muster.paths). A file is in the gr
 folder that holds it: "main" under a folder of roots; under a folder of tests "test-support" when a
 [loc].test_support glob matches it, else "test". A line of code keeps a character other than white
 space outside comments, as the language of the file counts it (muster.lang); a line ends at a line
-feed only. A LOC set without a file under [source].roots is a configuration error, as for `policy`:
-the globs left nothing to count (a set without test files is fine).
+feed only. A LOC set without a main file is a configuration error, as for `policy`: the globs left
+nothing to count (a file without a language is still a member, and a set without test files is
+fine).
 
 A file of the set without a language, or one that cannot be read, is not counted and is an input
 error; the section still reports what it counted. With --base the change split gives the raw lines
@@ -27,7 +28,7 @@ from muster.config import Config, ConfigError, require
 from muster.coverage import ref_argument
 from muster.gitio import binary_counts_since, count_file_lines, numstat_since, untracked_under
 from muster.lang import Language, count_file, language_of
-from muster.paths import group_of, in_loc_set, loc_set, root_of
+from muster.paths import group_of, in_loc_set, loc_set
 from muster.report import Report, ReportError, md_path
 
 HELP = "lines of code: main, test, test-support (trend only)"
@@ -56,10 +57,14 @@ def _loc_files(args: argparse.Namespace, cfg: Config) -> tuple[list[str], Config
     return [path for path in walked if in_loc_set(cfg, path)], sets.error
 
 
-def _extension(path: str) -> str:
+def _extension(path: str, langs: list[Language]) -> str:
     """The extension of the file name of `path` as the errors name it: from its last dot, or
-    NO_EXTENSION for a name without one (a dot-file too)."""
-    return posixpath.splitext(path.rsplit("/", 1)[-1])[1] or NO_EXTENSION
+    NO_EXTENSION for a name without one (a dot-file too) and for a name that is exactly an
+    extension of a language (`.d.ts`, which would else read as `.ts`)."""
+    name = path.rsplit("/", 1)[-1]
+    if any(name in lang.extensions for lang in langs):
+        return NO_EXTENSION
+    return posixpath.splitext(name)[1] or NO_EXTENSION
 
 
 def _group(cfg: Config, langs: list[Language], path: str) -> str | None:
@@ -137,11 +142,10 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     files, error = _loc_files(args, cfg)
     if error is not None:
         raise ConfigError(f"{cfg.name}: {error}")
-    roots = cfg.get("source.roots", [])
-    if not any(root_of(rel, roots) is not None for rel in files):  # a file without a language is a member
+    if not any(group_of(cfg, rel) == "main" for rel in files):  # a file without a language is a member
         raise ConfigError(
-            f"{cfg.name}: no file under source.roots is in the LOC set"
-            " (source.include minus source.generated and [loc].exclude)"
+            f"{cfg.name}: no main file is in the LOC set"
+            " (source.include minus source.generated and [loc].exclude, under source.roots)"
         )
     langs = cfg.languages
     groups = {name: {"files": 0, "loc": 0} for name in GROUPS}
@@ -151,7 +155,7 @@ def run(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     for rel in files:
         lang = language_of(rel, langs)
         if lang is None:
-            ext = _extension(rel)
+            ext = _extension(rel, langs)
             uncounted[ext] = uncounted.get(ext, 0) + 1
             example.setdefault(ext, rel)
             continue
