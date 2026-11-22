@@ -579,8 +579,8 @@ class LanguageEntryTest(ValidateCase):
 
 
 class LanguageEntryCommandTest(unittest.TestCase):
-    """Every command reads the profile through the same check: a bad [[language]] entry makes
-    even the policy command, which counts no lines, exit 2."""
+    """Every analysis command reads the profile through the same check: a bad [[language]] entry
+    makes even the policy command, which counts no lines, exit 2."""
 
     def setUp(self):
         self.enterContext(mock.patch.dict(os.environ))

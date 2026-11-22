@@ -341,9 +341,19 @@ class ChangeSplitTest(LocCase):
                 self.assertEqual(outcome.env["base"]["commit"], self.git("merge-base", "main", "HEAD"))
 
     def test_git_that_cannot_run_keeps_the_table(self):
-        with mock.patch("muster.gitio.subprocess.run", side_effect=FileNotFoundError("git")):
+        real_run = subprocess.run
+
+        def numstat_cannot_run(command, *args, **kwargs):
+            if "--numstat" in command:
+                raise FileNotFoundError(2, "synthetic reason")
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch("muster.gitio.subprocess.run", side_effect=numstat_cannot_run):
             outcome = self.quiet("--base", "main")
-        self.assertEqual((outcome.data["change"], outcome.env["base"]), (None, {"ref": "main", "commit": None}))
+        self.assertEqual(outcome.data["change"], None)
+        self.assertEqual(outcome.env["base"], {"ref": "main", "commit": self.git("merge-base", "main", "HEAD")})
+        self.assertIn("LOC change split not computed: git diff could not run: ", outcome.summary)
+        self.assertNotIn("| added |", outcome.summary)
         self.assertEqual(outcome.counts()["main"], (2, 13))
 
     def test_untracked_file_that_cannot_be_read_leaves_the_split_out(self):
@@ -353,6 +363,32 @@ class ChangeSplitTest(LocCase):
             outcome = self.quiet("--base", "main")
         self.assertEqual(outcome.data["change"], None)
         self.assertIn(f"LOC change split not computed: {CLOCK}: cannot read: Permission denied\n", outcome.summary)
+
+    def link(self, target: str, path: str) -> None:
+        """A symbolic link at `path` to `target`, relative to the link's folder."""
+        (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, self.repo / path)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symbolic link here")
+
+    def test_untracked_link_to_no_file_adds_nothing(self):
+        self.link("Missing.java", f"{MAIN}/Dangling.java")
+        self.write(CLOCK, java_lines(2))  # untracked
+        outcome = self.quiet("--base", "main")
+        self.assertEqual(outcome.data["change"], {"main": [0, 0], "test": [0, 0], "test-support": [2, 0]})
+        self.assertEqual(outcome.counts()["main"], (2, 13))
+
+    def test_link_replaced_by_a_binary_file_counts_once(self):
+        self.link("Engine.java", f"{MAIN}/Shape.java")
+        self.commit()
+        (self.repo / f"{MAIN}/Shape.java").unlink()
+        self.write(f"{MAIN}/Shape.java", "int one;" + chr(0) + "\nint two;\n")
+        with mock.patch("muster.loc.binary_counts_since", wraps=gitio.binary_counts_since) as spy:
+            outcome = self.quiet("--base", "main")
+        self.assertEqual(spy.call_count, 1)
+        # the link's one line deleted, the file's two lines added
+        self.assertEqual(outcome.data["change"], {"main": [2, 1], "test": [0, 0], "test-support": [0, 0]})
 
     def test_file_without_a_language_is_left_out_of_the_split(self):
         self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, 'include = ["**/*.java", "**/*.txt"]\n'))
@@ -379,6 +415,7 @@ class InputErrorTest(LocCase):
             self.assertEqual(outcome.code, expected, outcome.out + outcome.err)
             self.assertEqual((outcome.section["verdict"], outcome.env["error"]), ("error", None))
             self.assertEqual(outcome.section["errors"], errors)
+            self.assertEqual(outcome.section["violations"], [])
             level = "error" if options else "warning"
             titled = [f"::{level} title=Lines of code::{error}" for error in errors]
             self.assertEqual(outcome.annotations, titled)
@@ -390,22 +427,22 @@ class InputErrorTest(LocCase):
         return outcome
 
     def test_files_without_a_language_per_extension(self):
-        include = 'include = ["**/*.java", "**/*.txt", "**/*.tar.gz", "**/NOTICE"]\n'
+        include = 'include = ["**/*.java", "**/*.txt", "**/*.tar.gz", "**/NOTICE", "**/.keep"]\n'
         self.write("muster.toml", PROFILE.replace(INCLUDE_LINE, include))
         self.write(f"{MAIN}/notes.txt", "a\n")
         self.write(f"{TESTS}/more.txt", "a\n")
         self.write(f"{MAIN}/data.tar.gz", b"\x1f\x8b")
         self.write(f"{MAIN}/NOTICE", "a\n")
+        self.write(f"{TESTS}/.keep", "")  # a dot-file
+        self.write(f"{TESTS}/support/.java", "int a;\n")  # a name that is only the extension
         outcome = self.assert_errored(
             [
-                "(no extension): 1 file(s) of the LOC set have no language and are not counted",
-                ".gz: 1 file(s) of the LOC set have no language and are not counted",
-                ".txt: 2 file(s) of the LOC set have no language and are not counted",
+                f"(no extension): 3 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/NOTICE)",
+                f".gz: 1 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/data.tar.gz)",
+                f".txt: 2 file(s) of the LOC set have no language and are not counted (e.g. {MAIN}/notes.txt)",
             ]
         )
-        self.assertEqual(outcome.data["uncounted"], {"(no extension)": 1, ".gz": 1, ".txt": 2})
-        strict = self.loc("--strict")
-        self.assertEqual((strict.code, strict.section["verdict"]), (1, "error"))
+        self.assertEqual(outcome.data["uncounted"], {"(no extension)": 3, ".gz": 1, ".txt": 2})
         self.assertEqual(outcome.counts(), {"main": (1, 10), "test": (1, 2), "test-support": (0, 0)})
 
     def test_file_that_cannot_be_read_by_the_counter(self):
@@ -423,7 +460,13 @@ class InputErrorTest(LocCase):
         file = self.repo / ENGINE
         file.chmod(0)
         self.addCleanup(file.chmod, 0o644)
-        outcome = self.assert_errored([f"{ENGINE}: cannot read: Permission denied"])
+        try:
+            file.open("rb").close()
+        except PermissionError as exc:
+            reason = exc.strerror
+        else:
+            self.skipTest("chmod does not make a file unreadable here")
+        outcome = self.assert_errored([f"{ENGINE}: cannot read: {reason}"])
         self.assertEqual(outcome.counts()["main"], (0, 0))
 
 

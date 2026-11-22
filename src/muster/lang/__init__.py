@@ -22,6 +22,7 @@ from muster.lang.java import java_loc
 JAVA = "java"
 JAVA_LINE_COMMENT = "//"
 JAVA_BLOCK_COMMENT = ("/*", "*/")
+BOM = chr(0xFEFF)  # a byte order mark, decoded
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,9 @@ def generic_loc(lines: list[str], line_comment: str | None, block_comment: tuple
     for line in lines:
         code = False
         i = 0
+        # A marker that find() misses from some place on is not in the rest of the line, so it is
+        # not looked for again there: a long line with many blocks is scanned in linear time.
+        absent = {marker for marker in (line_comment, start) if not marker}
         while True:  # each pass ends the line or moves past a marker, which is never empty
             if in_block:
                 close = line.find(end, i)
@@ -69,8 +73,15 @@ def generic_loc(lines: list[str], line_comment: str | None, block_comment: tuple
                 i = close + len(end)
                 continue
             # (place, -length, marker) of each marker found: the first, then the longer one wins
-            found = [(line.find(marker, i), -len(marker), marker) for marker in (line_comment, start) if marker]
-            first = min((hit for hit in found if hit[0] >= 0), default=None)
+            found = []
+            for marker in (line_comment, start):
+                if marker not in absent:
+                    place = line.find(marker, i)
+                    if place < 0:
+                        absent.add(marker)
+                    else:
+                        found.append((place, -len(marker), marker))
+            first = min(found, default=None)
             stop = len(line) if first is None else first[0]
             code = code or bool(line[i:stop].strip())
             if first is None or first[2] == line_comment:
@@ -115,7 +126,9 @@ def language_of(path: str, langs: Iterable[Language]) -> Language | None:
 
 def count_file(path: Path, lang: Language) -> int:
     """The lines of code of the file at `path`, read as bytes and decoded as UTF-8 with every bad
-    byte replaced. A file that cannot be read raises its OSError: the caller reports it."""
+    byte replaced; one leading byte order mark is dropped. A file that cannot be read raises its
+    OSError: the caller reports it."""
     with open(path, "rb") as fh:
         data = fh.read()
-    return lang.count(data.decode("utf-8", "replace"))
+    text = data.decode("utf-8", "replace")
+    return lang.count(text[1:] if text.startswith(BOM) else text)

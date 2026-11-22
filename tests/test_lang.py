@@ -69,6 +69,18 @@ class GenericCounterTest(unittest.TestCase):
         lines = ["--[[ opens a block", "inside", "]] x = 1", "-- a note", "y = 2 -- a note"]
         self.assertEqual(generic_loc(lines, "--", ("--[[", "]]")), 2)
 
+    def test_longer_line_comment_wins_over_a_block_start_at_the_same_place(self):
+        # The line comment ends its line, so no block is open on the next one.
+        self.assertEqual(generic_loc(["--[[ a note", "x = 1"], "--[[", ("--", "]]")), 1)
+        lines = ["-- opens a block", "inside", "]] y = 2", "--[[ a note -- ]]", "z = 3"]
+        self.assertEqual(generic_loc(lines, "--[[", ("--", "]]")), 2)
+
+    def test_long_line_with_many_blocks(self):
+        self.assertEqual(c_like("/* a */ x = 1; " * 5000), 1)
+        self.assertEqual(c_like("/* a */ " * 5000, "/* b */ " * 5000 + "y"), 1)
+        self.assertEqual(c_like("/* a */ " * 5000 + "/* open", "inside", "close */"), 0)
+        self.assertEqual(c_like("/* a */ " * 5000 + "// note */ y", "x = 1;"), 1)
+
     def test_block_with_the_same_start_and_end(self):
         lines = ['"""', "a docstring", '"""', 'x = 1  """ inline """', '""" once """ y']
         self.assertEqual(generic_loc(lines, "#", ('"""', '"""')), 2)
@@ -194,6 +206,18 @@ class CountFileTest(unittest.TestCase):
     def test_invalid_utf8_is_replaced(self):
         self.assertEqual(self.count(b"x = '\xff\xfe'\n# \xc3\n\n", self.PYTHON), 1)
         self.assertEqual(self.count(b"int a = '\xff';\n// \xc3\n", BUILT_IN[JAVA]), 1)
+        # A line that is only a bad byte keeps its replacement character, so it is code.
+        self.assertEqual(self.count(b"\xff\n# \xfe\n\xc3\n", self.PYTHON), 2)
+        self.assertEqual(self.count(b"\xff\n// \xfe\n", BUILT_IN[JAVA]), 1)
+
+    def test_leading_byte_order_mark_is_dropped(self):
+        bom = chr(0xFEFF).encode("utf-8")
+        self.assertEqual(self.count(bom + b"# a note\nx = 1\n", self.PYTHON), 1)
+        self.assertEqual(self.count(bom + b"// a note\nint a;\n", BUILT_IN[JAVA]), 1)
+        self.assertEqual(self.count(bom + b"\nint a;\n", BUILT_IN[JAVA]), 1)
+        # Only one, and only at the start: a second one is a character of the line.
+        self.assertEqual(self.count(bom + bom + b"# a note\n", self.PYTHON), 1)
+        self.assertEqual(self.count(b"x = 1\n" + bom + b"\n", self.PYTHON), 2)
 
     def test_other_line_breaks_never_split_a_line(self):
         for code in (0x0C, 0x2028, 0x0D):
@@ -224,8 +248,15 @@ class CountFileTest(unittest.TestCase):
         path.write_bytes(b"x = 1\n")
         path.chmod(0)
         self.addCleanup(path.chmod, 0o600)
-        with self.assertRaises(PermissionError):
+        try:
+            path.open("rb").close()
+        except PermissionError as exc:
+            reason = exc.strerror
+        else:
+            self.skipTest("chmod does not make a file unreadable here")
+        with self.assertRaises(PermissionError) as caught:
             count_file(path, self.PYTHON)
+        self.assertEqual(caught.exception.strerror, reason)
 
 
 if __name__ == "__main__":
