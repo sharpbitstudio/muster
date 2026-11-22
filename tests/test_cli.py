@@ -526,6 +526,56 @@ class ScannedOutputClashTest(CliCase):
                     self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
                     (self.work / "out.json").unlink()
 
+    def test_nul_in_repo_still_refuses_two_outputs_that_are_one_file(self):
+        argv = ["--repo", str(self.repo) + chr(0), "loc", "--base=", "--json-out", "same.out"]
+        code, _, err = self.run_main(*argv, "--summary-file", "same.out")
+        self.assertEqual(code, 2, err)
+        self.assertIn("error: --summary-file same.out is the same file as --json-out same.out\n", err)
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_nul_in_config_keeps_the_default_config_file(self):
+        argv = ["--config", "muster" + chr(0) + ".toml", "loc", "--base=", "--json-out", str(self.config)]
+        self.assert_refused(argv, self.config, f"--json-out {self.config} is the default config file")
+
+    def test_step_summary_under_a_source_or_test_folder(self):
+        for error in self.ERRORS[:2]:
+            for target, folder in self.under_folders():
+                with self.subTest(error=error, folder=folder):
+                    os.environ["GITHUB_STEP_SUMMARY"] = str(target)
+                    argv = [*error, "--github", "--json-out", "out.json"]
+                    self.assert_refused(argv, target, f"$GITHUB_STEP_SUMMARY {target} is under {folder}")
+
+    def test_config_that_is_no_regular_file_is_not_read(self):
+        (self.repo / "profile").mkdir()
+        for command, expected in ((["loc", "--base="], 2), (["version"], 0)):
+            with self.subTest(command=command[0]), mock.patch.object(cli, "load_unchecked") as load:
+                argv = ["--repo", str(self.repo), "--config", "profile", *command, "--json-out", "out.json"]
+                code, _, err = self.run_main(*argv)
+                self.assertEqual(code, expected, err)
+                load.assert_not_called()
+                self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
+                (self.work / "out.json").unlink()
+
+    def test_path_that_cannot_be_resolved_is_no_clash(self):
+        # os.path.realpath raises for a busy named pipe on Windows; here it raises for one path.
+        realpath = os.path.realpath
+        for unresolved in (self.config, self.work / "out.json", self.repo / "src/main/java"):
+            for command, expected in ((["loc", "--base="], 2), (["version"], 0)):
+
+                def raising(path, *args, **kwargs):
+                    if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(unresolved)):
+                        raise OSError(231, "All pipe instances are busy")
+                    return realpath(path, *args, **kwargs)
+
+                with self.subTest(path=unresolved, command=command[0]):
+                    with mock.patch("os.path.realpath", side_effect=raising) as patched:
+                        argv = ["--repo", str(self.repo), *command, "--json-out", "out.json"]
+                        code, _, err = self.run_main(*argv)
+                    self.assertTrue(patched.called)
+                    self.assertEqual(code, expected, err)
+                    self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
+                    (self.work / "out.json").unlink()
+
 
 class InternalErrorTest(CliCase):
     def test_bug_exits_three_with_envelope(self):
