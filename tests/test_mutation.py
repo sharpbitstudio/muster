@@ -273,7 +273,11 @@ class ArgumentTest(MutationCase):
 class RequiredKeyTest(MutationCase):
     def test_missing_keys(self):
         for line, key in (
+            ('roots = ["src/main/java"]\n', "source.roots"),
+            ('include = ["**/*.java"]\n', "source.include"),
+            ('base = "src/main/java/org/example/app"\n', "zones.base"),
             ('critical = "policy/critical.txt"\n', "zones.critical"),
+            ('standard = "policy/standard.txt"\n', "zones.standard"),
             ('report = "build/mutation/mutations.xml"\n', "mutation.report"),
             ('targets = "policy/mutation.txt"\n', "mutation.targets"),
             ('own_test = "{stem}Test{ext}"\n', "mutation.own_test"),
@@ -605,6 +609,15 @@ class ZoneTest(MutationCase):
             row("standard", 0, 0, 0, 0, "n/a", "n/a", 0),
         )
 
+    def test_zones_are_ordered_by_number_past_nine(self):
+        self.write("policy/critical.txt", CRITICAL + "# Zone 10: parsing.\ncodec/**\n")
+        self.write("policy/standard.txt", "queue/*\n")
+        self.measure()
+        run = self.passed()
+        self.assertEqual(list(run.data["zones"]), ["Z1", "Z2", "Z10", "standard"])
+        names = re.findall(r"^\| (Z\d+|standard) \|", run.summary, re.MULTILINE)
+        self.assertEqual(names, ["Z1", "Z2", "Z10", "standard"])
+
     def test_freshness_problem_is_one_warning_in_every_mode(self):
         """Checks 1 and 2, and a snapshot that is missing or broken: the zones are left out with
         one warning, never an error or a violation; the totals and the file table stay."""
@@ -901,6 +914,14 @@ class MarkdownTest(MutationCase):
         self.assertIn(f"- `{TOKEN}` (2)\n" + item.format(1) + item.format(2), run.summary)
         self.assertNotIn("``", run.summary)
 
+    def test_text_of_only_white_space_is_a_span_of_one_space(self):
+        self.measure(mutants(ENGINE, "KILLED", 3) + mutants(TOKEN, " ", mutator=" ", description=" "))
+        run = self.passed()
+        self.assertIn("Mutators observed (2): `MathMutator` 3, ` ` 1\n", run.summary)
+        self.assertIn("Statuses: `KILLED` 3, ` ` 1\n", run.summary)
+        self.assertIn(f"- `{TOKEN}` (1)\n  - `Token` L{1} ` `\n", run.summary)
+        self.assertNotIn("``", run.summary)
+
     def test_survivors_are_listed_by_file_with_a_cap(self):
         fields = {"cls": "Token$Inner", "mutator": "VoidMethodCallMutator", "description": "removed call"}
         items = mutants(TOKEN, "SURVIVED", 5, **fields)
@@ -916,6 +937,18 @@ class MarkdownTest(MutationCase):
         )
         self.assertNotIn(item.format(3), run.summary)
         self.assertNotIn(f"- `{ENGINE}`", run.summary)
+
+    def test_survivors_are_the_undetected_mutants_a_test_reached(self):
+        self.measure(
+            mutants(ENGINE, "KILLED", 4)
+            + mutants(ENGINE, "NOT_STARTED", line=5, detected=False)
+            + mutants(ENGINE, "NO_COVERAGE", line=6)
+            + mutants(TOKEN)
+        )
+        run = self.passed()
+        item = f"`Engine` L{5} `MathMutator`: `replaced addition with subtraction`"
+        self.assertIn(f"### Survived mutants (1)\n\n- `{ENGINE}` (1)\n  - {item}\n\n", run.summary)
+        self.assertNotIn(f"`Engine` L{6}", run.summary)
 
     def test_data_has_no_killing_tests_or_indexes(self):
         killer = "org.example.app.billing.internal.ledger.EngineTest.[engine:junit-jupiter]/[method:settles()]"
