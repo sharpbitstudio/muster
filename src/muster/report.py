@@ -131,8 +131,9 @@ def md_path(text: str) -> str:
 def percent_digits(fraction: float) -> str:
     """A threshold as the number of a percentage, exactly as the profile gives it: 0.8 is 80, 0.825
     is 82.5 and 0.800000000001 is 80.0000000001. The decimal point of the value's shortest form is
-    moved, so no float error of a product shows and no digit is rounded away."""
-    return f"{(Decimal(repr(fraction)) * 100).normalize():f}"
+    moved, so no float error of a product shows and no digit is rounded away; -0.0 is 0."""
+    digits = (Decimal(repr(fraction)) * 100).normalize()
+    return f"{digits.copy_abs() if digits.is_zero() else digits:f}"
 
 
 def envelope(

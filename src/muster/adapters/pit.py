@@ -21,8 +21,9 @@ from muster.adapters import SourceResolver, label, long_number, read_xml
 from muster.config import ConfigError
 from muster.report import ReportError
 
-# Every element that is read; each may occur once in a <mutation>. The <index> elements of
-# <indexes> repeat; numberOfTestsRun, <blocks> and any other element are not read.
+# Every element that is read; each may occur once in a <mutation>, and each but <indexes> holds one
+# value, without a child element. The <index> elements of <indexes> repeat and hold one value each;
+# numberOfTestsRun, <blocks> and any other element are not read.
 _SINGLE = (
     "sourceFile",
     "mutatedClass",
@@ -81,11 +82,18 @@ def _single(mutation: ET.Element, tag: str, where: str) -> ET.Element | None:
     return found[0] if found else None
 
 
+def _scalar(element: ET.Element, tag: str, where: str) -> str:
+    """The text of an element that holds one value, which may not have a child element."""
+    if len(element):
+        raise ReportError(f"{where}: <{tag}> has a child element")
+    return element.text or ""
+
+
 def _text(mutation: ET.Element, tag: str, where: str, *, required: bool = False) -> str:
     """The text of the element `tag`, "" when it is absent or empty; a required element must be
     there and not empty."""
     element = _single(mutation, tag, where)
-    text = "" if element is None or element.text is None else element.text
+    text = "" if element is None else _scalar(element, tag, where)
     if required and not text:
         raise ReportError(f"{where} has no <{tag}>" if element is None else f"{where} has an empty <{tag}>")
     return text
@@ -149,7 +157,7 @@ def _mutant(mutation: ET.Element, where: str) -> Mutant:
         raise ReportError(f"{where}: <mutator> {mutator_full!r} has no simple name")
     indexes_element = _single(mutation, "indexes", where)
     indexes = tuple(
-        _number(index.text or "", "index", where)
+        _number(_scalar(index, "index", where), "index", where)
         for index in ([] if indexes_element is None else indexes_element.findall("index"))
     )
     killing = _text(mutation, "killingTest", where)

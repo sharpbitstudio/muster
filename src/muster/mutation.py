@@ -38,6 +38,7 @@ from muster.report import Report, ReportError, md_path, one_line, percent_digits
 HELP = "mutation testing of the allowlist: test strength"
 SURVIVED_FILES_CAP = 50
 SURVIVED_ITEMS_CAP = 40
+SHOWN_NAMES = 10  # names in an allowlist message; the data keeps every one
 UNKNOWN = "unknown"
 
 
@@ -131,6 +132,12 @@ def _cell(text: str) -> str:
     return _code(text).replace("|", "\\|")
 
 
+def _shown(names: list[str]) -> str:
+    """At most SHOWN_NAMES of the names, then how many more there are."""
+    more = len(names) - SHOWN_NAMES
+    return ", ".join(names[:SHOWN_NAMES]) + (f" (+{more} more)" if more > 0 else "")
+
+
 def _by_count(counts: dict[str, int]) -> list[tuple[str, int]]:
     """Most frequent first, then by name."""
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -211,7 +218,7 @@ def _errored(rep: Report, errors: list[str], data: dict) -> None:
     rep.evaluated = False
     rep.data = {"outcome": "error", **data}
     rep.md = ["## Mutation testing", "", "**ERROR**: the inputs could not be read, no verdict:", ""]
-    rep.md.extend(f"- {error}" for error in errors)
+    rep.md.extend(f"- {_code(error)}" for error in errors)
     rep.verdict = f"mutation: ERROR ({errors[0]})"
 
 
@@ -277,30 +284,32 @@ def _evaluate(
     if not_listed:
         rep.errored(
             "Mutation allowlist",
-            f"{len(not_listed)} mutated file(s) not on the allowlist: " + ", ".join(not_listed),
+            f"{len(not_listed)} mutated file(s) not on the allowlist: " + _shown(not_listed),
         )
     if no_mutations:
         rep.annotate(
             "warning",
             "Mutation allowlist",
-            f"{len(no_mutations)} allowlisted file(s) without any mutation: " + ", ".join(no_mutations),
+            f"{len(no_mutations)} allowlisted file(s) without any mutation: " + _shown(no_mutations),
         )
     if not_covered:
         rep.annotate(
             "warning",
             "Mutation allowlist",
             f"{len(not_covered)} allowlisted file(s) not covered by tests (no covered mutant): "
-            + ", ".join(not_covered),
+            + _shown(not_covered),
         )
 
     strength = total.strength()
     measured = f"test strength {pit_pct(strength)}"
     fraction = f"{total.detected}/{total.covered}"
-    if rep.errors:
+    input_error = bool(rep.errors)  # the allowlist error; "no covered mutant" is added after it
+    if strength is None:
+        rep.errored("Mutation testing", f"no covered mutant among {total.total} mutation(s): test strength n/a")
+    if input_error:
         outcome, gate = "error", "no verdict (input error)"
     elif strength is None:
         outcome, gate = "error", "no verdict (no covered mutant)"
-        rep.errored("Mutation testing", f"no covered mutant among {total.total} mutation(s): test strength n/a")
     elif _below(total, threshold_value):
         outcome, gate = "below", f"below the {threshold} threshold"
         rep.violated(
@@ -327,7 +336,7 @@ def _evaluate(
     if rep.errors:
         rep.md.append("**ERROR**: no verdict:")
         rep.md.append("")
-        rep.md.extend(f"- {error}" for error in rep.errors)
+        rep.md.extend(f"- {_code(error)}" for error in rep.errors)
         rep.md.append("")
     reached = "reached" if strength is not None and not _below(total, target_value) else "not reached"
     rep.md.append(
@@ -352,7 +361,7 @@ def _evaluate(
     if zones is None:
         rep.md.append("Zones not evaluated (stale or missing snapshot):")
         rep.md.append("")
-        rep.md.extend(f"- {reason}" for reason in reasons)
+        rep.md.extend(f"- {_code(reason)}" for reason in reasons)
     else:
         rep.md.extend(mutants_header("zone", "files", "---:"))
         for zone in zones:
@@ -427,7 +436,8 @@ def _survivors(rep: Report, report: MutationReport) -> None:
         items.sort(key=lambda mutant: (mutant.line, str(mutant.meta["class"]), mutant.mutator, mutant.description))
         for mutant in items[:SURVIVED_ITEMS_CAP]:
             simple = str(mutant.meta["class"]).rpartition(".")[2]
-            rep.md.append(f"  - {_code(simple)} L{mutant.line} {_code(mutant.mutator)}: {_code(mutant.description)}")
+            description = f": {_code(mutant.description)}" if one_line(mutant.description) else ""
+            rep.md.append(f"  - {_code(simple)} L{mutant.line} {_code(mutant.mutator)}{description}")
         if len(items) > SURVIVED_ITEMS_CAP:
             rep.md.append(f"  - ... (+{len(items) - SURVIVED_ITEMS_CAP} more)")
     if len(survivors) > SURVIVED_FILES_CAP:
