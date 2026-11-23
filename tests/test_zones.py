@@ -20,6 +20,7 @@ from muster.zones import (
     target_files,
     target_violations,
     trim,
+    zone_sort_key,
 )
 
 BASE = "src/main/java/org/example/app"
@@ -515,6 +516,12 @@ class GrammarHelperTest(unittest.TestCase):
         for bad in ("2026-02-29", "2026-13-01", "26-01-01", "2026-01-01 ", "\u0662026-01-01", "20260101"):
             with self.subTest(bad=bad):
                 self.assertIsNone(parse_date(bad))
+
+    def test_zone_sort_key(self):
+        zones = ["unknown", "Z10", "standard", "Z2", "Z1"]
+        self.assertEqual(sorted(zones, key=zone_sort_key), ["Z1", "Z2", "Z10", "standard", "unknown"])
+        other_digit = "Z" + chr(0x0662)  # an Arabic-Indic two, which int() would read as 2
+        self.assertEqual(sorted(["Z3", other_digit, "Z1"], key=zone_sort_key), ["Z1", "Z3", other_digit])
 
 
 class TargetTest(unittest.TestCase):

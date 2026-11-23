@@ -30,6 +30,8 @@ STANDARD_ZONE = "standard"
 ROOT_PACKAGE = "<root>"
 
 HEADER = re.compile(r"# Zone (\d+): ", re.ASCII)
+# The name of a critical zone, as the classification gives it.
+ZONE_NAME = re.compile(r"Z[1-9][0-9]*", re.ASCII)
 # A comment that looks like a zone header; unless it is a valid one, it is a violation, not a comment.
 HEADER_LOOKALIKE = re.compile(r"#\s*zone\b", re.ASCII | re.IGNORECASE)
 # A standard alternative: `*` (the base folder) or `<segment>/.../<segment>/*`, no wildcard before.
@@ -130,6 +132,14 @@ def zone_number(digits: str) -> int | None:
         return None
     number = int(digits)
     return number if 1 <= number <= MAX_ZONE else None
+
+
+def zone_sort_key(zone: str) -> tuple[int, int, str]:
+    """The sort key of a zone name: a critical zone `Z<n>` sorts by its number, and every other name
+    (standard) sorts after all of them, by name."""
+    if ZONE_NAME.fullmatch(zone):
+        return (0, int(zone[1:]), "")
+    return (1, 0, zone)
 
 
 def expand(glob: str) -> list[str]:

@@ -23,7 +23,7 @@ from muster.config import SHA256, Config, ConfigError, named_files, require
 from muster.gitio import records
 from muster.paths import SourceSets, exists_exact, resolve_glob, source_sets
 from muster.report import FatalError, Report, ReportError, json_text, md_path, write_json
-from muster.zones import Classification, Names, Targets, classify, target_files, target_violations
+from muster.zones import Classification, Names, Targets, classify, target_files, target_violations, zone_sort_key
 
 HELP = "classify the source files by the policy files and check the policy"
 SNAPSHOT_SCHEMA = 1
@@ -344,7 +344,7 @@ def _passed(rep: Report, classification: Classification, targets: int | None) ->
     for zone in classification.zones.values():
         counts[zone] = counts.get(zone, 0) + 1
     standard = counts.pop("standard", 0)
-    zones = {zone: counts[zone] for zone in sorted(counts, key=lambda zone: int(zone[1:]))}
+    zones = {zone: counts[zone] for zone in sorted(counts, key=zone_sort_key)}
     critical = sum(zones.values())
     exemptions = [{"path": path, "until": until.isoformat()} for path, until in classification.exempt_until.items()]
     rep.data = {
