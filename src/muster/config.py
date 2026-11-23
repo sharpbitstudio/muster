@@ -14,7 +14,6 @@ import math
 import os
 import re
 import tomllib
-import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,7 @@ from typing import Any
 
 from muster.globs import alternatives
 from muster.lang import BUILT_IN, Language, languages
-from muster.report import FatalError
+from muster.report import FatalError, has_control
 
 SCHEMA_VERSION = 1
 DEFAULT_CONFIG = "muster.toml"
@@ -146,7 +145,7 @@ _LINE_SEPARATORS = ("\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}")
 def _has_control(value: str) -> bool:
     """A control character (Unicode category Cc: C0, DEL and C1), or a line or paragraph separator,
     which the zone grammar takes as a line terminator."""
-    return any(unicodedata.category(ch) == "Cc" or ch in _LINE_SEPARATORS for ch in value)
+    return has_control(value) or any(ch in _LINE_SEPARATORS for ch in value)
 
 
 def _path_problem(value: str, allow_empty: bool = False) -> str | None:

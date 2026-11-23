@@ -11,16 +11,21 @@ from pathlib import Path
 from unittest import mock
 
 from muster import __version__, report
+from muster.config import ConfigError, validate
 from muster.report import (
     Report,
     cap_markdown,
+    cell_span,
+    code_span,
     envelope,
     escape_data,
     escape_property,
+    has_control,
     json_text,
     md_path,
     one_line,
     percent_digits,
+    shown_names,
     write_json,
     write_markdown,
 )
@@ -64,6 +69,55 @@ class MdPathTest(unittest.TestCase):
 
     def test_backtick_becomes_quote(self):
         self.assertEqual(md_path("a`b``c"), "`a'b''c`")
+
+
+class CodeSpanTest(unittest.TestCase):
+    def test_blank_text_is_a_span_of_one_space(self):
+        for text in ("", " ", "\t\r\n "):
+            with self.subTest(text=text):
+                self.assertEqual(code_span(text), "` `")
+
+    def test_backtick_and_line_break_as_md_path_and_one_line(self):
+        text = " run `all`\n  tests\r\n"
+        self.assertEqual(code_span(text), "`run 'all' tests`")
+        self.assertEqual(code_span(text), md_path(one_line(text)))
+
+
+class CellSpanTest(unittest.TestCase):
+    def test_pipe_is_escaped(self):
+        self.assertEqual(cell_span("left|right\n|"), "`left\\|right \\|`")
+        self.assertEqual(cell_span(" "), "` `")
+
+
+class ShownNamesTest(unittest.TestCase):
+    NAMES = [f"name{i}" for i in range(11)]
+
+    def test_more_only_past_the_cap(self):
+        self.assertEqual(shown_names(self.NAMES[:10]), ", ".join(self.NAMES[:10]))
+        self.assertEqual(shown_names(self.NAMES), ", ".join(self.NAMES[:10]) + " (+1 more)")
+        self.assertEqual(shown_names([]), "")
+
+    def test_custom_cap_and_separator(self):
+        self.assertEqual(shown_names(self.NAMES[:3], cap=3, sep="; "), "name0; name1; name2")
+        self.assertEqual(shown_names(self.NAMES[:5], cap=2, sep="; "), "name0; name1 (+3 more)")
+
+
+class HasControlTest(unittest.TestCase):
+    def test_c0_del_and_c1(self):
+        for code in (0x00, 0x09, 0x0A, 0x1F, 0x7F, 0x80, 0x85, 0x9F):
+            with self.subTest(code=hex(code)):
+                self.assertTrue(has_control("text" + chr(code) + "more"))
+
+    def test_other_characters(self):
+        for text in ("", "plain text", chr(0xA0), chr(0xE9), chr(0x200B)):
+            with self.subTest(text=text):
+                self.assertFalse(has_control(text))
+
+    def test_line_separator_is_a_control_only_for_the_profile(self):
+        self.assertFalse(has_control(chr(0x2028)))
+        with self.assertRaises(ConfigError) as ctx:
+            validate({"zones": {"base": "app/" + chr(0x2028)}})
+        self.assertIn("has a control character", str(ctx.exception))
 
 
 class PercentDigitsTest(unittest.TestCase):

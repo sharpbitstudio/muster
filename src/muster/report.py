@@ -8,6 +8,7 @@ the step summary. The envelope has the same shape for every command and every ex
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -126,6 +127,28 @@ def write_markdown(path: Path, text: str, append: bool = True) -> None:
 def md_path(text: str) -> str:
     """An inline code span (a path, a class or a mutant description); a backtick becomes a quote."""
     return "`" + text.replace("`", "'") + "`"
+
+
+def code_span(text: str) -> str:
+    """Text of a report as an inline code span, on one line; text that collapses to nothing is a
+    span of one space, since an empty span shows as two backticks."""
+    return md_path(one_line(text) or " ")
+
+
+def cell_span(text: str) -> str:
+    """Text of a report as an inline code span in a table cell, where a | would end the cell."""
+    return code_span(text).replace("|", "\\|")
+
+
+def shown_names(names: Sequence[str], cap: int = 10, sep: str = ", ") -> str:
+    """At most `cap` of the names joined with `sep`, then how many more there are."""
+    more = len(names) - cap
+    return sep.join(names[:cap]) + (f" (+{more} more)" if more > 0 else "")
+
+
+def has_control(text: str) -> bool:
+    """Whether the text has a control character: Unicode category Cc, which is C0, DEL and C1."""
+    return any(unicodedata.category(ch) == "Cc" for ch in text)
 
 
 def percent_digits(fraction: float) -> str:

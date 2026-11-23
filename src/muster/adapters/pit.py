@@ -12,14 +12,13 @@ is an input error. The same mutant twice in a report is two mutants.
 from __future__ import annotations
 
 import dataclasses
-import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 from muster.adapters import SourceResolver, label, long_number, read_xml
 from muster.config import ConfigError
-from muster.report import ReportError
+from muster.report import ReportError, has_control
 
 # Every element that is read; each may occur once in a <mutation>, and each but <indexes> holds one
 # value, without a child element. The <index> elements of <indexes> repeat and hold one value each;
@@ -64,15 +63,10 @@ class MutationReport:
     unresolved: list[str]  # report names with no file under any source root, sorted, each once
 
 
-def _has_control(text: str) -> bool:
-    """A control character: Unicode category Cc, which is C0, DEL and C1."""
-    return any(unicodedata.category(ch) == "Cc" for ch in text)
-
-
 def _bad_component(text: str) -> bool:
     """Whether `text` cannot be one component of a path: `.`, `..`, or a /, backslash, colon or
     control character in it."""
-    return text in (".", "..") or any(ch in "/\\:" for ch in text) or _has_control(text)
+    return text in (".", "..") or any(ch in "/\\:" for ch in text) or has_control(text)
 
 
 def _single(mutation: ET.Element, tag: str, where: str) -> ET.Element | None:
@@ -109,7 +103,7 @@ def _number(text: str, tag: str, where: str) -> int:
 
 
 def _no_control(text: str, what: str, where: str) -> None:
-    if _has_control(text):
+    if has_control(text):
         raise ReportError(f"{where}: {what} has a control character")
 
 

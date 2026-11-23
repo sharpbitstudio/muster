@@ -30,6 +30,7 @@ from muster.gitio import count_file_lines, diff_since, parse_diff, ref_problem, 
 from muster.paths import resolve_glob
 from muster.policy import CheckedPolicy
 from muster.report import FatalError, Report, ReportError, md_path, percent_digits
+from muster.zones import zone_sort_key
 
 HELP = "global floor, zones table and the critical delta gate"
 EXPIRY_WARN_DAYS = 7  # an exemption that ends within this many days, today included, gets a warning
@@ -314,7 +315,7 @@ def _evaluate(
         else:
             add_to(critical, sf)
             add_to(per_zone.setdefault(zone, new_acc()), sf)
-    per_zone = {zone: per_zone[zone] for zone in sorted(per_zone, key=lambda zone: int(zone[1:]))}
+    per_zone = {zone: per_zone[zone] for zone in sorted(per_zone, key=zone_sort_key)}
     line_ok = ratio(total["line"]) is None or ratio(total["line"]) >= floor["line"]
     branch_ok = ratio(total["branch"]) is None or ratio(total["branch"]) >= floor["branch"]
     floor_ok = line_ok and branch_ok

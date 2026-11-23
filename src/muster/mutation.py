@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import tomllib
-import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -33,7 +32,17 @@ from muster.adapters.pit import Mutant, MutationReport
 from muster.config import Config, require
 from muster.paths import exists_exact
 from muster.policy import CheckedPolicy
-from muster.report import Report, ReportError, md_path, one_line, percent_digits
+from muster.report import (
+    Report,
+    ReportError,
+    cell_span,
+    code_span,
+    has_control,
+    one_line,
+    percent_digits,
+    shown_names,
+)
+from muster.zones import zone_sort_key
 
 HELP = "mutation testing of the allowlist: test strength"
 SURVIVED_FILES_CAP = 50
@@ -122,23 +131,6 @@ def _below(acc: Mutants, threshold: float) -> bool:
     return acc.covered > 0 and Fraction(acc.detected, acc.covered) < Fraction(repr(threshold))
 
 
-def _code(text: str) -> str:
-    """Text of the report as an inline code span, on one line; text that collapses to nothing is a
-    span of one space, since an empty span shows as two backticks."""
-    return md_path(one_line(text) or " ")
-
-
-def _cell(text: str) -> str:
-    """Text of the report as an inline code span in a table cell, where a | would end the cell."""
-    return _code(text).replace("|", "\\|")
-
-
-def _shown(names: list[str]) -> str:
-    """At most SHOWN_NAMES of the names, then how many more there are."""
-    more = len(names) - SHOWN_NAMES
-    return ", ".join(names[:SHOWN_NAMES]) + (f" (+{more} more)" if more > 0 else "")
-
-
 def _by_count(counts: dict[str, int]) -> list[tuple[str, int]]:
     """Most frequent first, then by name."""
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -146,7 +138,7 @@ def _by_count(counts: dict[str, int]) -> list[tuple[str, int]]:
 
 def _version(value: object) -> str:
     """A version: a string that is not empty and has no control character, else unknown."""
-    usable = isinstance(value, str) and value and not any(unicodedata.category(ch) == "Cc" for ch in value)
+    usable = isinstance(value, str) and value and not has_control(value)
     return value if usable else UNKNOWN
 
 
@@ -203,7 +195,7 @@ def _zones(checked: CheckedPolicy, report: MutationReport, files: list[str]) -> 
     number of the listed and the mutated files in it, and the counters of its mutants."""
     zone_of = checked.classification.zones
     names = set(zone_of.values())
-    order = sorted(names - {"standard"}, key=lambda zone: int(zone[1:])) + sorted(names & {"standard"})
+    order = sorted(names, key=zone_sort_key)
     zones = {zone: {"files": 0, "acc": Mutants()} for zone in order}
     for path in files:
         zones[zone_of[path]]["files"] += 1
@@ -219,7 +211,7 @@ def _errored(rep: Report, errors: list[str], data: dict) -> None:
     rep.evaluated = False
     rep.data = {"outcome": "error", **data}
     rep.md = ["## Mutation testing", "", "**ERROR**: the inputs could not be read, no verdict:", ""]
-    rep.md.extend(f"- {_code(error)}" for error in errors)
+    rep.md.extend(f"- {code_span(error)}" for error in errors)
     rep.verdict = f"mutation: ERROR ({errors[0]})"
 
 
@@ -285,20 +277,20 @@ def _evaluate(
     if not_listed:
         rep.errored(
             "Mutation allowlist",
-            f"{len(not_listed)} mutated file(s) not on the allowlist: " + _shown(not_listed),
+            f"{len(not_listed)} mutated file(s) not on the allowlist: " + shown_names(not_listed, SHOWN_NAMES),
         )
     if no_mutations:
         rep.annotate(
             "warning",
             "Mutation allowlist",
-            f"{len(no_mutations)} allowlisted file(s) without any mutation: " + _shown(no_mutations),
+            f"{len(no_mutations)} allowlisted file(s) without any mutation: " + shown_names(no_mutations, SHOWN_NAMES),
         )
     if not_covered:
         rep.annotate(
             "warning",
             "Mutation allowlist",
             f"{len(not_covered)} allowlisted file(s) not covered by tests (no covered mutant): "
-            + _shown(not_covered),
+            + shown_names(not_covered, SHOWN_NAMES),
         )
 
     strength = total.strength()
@@ -328,16 +320,16 @@ def _evaluate(
     versions = _versions(cfg)
     head = getattr(args, "head_commit", None) or UNKNOWN
     rep.md = ["## Mutation testing", ""]
-    parts = [f"Commit `{head}`"] + [f"{key} {_code(value)}" for key, value in versions.items()]
+    parts = [f"Commit `{head}`"] + [f"{key} {code_span(value)}" for key, value in versions.items()]
     rep.md.append(" - ".join(parts))
     rep.md.append("")
-    observed = ", ".join(f"{_code(name)} {n}" for name, n in _by_count(mutators))
+    observed = ", ".join(f"{code_span(name)} {n}" for name, n in _by_count(mutators))
     rep.md.append(f"Mutators observed ({len(mutators)}): {observed}")
     rep.md.append("")
     if rep.errors:
         rep.md.append("**ERROR**: no verdict:")
         rep.md.append("")
-        rep.md.extend(f"- {_code(error)}" for error in rep.errors)
+        rep.md.extend(f"- {code_span(error)}" for error in rep.errors)
         rep.md.append("")
     reached = "reached" if strength is not None and not _below(total, target_value) else "not reached"
     rep.md.append(
@@ -354,7 +346,7 @@ def _evaluate(
         f" | {pit_pct(strength)} | {pit_pct(total.score())} |"
     )
     rep.md.append("")
-    rep.md.append("Statuses: " + ", ".join(f"{_code(status)} {n}" for status, n in _by_count(statuses)))
+    rep.md.append("Statuses: " + ", ".join(f"{code_span(status)} {n}" for status, n in _by_count(statuses)))
     rep.md.append("")
 
     rep.md.append("### By zone")
@@ -362,7 +354,7 @@ def _evaluate(
     if zones is None:
         rep.md.append("Zones not evaluated (stale or missing snapshot):")
         rep.md.append("")
-        rep.md.extend(f"- {_code(reason)}" for reason in reasons)
+        rep.md.extend(f"- {code_span(reason)}" for reason in reasons)
     else:
         rep.md.extend(mutants_header("zone", "files", "---:"))
         for zone in zones:
@@ -389,14 +381,14 @@ def _evaluate(
         elif _below(acc, threshold_value):
             notes.append(f"< {threshold}")
         notes_of[is_unresolved][key] = notes
-        rep.md.append(mutants_row(_cell(key), acc, "; ".join(notes)))
+        rep.md.append(mutants_row(cell_span(key), acc, "; ".join(notes)))
     rep.md.append("")
 
     rep.md.append(f"<details><summary>By class ({len(classes)}; information, not a verdict)</summary>")
     rep.md.append("")
     rep.md.extend(mutants_header("class"))
     for cls, acc in sorted(classes.items(), key=strength_order):
-        rep.md.append(mutants_row(_cell(cls), acc, f"< {threshold}" if _below(acc, threshold_value) else ""))
+        rep.md.append(mutants_row(cell_span(cls), acc, f"< {threshold}" if _below(acc, threshold_value) else ""))
     rep.md.append("")
     rep.md.append("</details>")
     rep.md.append("")
@@ -433,12 +425,12 @@ def _survivors(rep: Report, report: MutationReport) -> None:
     rep.md.append(f"### Survived mutants ({sum(len(items) for items in survivors.values())})")
     rep.md.append("")
     for (key, _), items in sorted(survivors.items())[:SURVIVED_FILES_CAP]:
-        rep.md.append(f"- {_code(key)} ({len(items)})")
+        rep.md.append(f"- {code_span(key)} ({len(items)})")
         items.sort(key=lambda mutant: (mutant.line, str(mutant.meta["class"]), mutant.mutator, mutant.description))
         for mutant in items[:SURVIVED_ITEMS_CAP]:
             simple = str(mutant.meta["class"]).rpartition(".")[2]
-            description = f": {_code(mutant.description)}" if one_line(mutant.description) else ""
-            rep.md.append(f"  - {_code(simple)} L{mutant.line} {_code(mutant.mutator)}{description}")
+            description = f": {code_span(mutant.description)}" if one_line(mutant.description) else ""
+            rep.md.append(f"  - {code_span(simple)} L{mutant.line} {code_span(mutant.mutator)}{description}")
         if len(items) > SURVIVED_ITEMS_CAP:
             rep.md.append(f"  - ... (+{len(items) - SURVIVED_ITEMS_CAP} more)")
     if len(survivors) > SURVIVED_FILES_CAP:
