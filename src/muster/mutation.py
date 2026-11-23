@@ -123,8 +123,9 @@ def _below(acc: Mutants, threshold: float) -> bool:
 
 
 def _code(text: str) -> str:
-    """Text of the report as an inline code span, on one line."""
-    return md_path(one_line(text))
+    """Text of the report as an inline code span, on one line; text that collapses to nothing is a
+    span of one space, since an empty span shows as two backticks."""
+    return md_path(one_line(text) or " ")
 
 
 def _cell(text: str) -> str:
