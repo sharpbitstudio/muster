@@ -749,7 +749,30 @@ class PitBrokenTest(AdapterCase):
                 "<sourceFile>",
             ),
             "sourceFile NUL reference": (mutations_xml(mutation(sourceFile="Token&#0;.java")), "not well-formed XML"),
+            "sourceFile with a child element": (
+                mutations_xml(mutation(sourceFile="Token.java<x/>/Other.java")),
+                "mutation 1: <sourceFile> has a child element",
+            ),
+            "lineNumber with a child element": (
+                mutations_xml(mutation(lineNumber="12<x/>bad")),
+                "mutation 1: <lineNumber> has a child element",
+            ),
+            "index with a child element": (
+                mutations_xml(mutation(indexes="<index>1<x/>2</index>")),
+                "mutation 1: <index> has a child element",
+            ),
+            "description with a child element": (
+                mutations_xml(mutation(description="a<b/>c")),
+                "mutation 1: <description> has a child element",
+            ),
         }
+        for tag in ("mutatedClass", "mutatedMethod", "methodDescription", "mutator", "killingTest"):
+            child = mutations_xml(mutation(**{tag: TOKEN_MUTATION[tag] + "<x/>"}))
+            cases[f"{tag} with a child element"] = (child, f"mutation 1: <{tag}> has a child element")
+        cases["twice before a child element"] = (
+            mutations_xml(mutation(lineNumber="12<x/>", more="<description>again</description>")),
+            "has <description> twice",
+        )
         for tag in ("sourceFile", "mutatedClass", "mutator", "lineNumber"):
             cases[f"{tag} missing"] = (mutations_xml(mutation(**{tag: None})), f"has no <{tag}>")
             cases[f"{tag} empty"] = (mutations_xml(mutation(**{tag: ""})), f"has an empty <{tag}>")
@@ -766,6 +789,17 @@ class PitBrokenTest(AdapterCase):
                     pit.load(path, resolver)
                 self.assertIn(path.as_posix(), str(caught.exception))
                 self.assertIn(part, str(caught.exception))
+
+    def test_every_mutation_is_checked_before_a_name_is_resolved(self):
+        # Alone, the first mutation is a ConfigError: Token.java is under both roots.
+        self.make(f"{MAIN}/{TOKEN}", f"{EXTRA}/{TOKEN}")
+        path = self.write("build/reports/pit/mutations.xml", mutations_xml(mutation(), mutation(lineNumber="x")))
+        with self.assertRaises(ReportError) as caught:
+            pit.load(path, self.resolver([MAIN, EXTRA]), name="build/reports/pit/mutations.xml")
+        self.assertIn("build/reports/pit/mutations.xml: mutation 2: <lineNumber>", str(caught.exception))
+        self.write("build/reports/pit/mutations.xml", mutations_xml(mutation()))
+        with self.assertRaises(ConfigError):
+            pit.load(path, self.resolver([MAIN, EXTRA]))
 
     def test_messages_have_the_texts_of_the_other_adapters(self):
         (self.root / MAIN).mkdir(parents=True)

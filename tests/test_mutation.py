@@ -23,6 +23,7 @@ from xml.sax.saxutils import escape, quoteattr
 from muster import cli, mutation, policy
 from muster.adapters import LONG_MAX
 from muster.config import DEFAULT_MUTATION_TARGET, DEFAULT_MUTATION_THRESHOLD, named_files
+from muster.report import percent_digits
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = (
@@ -232,10 +233,14 @@ class DefaultsTest(unittest.TestCase):
     def test_policy_text_names_the_default_thresholds(self):
         text = (REPO_ROOT / "POLICY.md").read_bytes().decode("ascii")
         point = text.split("## 6. ", 1)[1].split("\n## ", 1)[0]
-        pattern = r"By default the threshold is (\d+)% and the target (\d+)%; the profile changes them\."
+        pattern = r"By default the threshold is ([0-9.]+)% and the target ([0-9.]+)%; the profile changes them\."
         found = re.findall(pattern, point)
         expected = (DEFAULT_MUTATION_THRESHOLD, DEFAULT_MUTATION_TARGET)
-        self.assertEqual(found, [tuple(f"{round(value * 100)}" for value in expected)])
+        self.assertEqual(found, [tuple(percent_digits(value) for value in expected)])
+
+    def test_limits_of_the_lists(self):
+        limits = (mutation.SURVIVED_FILES_CAP, mutation.SURVIVED_ITEMS_CAP, mutation.SHOWN_NAMES)
+        self.assertEqual(limits, (50, 40, 10))
 
     def test_command_never_reads_the_identity_or_the_known_variation(self):
         source = (REPO_ROOT / "src" / "muster" / "mutation.py").read_bytes().decode("ascii")
@@ -359,6 +364,16 @@ class CountTest(MutationCase):
         self.assertEqual(run.verdict, "mutation: BELOW THRESHOLD test strength 60.0 % (3/5, < 62.5 %)")
         self.assertIn("### By file (allowlist entries, ascending by test strength; mark `< 62.5 %`)", run.summary)
 
+    def test_threshold_is_compared_exactly_on_a_float_boundary(self):
+        threshold = 0.8333333333333334
+        self.assertEqual(5 / 6, threshold)  # the float quotient is the threshold; 5/6 itself is below it
+        self.write("muster.toml", PROFILE + f"threshold = {threshold!r}\ntarget = 1.0\n")
+        self.measure(mutants(ENGINE, "KILLED", 5) + mutants(TOKEN, "SURVIVED"))
+        run = self.mutation()
+        self.assertEqual((run.code, run.data["outcome"]), (0, "below"))
+        self.assertEqual(run.verdict, "mutation: BELOW THRESHOLD test strength 83.3 % (5/6, < 83.33333333333334 %)")
+        self.assertEqual(run.data["thresholds"], {"threshold": threshold, "target": 1.0})
+
     def test_target_is_reached_on_equality(self):
         for items, text in (
             (mutants(ENGINE, "KILLED", 13) + mutants(TOKEN, "SURVIVED", 7), "pass (>= 60 %); target 70 %: not reached"),
@@ -371,6 +386,7 @@ class CountTest(MutationCase):
     def test_verdict_table(self):
         """Annotation, violation, enum and exit of each outcome."""
         below = mutants(ENGINE, "KILLED", 5) + mutants(TOKEN, "SURVIVED", 4)
+        not_covered = mutants(ENGINE) + mutants(TOKEN, "NO_COVERAGE", 2)
         cases = (
             ("pass", mutants(ENGINE) + mutants(TOKEN), [], (None, False, "pass", 0)),
             ("zones not evaluated", None, [], ("warning", False, "warn", 0)),
@@ -379,6 +395,9 @@ class CountTest(MutationCase):
             ("listed file without a mutant", mutants(ENGINE), [], ("warning", False, "warn", 0)),
             ("listed file without a mutant", mutants(ENGINE), ["--strict"], ("warning", False, "warn", 0)),
             ("listed file without a mutant", mutants(ENGINE), ["--fail-on-error"], ("warning", False, "warn", 0)),
+            ("listed file without a covered mutant", not_covered, [], ("warning", False, "warn", 0)),
+            ("listed file without a covered mutant", not_covered, ["--strict"], ("warning", False, "warn", 0)),
+            ("listed file without a covered mutant", not_covered, ["--fail-on-error"], ("warning", False, "warn", 0)),
             ("below", below, [], ("warning", True, "warn", 0)),
             ("below", below, ["--strict"], ("error", True, "fail", 1)),
             ("below", below, ["--fail-on-error"], ("warning", True, "warn", 0)),
@@ -452,21 +471,37 @@ class AllowlistTest(MutationCase):
         self.assertEqual((list(run.data["files"]), run.annotations), ([ENGINE], []))
 
     def test_listed_file_without_a_mutant_warns_and_keeps_its_row(self):
-        self.measure(mutants(ENGINE, "KILLED", 2))
+        self.measure(mutants(TOKEN, "KILLED", 2))
         run = self.passed()
-        self.assertEqual(run.data["no_mutations"], [TOKEN])
-        message = f"1 allowlisted file(s) without any mutation: {TOKEN}"
+        self.assertEqual(run.data["no_mutations"], [ENGINE])
+        message = f"1 allowlisted file(s) without any mutation: {ENGINE}"
         self.assertEqual(run.annotations, [f"::warning title=Mutation allowlist::{message}"])
-        self.assert_rows(run, row(f"`{TOKEN}`", 0, 0, 0, 0, "n/a", "n/a", "0 mutations"))
+        # The n/a row comes first, though its name sorts after the other one.
+        rows = [line for line in run.summary.splitlines() if line.startswith("| `src/")]
+        self.assertEqual(
+            rows,
+            [
+                row(f"`{ENGINE}`", 0, 0, 0, 0, "n/a", "n/a", "0 mutations"),
+                row(f"`{TOKEN}`", 2, 2, 0, 2, "100.0 %", "100.0 %", ""),
+            ],
+        )
 
     def test_listed_file_without_a_covered_mutant_warns_with_strength_na(self):
-        self.measure(mutants(ENGINE, "KILLED", 2) + mutants(TOKEN, "NO_COVERAGE", 3))
+        self.measure(mutants(ENGINE, "NO_COVERAGE", 3) + mutants(TOKEN, "KILLED", 2))
         run = self.passed()
-        self.assertEqual(run.data["not_covered"], [TOKEN])
-        self.assertIsNone(run.data["files"][TOKEN]["strength"])
-        message = f"1 allowlisted file(s) not covered by tests (no covered mutant): {TOKEN}"
+        self.assertEqual(run.data["not_covered"], [ENGINE])
+        self.assertIsNone(run.data["files"][ENGINE]["strength"])
+        message = f"1 allowlisted file(s) not covered by tests (no covered mutant): {ENGINE}"
         self.assertEqual(run.annotations, [f"::warning title=Mutation allowlist::{message}"])
-        self.assert_rows(run, row(f"`{TOKEN}`", 3, 0, 3, 0, "n/a", "0.0 %", "not covered by tests"))
+        # The n/a row comes first, though its name sorts after the other one.
+        rows = [line for line in run.summary.splitlines() if line.startswith("| `src/")]
+        self.assertEqual(
+            rows,
+            [
+                row(f"`{ENGINE}`", 3, 0, 3, 0, "n/a", "0.0 %", "not covered by tests"),
+                row(f"`{TOKEN}`", 2, 2, 0, 2, "100.0 %", "100.0 %", ""),
+            ],
+        )
 
     def test_mutated_file_off_the_allowlist_is_an_error_and_keeps_its_row(self):
         self.measure(mutants(ENGINE, "KILLED", 2) + mutants(TOKEN) + mutants(PARSER))
@@ -480,7 +515,7 @@ class AllowlistTest(MutationCase):
                 self.assertEqual(run.verdict, f"mutation: ERROR ({message})")
         self.assertEqual((run.data["outside"], run.data["totals"]["total"]), ([PARSER], 4))
         self.assertEqual(run.data["zones"]["standard"]["files"], 1)
-        self.assertIn(f"**ERROR**: no verdict:\n\n- {message}\n", run.summary)
+        self.assertIn(f"**ERROR**: no verdict:\n\n- `{message}`\n", run.summary)
         self.assertIn("- no verdict (input error); target 70 %: reached.", run.summary)
         self.assert_rows(run, row(f"`{PARSER}`", 1, 1, 0, 1, "100.0 %", "100.0 %", "not on the allowlist"))
 
@@ -494,10 +529,45 @@ class AllowlistTest(MutationCase):
                 self.assertEqual(run.verdict, f"mutation: ERROR ({message})")
                 self.assertNotIn("PASS", run.out)
                 self.assertEqual(run.annotations[-1], f"::{level} title=Mutation testing::{message}")
-        self.assertIn(f"**ERROR**: no verdict:\n\n- {message}\n", run.summary)
+        self.assertIn(f"**ERROR**: no verdict:\n\n- `{message}`\n", run.summary)
         gate = "**Test strength n/a** (0/0 covered mutations detected) - no verdict (no covered mutant);"
         self.assertIn(gate, run.summary)
         self.assertIn("### By file", run.summary)
+
+    def test_unlisted_file_and_no_covered_mutant_are_two_errors(self):
+        self.measure(mutants(ENGINE, "NO_COVERAGE") + mutants(TOKEN, "NO_COVERAGE") + mutants(PARSER, "NO_COVERAGE"))
+        run = self.mutation()
+        first = f"1 mutated file(s) not on the allowlist: {PARSER}"
+        second = "no covered mutant among 3 mutation(s): test strength n/a"
+        self.assertEqual((run.code, run.data["outcome"]), (0, "error"))
+        self.assertEqual((run.section["errors"], run.section["violations"]), ([first, second], []))
+        self.assertEqual(run.verdict, f"mutation: ERROR ({first})")
+        self.assertIn(f"**ERROR**: no verdict:\n\n- `{first}`\n- `{second}`\n\n", run.summary)
+        self.assertIn("- no verdict (input error); target 70 %: not reached.", run.summary)
+
+    def test_unlisted_file_and_a_strength_below_the_threshold_are_one_error(self):
+        self.measure(mutants(ENGINE) + mutants(TOKEN, "SURVIVED", 2) + mutants(PARSER))
+        run = self.mutation()
+        message = f"1 mutated file(s) not on the allowlist: {PARSER}"
+        self.assertEqual((run.code, run.data["outcome"]), (0, "error"))
+        self.assertEqual((run.section["errors"], run.section["violations"]), ([message], []))
+        self.assertEqual(run.verdict, f"mutation: ERROR ({message})")
+        gate = "**Test strength 50.0 %** (2/4 covered mutations detected) - no verdict (input error);"
+        self.assertIn(gate, run.summary)
+
+    def test_allowlist_message_names_at_most_ten_files(self):
+        drafts = [f"Draft{nr:02}.java" for nr in range(1, 13)]
+        items = mutants(ENGINE) + mutants(TOKEN)
+        for name in drafts:
+            items += mutants(ENGINE, package="org.example.app.drafts", file=name)
+        self.measure(items)
+        run = self.mutation()
+        names = [f"org/example/app/drafts/{name}" for name in drafts]
+        message = "12 mutated file(s) not on the allowlist: " + ", ".join(names[:10]) + " (+2 more)"
+        self.assertEqual(run.section["errors"], [message])
+        self.assertEqual(run.annotations[-1], f"::warning title=Mutation allowlist::{message}")
+        self.assertEqual(run.verdict, f"mutation: ERROR ({message})")
+        self.assertEqual(sorted(run.data["unresolved"]), names)
 
     def test_unresolved_name_keeps_its_own_key_space(self):
         # The report name of the second mutant has the text of the path of the first one.
@@ -581,7 +651,7 @@ class ZoneTest(MutationCase):
                     self.assertEqual(run.annotations, [warning])
                     self.assertEqual((run.section["errors"], run.section["violations"]), ([], []))
                     self.assertEqual(run.verdict, "mutation: PASS test strength 75.0 % (3/4, >= 60 %)")
-                    self.assertIn(f"Zones not evaluated (stale or missing snapshot):\n\n- {reason}\n", run.summary)
+                    self.assertIn(f"Zones not evaluated (stale or missing snapshot):\n\n- `{reason}`\n", run.summary)
                     self.assertEqual((run.data["totals"]["total"], run.data["files"][ENGINE]["detected"]), (4, 3))
                     self.assertIn("### By file", run.summary)
             if (self.repo / SNAPSHOT).is_dir():
@@ -709,7 +779,7 @@ class InputErrorTest(MutationCase):
                     level = "error" if options else "warning"
                     self.assertEqual(run.annotations, [f"::{level} title=Mutation testing::{errors[0]}"])
                     heading = "## Mutation testing\n\n**ERROR**: the inputs could not be read, no verdict:\n\n"
-                    self.assertEqual(run.summary, f"{heading}- {errors[0]}\n\n")
+                    self.assertEqual(run.summary, f"{heading}- `{errors[0]}`\n\n")
 
     def test_bug_in_the_adapter_exits_three(self):
         self.measure()
@@ -809,6 +879,27 @@ class MarkdownTest(MutationCase):
         self.assertIn("- `org/example/app/auth/We|rd.java` (1)\n", run.summary)
         self.assertIn(f"org.example.app.auth.{odd}", run.data["classes"])
         self.assertNotIn(chr(10) + "with", run.summary)
+
+    def test_error_and_reason_bullets_are_code_spans(self):
+        draft = {"package": "org.example.app.drafts", "file": "__Draft__*.java"}
+        self.measure(mutants(ENGINE) + mutants(TOKEN) + mutants(ENGINE, **draft))
+        run = self.mutation()
+        name = "org/example/app/drafts/__Draft__*.java"
+        error = f"1 mutated file(s) not on the allowlist: {name}"
+        reason = f"1 mutated source file(s) not in the classification set (e.g. {name})"
+        self.assertEqual((run.section["errors"], run.data["zone_reasons"]), ([error], [reason]))
+        self.assertEqual(run.annotations[-1], f"::warning title=Mutation allowlist::{error}")
+        self.assertIn(f"**ERROR**: no verdict:\n\n- `{error}`\n\n", run.summary)
+        self.assertIn(f"Zones not evaluated (stale or missing snapshot):\n\n- `{reason}`\n\n", run.summary)
+        self.assertNotIn(f"- {error}", run.summary)
+        self.assertNotIn(f"- {reason}", run.summary)
+
+    def test_survivor_without_a_description_has_no_empty_span(self):
+        self.measure(mutants(ENGINE, "KILLED", 3) + mutants(TOKEN, "SURVIVED", 2, description=""))
+        run = self.passed()
+        item = "  - `Token` L{} `MathMutator`\n"
+        self.assertIn(f"- `{TOKEN}` (2)\n" + item.format(1) + item.format(2), run.summary)
+        self.assertNotIn("``", run.summary)
 
     def test_survivors_are_listed_by_file_with_a_cap(self):
         fields = {"cls": "Token$Inner", "mutator": "VoidMethodCallMutator", "description": "removed call"}

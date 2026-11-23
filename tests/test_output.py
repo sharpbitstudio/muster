@@ -68,7 +68,8 @@ class MdPathTest(unittest.TestCase):
 
 class PercentDigitsTest(unittest.TestCase):
     def test_number_as_the_profile_gives_it(self):
-        for fraction, text in ((0.8, "80"), (0.07, "7"), (0.825, "82.5"), (1, "100"), (1.0, "100"), (0, "0")):
+        cases = ((0.8, "80"), (0.07, "7"), (0.825, "82.5"), (1, "100"), (1.0, "100"), (0, "0"), (-0.0, "0"))
+        for fraction, text in cases:
             with self.subTest(fraction=fraction):
                 self.assertEqual(percent_digits(fraction), text)
 
