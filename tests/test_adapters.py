@@ -4,11 +4,14 @@ Every tree and every report is built in a temporary folder. Non-ASCII and contro
 built at run time with chr().
 """
 
+import contextlib
 import datetime as dt
 import json
 import os
+import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -212,6 +215,64 @@ class JacocoLoadTest(AdapterCase):
         report = self.load(jacoco_xml(package("org/example/app/auth", sourcefile("token.java"))))
         self.assertEqual(report.unresolved, ["org/example/app/auth/token.java"])
         self.assertEqual(report.files, {})
+
+
+class JacocoSourceFilesTest(AdapterCase):
+    NAME = "build/reports/jacoco.xml"
+
+    def setUp(self):
+        super().setUp()
+        self.make(f"{MAIN}/{ENGINE}", f"{MAIN}/{PARSER}")
+
+    def files(self, xml: str, roots: list[str] | None = None) -> list:
+        path = self.write(self.NAME, xml)
+        return jacoco.source_files(path, self.resolver(roots or [MAIN], [f"{MAIN}/{ENGINE}"]), name=self.NAME)
+
+    def test_every_source_file_in_report_order(self):
+        engine = sourcefile("Engine.java", '<line nr="3" mi="0" ci="4" mb="1" cb="1"/>')
+        parser = sourcefile("KeyParser.java", '<counter type="LINE" missed="1" covered="0"/>')
+        body = (
+            package("org/example/app/queue", sourcefile("Dispatcher.java"))
+            + package("org/example/app/codec", parser)
+            + package("org/example/app/billing/internal/ledger", engine)
+        )
+        self.assertEqual(
+            self.files(jacoco_xml(body)),
+            [
+                (DISPATCHER, None, False, jacoco.FileCoverage({}, (0, 0), (0, 0))),
+                (PARSER, f"{MAIN}/{PARSER}", False, jacoco.FileCoverage({}, (1, 0), (0, 0))),
+                (ENGINE, f"{MAIN}/{ENGINE}", True, jacoco.FileCoverage({3: (0, 4, 1, 1)}, (0, 0), (0, 0))),
+            ],
+        )
+        self.assertEqual(self.files(jacoco_xml(package("org/example/app/auth"))), [])
+
+    def test_names_are_refused_as_load_refuses_them(self):
+        self.make(f"{EXTRA}/{ENGINE}")
+        ledger = "org/example/app/billing/internal/ledger"
+        cases = (
+            ("under two roots", package(ledger, sourcefile("Engine.java")), [MAIN, EXTRA]),
+            (
+                "two names as one file",
+                package(ledger, sourcefile("Engine.java")) + package(ledger[4:], sourcefile("Engine.java")),
+                [MAIN, f"{MAIN}/org"],
+            ),
+        )
+        for case, body, roots in cases:
+            with self.subTest(case=case):
+                path = self.write(self.NAME, jacoco_xml(body))
+                resolver = self.resolver(roots, [f"{MAIN}/{ENGINE}"])
+                with self.assertRaises(ConfigError) as loaded:
+                    jacoco.load(path, resolver, name=self.NAME)
+                with self.assertRaises(ConfigError) as listed:
+                    jacoco.source_files(path, resolver, name=self.NAME)
+                self.assertEqual(str(listed.exception), str(loaded.exception))
+                self.assertNamedOnly(str(listed.exception), self.NAME)
+
+    def test_whole_report_is_checked(self):
+        body = package("org/example/app/codec", sourcefile("KeyParser.java")) + '<counter type="LINE" missed="x"/>'
+        with self.assertRaises(ReportError) as caught:
+            self.files(jacoco_xml(body))
+        self.assertTrue(str(caught.exception).startswith(f"{self.NAME}: <counter> attribute missed "), caught.exception)
 
 
 class JacocoBrokenTest(AdapterCase):
@@ -998,6 +1059,94 @@ class JunitErrorsTest(AdapterCase):
         errors: list[str] = []
         self.assertEqual(junit.read_suites(self.root, ["results/TEST-folder.xml"], errors), [])
         self.assertEqual(errors, ["results/TEST-folder.xml: not a file"])
+
+
+class JunitFolderTest(AdapterCase):
+    """The JUnit files under a folder named on the command line, and their test case identities."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(contextlib.chdir(self.root))
+
+    def test_xml_files_at_any_depth_in_exact_case(self):
+        self.make(
+            "results/TEST-two.xml",
+            "results/deeper/inner/TEST-one.xml",
+            "results/folder.xml/TEST-three.xml",
+            "results/notes.txt",
+            "results/upper.XML",
+        )
+        errors: list[str] = []
+        found = ["TEST-two.xml", "deeper/inner/TEST-one.xml", "folder.xml/TEST-three.xml"]
+        self.assertEqual(junit.xml_files("results", errors), [f"results/{path}" for path in found])
+        self.assertEqual(junit.xml_files("results/", errors), [f"results/{path}" for path in found])
+        self.assertEqual(errors, [])
+
+    def test_linked_folder_is_not_followed(self):
+        self.make("results/TEST-two.xml", "elsewhere/TEST-other.xml")
+        link = self.root / "results" / "linked"
+        try:
+            if sys.platform == "win32":  # a junction needs no privilege
+                __import__("_winapi").CreateJunction(str(self.root / "elsewhere"), str(link))
+            else:
+                os.symlink(self.root / "elsewhere", link, target_is_directory=True)
+        except OSError:
+            self.skipTest("cannot create a link here")
+        self.assertEqual(junit.xml_files("results", []), ["results/TEST-two.xml"])
+
+    def test_folder_that_cannot_be_read(self):
+        self.make("results/TEST-two.xml", "results/locked/TEST-one.xml")
+        denied, scandir = os.path.join("results", "locked"), os.scandir
+
+        def listing(top="."):
+            if os.path.normpath(os.fspath(top)) == denied:
+                raise PermissionError(13, "Permission denied", top)
+            return scandir(top)
+
+        errors: list[str] = []
+        with mock.patch("os.scandir", side_effect=listing):
+            found = junit.xml_files("results", errors)
+        self.assertEqual(found, ["results/TEST-two.xml"])
+        self.assertEqual(errors, ["results/locked: cannot read: Permission denied"])
+
+    def test_identities_count_every_test_case(self):
+        token = "org.example.app.auth.TokenTest"
+        self.write(
+            "results/TEST-one.xml",
+            f'<testsuites><testsuite name="{token}"><testcase classname="{token}" name="checks()"/>'
+            f'<testcase name="bare()"/><testcase classname="{token}" name="checks()"><skipped/></testcase>'
+            "</testsuite></testsuites>",
+        )
+        failed = f'<testcase classname="{token}" name="fails()"><failure/></testcase>'
+        self.write("results/TEST-two.xml", f"<testsuite>{failed}</testsuite>")
+        found = junit.identities(["results/TEST-one.xml", "results/TEST-two.xml"])
+        self.assertEqual(found, Counter({f"{token}#checks()": 2, "#bare()": 1, f"{token}#fails()": 1}))
+
+    def test_every_broken_identity_file_is_collected(self):
+        cases = {
+            "results/a.xml": ("<testsuite", "results/a.xml: not well-formed XML: "),
+            "results/b.xml": ("<report/>", "results/b.xml: not a JUnit report, the root element is <report>"),
+            "results/c.xml": (
+                '<testsuite><testcase classname="Odd"/></testsuite>',
+                "results/c.xml: <testcase> has no attribute name",
+            ),
+            "results/d.xml": (
+                '<testsuite><testcase name=""/></testsuite>',
+                "results/d.xml: <testcase> has an empty name",
+            ),
+        }
+        for file, (content, _) in cases.items():
+            self.write(file, content)
+        self.write("results/good.xml", '<testsuite><testcase classname="Kept" name="works()"/></testsuite>')
+        errors: list[str] = []
+        found = junit.identities([*cases, "results/good.xml"], errors)
+        self.assertEqual(found, Counter({"Kept#works()": 1}))
+        self.assertEqual(len(errors), 4)
+        for error, (_, expected) in zip(errors, cases.values()):
+            self.assertTrue(error.startswith(expected), error)
+        with self.assertRaises(ReportError) as caught:
+            junit.identities(["results/good.xml", "results/b.xml"])
+        self.assertEqual(str(caught.exception), cases["results/b.xml"][1])
 
 
 class WithinTest(unittest.TestCase):

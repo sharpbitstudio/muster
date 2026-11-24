@@ -11,6 +11,7 @@ path has exactly that name on disk.
 
 from __future__ import annotations
 
+import argparse
 import os
 import posixpath
 import stat
@@ -25,6 +26,16 @@ def normalize(path: str) -> str:
     """A repository-relative path without `.` segments or a trailing slash; "" is the root."""
     norm = posixpath.normpath(path) if path else "."
     return "" if norm == "." else norm
+
+
+def file_argument(text: str) -> str:
+    """The argparse type of a file or a folder named on the command line: an empty name, or one with
+    a NUL, is a usage error."""
+    if not text:
+        raise argparse.ArgumentTypeError("the file name is empty")
+    if "\0" in text:
+        raise argparse.ArgumentTypeError("the file name has a NUL")
+    return text
 
 
 def _exact(root: Path, path: str, strict: bool = False) -> Path | None:
