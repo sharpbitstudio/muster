@@ -27,7 +27,7 @@ from muster.adapters import SourceResolver, exists, jacoco, junit
 from muster.adapters.jacoco import CoverageReport, FileCoverage
 from muster.config import Config, require
 from muster.gitio import count_file_lines, diff_since, parse_diff, ref_problem, untracked_under
-from muster.paths import resolve_glob
+from muster.paths import file_argument, resolve_glob
 from muster.policy import CheckedPolicy
 from muster.report import FatalError, Report, ReportError, md_path, percent_digits
 from muster.zones import zone_sort_key
@@ -49,14 +49,6 @@ def ref_argument(text: str) -> str:
     return text
 
 
-def _file_name(text: str) -> str:
-    if not text:
-        raise argparse.ArgumentTypeError("the file name is empty")
-    if "\0" in text:
-        raise argparse.ArgumentTypeError("the file name has a NUL")
-    return text
-
-
 def _day(text: str) -> date:
     if not _DATE.fullmatch(text):
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {text!r}")
@@ -75,7 +67,7 @@ def arguments(parser: argparse.ArgumentParser) -> None:
     )
     # Hidden, for tests: a unified diff instead of git (paths relative to the profile root, with a/
     # and b/ prefixes), no freshness checks, and the day that exemptions are judged on.
-    parser.add_argument("--diff-file", type=_file_name, help=argparse.SUPPRESS)
+    parser.add_argument("--diff-file", type=file_argument, help=argparse.SUPPRESS)
     parser.add_argument("--no-freshness", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--today", type=_day, help=argparse.SUPPRESS)
 

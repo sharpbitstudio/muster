@@ -526,6 +526,29 @@ class ScannedOutputClashTest(CliCase):
                     self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
                     (self.work / "out.json").unlink()
 
+    def test_files_the_options_name(self):
+        kept = self.work / "kept.xml"
+        kept.write_bytes(b"kept\n")
+        found = self.work / "results" / "deeper" / "TEST-one.xml"
+        found.parent.mkdir(parents=True)
+        found.write_bytes(b"<testsuite/>\n")
+        junit_file = "results/deeper/TEST-one.xml"
+        cases = [([option, "kept.xml"], "kept.xml", f"{option} kept.xml") for option in ("--before", "--after")]
+        cases.append((["--diff-file", "kept.xml"], "kept.xml", "--diff-file kept.xml"))
+        for option in ("--junit-before", "--junit-after"):
+            cases.append(([option, "results"], junit_file, f"the JUnit file {junit_file}"))
+        for options, target, label in cases:
+            for output in ("--json-out", "--summary-file"):
+                with self.subTest(options=options, output=output):
+                    before = (self.work / target).read_bytes()
+                    code, _, err = self.run_main("--repo", str(self.repo), "loc", "--base=", *options, output, target)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(f"error: {output} {target} is {label}\n", err)
+                    self.assertEqual((self.work / target).read_bytes(), before)
+        nul = ["--before", f"kept{chr(0)}.xml", "--junit-after", f"results{chr(0)}"]
+        code, _, err = self.run_main("--repo", str(self.repo), "loc", "--base=", *nul, "--json-out", "out.json")
+        self.assertEqual((code, self.read_json(self.work / "out.json")["exit_code"]), (2, 2), err)
+
     def test_nul_in_repo_still_refuses_two_outputs_that_are_one_file(self):
         argv = ["--repo", str(self.repo) + chr(0), "loc", "--base=", "--json-out", "same.out"]
         code, _, err = self.run_main(*argv, "--summary-file", "same.out")

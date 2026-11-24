@@ -14,12 +14,14 @@ of the repository or another output: on such a clash nothing is removed or writt
 fails its check, or one that no command reads (after a failed parse of argv, where the default
 config file of the repository is refused too, and for `version`), still names every file and folder
 it can, as far as it parses; there it is read only when it is a regular file, and a path that
-cannot be resolved (a busy named pipe on Windows, say) is no clash. These best-effort checks do not
-refuse what only a command would find: the JUnit files of tests.results (a glob), or a --diff-file
-named on the same command line; and the fallback in src/__main__.py, for an older Python or a broken
-install, writes --json-out without any check. Once that holds, the outputs that must not outlive a
-failed run are removed before the command does anything else, and those removed when the run fails
-go on any exit 2 or 3.
+cannot be resolved (a busy named pipe on Windows, say) is no clash. After a failed parse, the files
+that --before, --after and --diff-file name as read from argv, and the JUnit files under the folders
+of --junit-before and --junit-after, are refused too, as far as they can be found. These
+best-effort checks do not refuse what only a command would find, the JUnit files of tests.results
+(a glob); and the fallback in src/__main__.py, for an older Python or a broken install, writes
+--json-out without any check. Once that holds, the outputs that must not outlive a failed run are
+removed before the command does anything else, and those removed when the run fails go on any exit
+2 or 3.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from muster import __version__, coverage, duration, loc, mutation, policy
+from muster import __version__, coverage, diffs, duration, loc, mutation, policy
 from muster.config import (
     DEFAULT_CONFIG,
     SECTIONS,
@@ -115,14 +117,25 @@ ANALYSES: dict[str, Analysis] = {
     "duration": Analysis(duration.run, duration.HELP, inputs=named_files, protected=policy.protected),
     "loc": Analysis(loc.run, loc.HELP, loc.arguments, named_files, protected=policy.protected),
     "mutation": Analysis(mutation.run, mutation.HELP, inputs=named_files, protected=policy.protected),
+    "coverage-diff": Analysis(
+        diffs.coverage_diff,
+        diffs.COVERAGE_HELP,
+        diffs.coverage_arguments,
+        named_files,
+        protected=policy.protected,
+        option_inputs=diffs.option_inputs,
+    ),
 }
+# The names --strict-only takes: the sections of [check] sections, and the diff commands, which
+# are no section of the profile.
+STRICT_SECTIONS = SECTIONS + tuple(name for name in ANALYSES if name not in SECTIONS)
 
 
 def _section_list(text: str) -> frozenset[str]:
     names = [name.strip() for name in text.split(",")]
     for name in names:
-        if name not in SECTIONS:
-            raise argparse.ArgumentTypeError(f"unknown section '{name}' (choose from {', '.join(SECTIONS)})")
+        if name not in STRICT_SECTIONS:
+            raise argparse.ArgumentTypeError(f"unknown section '{name}' (choose from {', '.join(STRICT_SECTIONS)})")
     return frozenset(names)
 
 
@@ -142,7 +155,7 @@ def common_options() -> argparse.ArgumentParser:
         "--strict-only",
         metavar="A,B",
         type=_section_list,
-        help=f"only these sections are strict ({', '.join(SECTIONS)})",
+        help=f"only these sections are strict ({', '.join(STRICT_SECTIONS)})",
     )
     common.add_argument("--fail-on-error", action="store_true", help="an input error exits 1")
     _output_options(common)
@@ -175,7 +188,8 @@ _NEGATIVE_NUMBER = re.compile(r"-\d+$|-\d*\.\d+$")
 # Every option string of build_parser(), at every level (a test keeps the two equal).
 OPTIONS = frozenset(
     "-h --help --repo --config --format --json-out --strict --strict-only --fail-on-error --summary-file"
-    " --github --snapshot --zones-out --base --diff-file --no-freshness --today".split()
+    " --github --snapshot --zones-out --base --diff-file --no-freshness --today --before --after --junit-before"
+    " --junit-after".split()
 )
 # The options before the command word; each takes a value.
 GLOBAL_OPTIONS = ("--repo", "--config")
@@ -435,28 +449,30 @@ def _option_summary(args: argparse.Namespace) -> Summary | None:
     return f"$GITHUB_STEP_SUMMARY {step_summary}", Path(step_summary), True, step_summary
 
 
-def _refuse_profile_clashes(inv: Invocation, named: Inputs, repo: str | None, value: str, *, default: bool) -> None:
-    """For a profile that no command reads: refuse an output that is another output, the config
-    file `value` of the repository `repo` (--repo and --config, which may be anything), with
-    `default` also the default config file, or, as far as the profile parses without its check, a
-    file it names or a file under one of its source or test folders: exit 2, and nothing is removed
-    or written. The profile is read only when it is a regular file, so a named pipe never blocks
-    the run; one that cannot be read or is not TOML adds nothing. A path that cannot be resolved is
-    no clash. Only a UsageError is raised: a NUL in `repo`, or a folder `repo` that cannot be
-    resolved, names no repository, so only the outputs are checked against each other; a NUL in
-    `value` names no file.
+def _refuse_profile_clashes(
+    inv: Invocation, named: Inputs, repo: str | None, value: str, *, default: bool, inputs: Inputs = ()
+) -> None:
+    """For a profile that no command reads: refuse an output that is another output, one of the
+    `inputs` of the command line, the config file `value` of the repository `repo` (--repo and
+    --config, which may be anything), with `default` also the default config file, or, as far as
+    the profile parses without its check, a file it names or a file under one of its source or test
+    folders: exit 2, and nothing is removed or written. The profile is read only when it is a
+    regular file, so a named pipe never blocks the run; one that cannot be read or is not TOML adds
+    nothing. A path that cannot be resolved is no clash. Only a UsageError is raised: a NUL in
+    `repo`, or a folder `repo` that cannot be resolved, names no repository, so the outputs are
+    checked only against each other and against `inputs`; a NUL in `value` names no file.
 
-    It does not refuse what only a command would find: a JUnit file of tests.results (a glob) or a
-    --diff-file named on the same command line. Nor does the fallback in src/__main__.py, for an
-    older Python or a broken install, run it: that one writes --json-out without any check."""
+    It does not refuse what only a command would find: a JUnit file of tests.results (a glob). Nor
+    does the fallback in src/__main__.py, for an older Python or a broken install, run it: that one
+    writes --json-out without any check."""
     try:
         root = None if "\0" in (repo or "") else _repo_root(repo)
     except UsageError:  # the folder cannot be resolved
         root = None
     if root is None:
-        _refuse_clashes(inv, named, [], best_effort=True)
+        _refuse_clashes(inv, named, list(inputs), best_effort=True)
         return
-    given = [] if "\0" in value else [("the config file", config_path(root, value))]
+    given = [*inputs] + ([] if "\0" in value else [("the config file", config_path(root, value))])
     if default:
         given.append(("the default config file", config_path(root, DEFAULT_CONFIG)))
     unchecked = load_unchecked(root, value) if os.path.isfile(config_path(root, value)) else None
@@ -465,12 +481,28 @@ def _refuse_profile_clashes(inv: Invocation, named: Inputs, repo: str | None, va
         _refuse_under_folders(inv, named, unchecked, best_effort=True)
 
 
+def _scanned_inputs(words: list[str]) -> Inputs:
+    """The input files of the options as read from argv: those that --before, --after and
+    --diff-file name, and the JUnit files under the folders of --junit-before and --junit-after, as
+    far as they can be found. It never raises."""
+    inputs: Inputs = []
+    for option in ("--before", "--after", "--diff-file"):
+        value = _scan_option(words, option)
+        if value and "\0" not in value:
+            inputs.append((f"{option} {value}", Path(value)))
+    for option in ("--junit-before", "--junit-after"):
+        value = _scan_option(words, option)
+        if value and "\0" not in value:
+            inputs += diffs.folder_inputs(value)
+    return inputs
+
+
 def _arm_scanned(inv: Invocation) -> None:
     """argparse failed, or a file name it read is empty or '-': the --json-out and the summary file
     read from argv are refused when they are the config file named before the command or the default
     one of the repository, a file that profile names or a file under one of its source or test
-    folders, as far as it parses (the --repo and --config read from argv may be anything); else the
-    envelope and the line go there."""
+    folders, as far as it parses (the --repo and --config read from argv may be anything), or an
+    input file of the options as read from argv; else the envelope and the line go there."""
     words = _options(inv.argv)
     json_out = _scan_option(words, "--json-out")
     json_out = json_out if json_out not in ("", "-") else None
@@ -485,7 +517,8 @@ def _arm_scanned(inv: Invocation) -> None:
     if named:
         before = _global_words(words)
         value = _scan_option(before, "--config") or DEFAULT_CONFIG
-        _refuse_profile_clashes(inv, named, _scan_option(before, "--repo"), value, default=True)
+        repo = _scan_option(before, "--repo")
+        _refuse_profile_clashes(inv, named, repo, value, default=True, inputs=_scanned_inputs(words))
     _arm(inv, json_out, summary)
 
 

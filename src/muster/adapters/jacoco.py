@@ -168,6 +168,27 @@ def read_sessions(path: Path, *, name: str | None = None) -> list[tuple[int, int
     return _read(path, name)[0]
 
 
+def _resolve(
+    entries: list[tuple[str, FileCoverage]], resolver: SourceResolver, name: str
+) -> list[tuple[str, str | None, FileCoverage]]:
+    """(report name, repository-relative path or None under no source root, coverage) of every
+    source file, in report order. A report name found under two or more source roots, and two
+    report names found as one file (source roots that nest), are a ConfigError naming every path."""
+    resolved: list[tuple[str, str | None, FileCoverage]] = []
+    found: dict[str, str] = {}  # repository-relative path -> the report name found as it
+    for report_name, coverage in entries:
+        paths = resolver.resolve(report_name)
+        if len(paths) > 1:
+            raise ConfigError(f"{name}: {report_name} is under more than one source root: {', '.join(paths)}")
+        path = paths[0] if paths else None
+        if path is not None:
+            if path in found:
+                raise ConfigError(f"{name}: {found[path]} and {report_name} are both {path} (the source roots nest)")
+            found[path] = report_name
+        resolved.append((report_name, path, coverage))
+    return resolved
+
+
 def load(path: Path, resolver: SourceResolver, *, name: str | None = None) -> CoverageReport:
     """Every source file of the report with its per-line data and its counters, and the sessions.
     A report name found under two or more source roots, and two report names found as one file
@@ -175,22 +196,28 @@ def load(path: Path, resolver: SourceResolver, *, name: str | None = None) -> Co
     default the path."""
     sessions, entries, name = _read(path, name)
     files: dict[str, FileCoverage] = {}
-    found: dict[str, str] = {}  # repository-relative path -> the report name found as it
     unresolved: list[str] = []
     excluded: list[str] = []
-    for report_name, coverage in entries:
-        paths = resolver.resolve(report_name)
-        if len(paths) > 1:
-            raise ConfigError(f"{name}: {report_name} is under more than one source root: {', '.join(paths)}")
-        if not paths:
+    for report_name, found, coverage in _resolve(entries, resolver, name):
+        if found is None:
             unresolved.append(report_name)
-            continue
-        path = paths[0]
-        if path in found:
-            raise ConfigError(f"{name}: {found[path]} and {report_name} are both {path} (the source roots nest)")
-        found[path] = report_name
-        if path in resolver.classified:
-            files[path] = coverage
+        elif found in resolver.classified:
+            files[found] = coverage
         else:
-            excluded.append(path)
+            excluded.append(found)
     return CoverageReport(files, sessions, sorted(unresolved), sorted(excluded), len(entries))
+
+
+def source_files(
+    path: Path, resolver: SourceResolver, *, name: str | None = None
+) -> list[tuple[str, str | None, bool, FileCoverage]]:
+    """Every source file of the report, in report order, as (report name, repository-relative path
+    or None under no source root, whether the path is in the classification set, coverage), with no
+    file left out. The whole report is checked as load() checks it, and a name is resolved and
+    refused as load() does: the same two ConfigErrors. Messages name the file `name`, by default the
+    path."""
+    _, entries, name = _read(path, name)
+    return [
+        (report_name, found, found is not None and found in resolver.classified, coverage)
+        for report_name, found, coverage in _resolve(entries, resolver, name)
+    ]

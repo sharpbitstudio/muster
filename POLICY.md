@@ -49,7 +49,7 @@ Per change, added test lines should stay at about one times the production lines
 
 Tests are removed one method at a time, never by file or by count, and only when they duplicate a check that stays on the same or a lower level. The change shows its evidence:
 
-- `coverage-diff`: per-file coverage of two full runs, before and after. A critical file does not lose a covered line without an explanation;
+- `coverage-diff`: per-file coverage of two full runs, before and after. A critical file does not lose a covered line, or more than 1 covered branch counted per line, without an explanation in review;
 - `mutation-diff`: mutation results before and after, when the change touches unit tests of allowlisted files.
 
 Refactoring shared fixtures does not change what a test checks: test bodies, assertions and inputs stay the same.

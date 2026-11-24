@@ -1,5 +1,5 @@
-"""JUnit XML reports: the start and the duration of each test suite, and the window check of the
-times of a run.
+"""JUnit XML reports: the start and the duration of each test suite, the window check of the
+times of a run, and the identities of the test cases under a folder of reports.
 
 The root element is <testsuite> or <testsuites>. A suite without a timestamp is skipped; a
 timestamp without a zone is UTC.
@@ -10,11 +10,14 @@ from __future__ import annotations
 import datetime as dt
 import math
 import os
+import posixpath
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from muster.adapters import read_xml
+from muster.paths import is_link
 from muster.report import ReportError
 
 TOLERANCE_MS = 1000  # clock rounding between the build, the JUnit XML and the coverage agent
@@ -104,6 +107,65 @@ def read_suites(root: Path, files: list[str], errors: list[str] | None = None) -
                 raise
             errors.append(str(exc))
     return suites
+
+
+def xml_files(folder: str, errors: list[str]) -> list[str]:
+    """Every file under `folder`, a folder named on the command line, whose name ends in .xml in
+    exactly that case, at any depth, sorted by its path relative to the folder; each is named
+    `<folder>/<relative path>`, a path that opens it from the working directory too. A linked folder
+    (a symbolic link or a junction) below it is not followed; a folder that cannot be read adds its
+    message to `errors`, and the walk goes on."""
+    separators = tuple({os.sep, os.altsep or os.sep})
+    prefix = folder if folder.endswith(separators) else folder + "/"
+    found: list[str] = []
+
+    def unreadable(exc: OSError) -> None:
+        try:
+            rel = Path(exc.filename).relative_to(folder).as_posix()
+        except (TypeError, ValueError):  # no file name, or one outside the folder
+            rel = "."
+        errors.append(f"{folder if rel == '.' else prefix + rel}: cannot read: {exc.strerror or exc}")
+
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=unreadable, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not is_link(os.path.join(dirpath, name))]
+        here = Path(dirpath).relative_to(folder).as_posix()
+        for name in filenames:
+            if name.endswith(".xml") and os.path.isfile(os.path.join(dirpath, name)):
+                found.append(name if here == "." else posixpath.join(here, name))
+    return [prefix + rel for rel in sorted(found)]
+
+
+def _identities(file: str) -> Counter[str]:
+    document = read_xml(Path(file), file)
+    if document.tag not in _ROOTS:
+        raise ReportError(f"{file}: not a JUnit report, the root element is <{document.tag}>")
+    found: Counter[str] = Counter()
+    for case in document.iter("testcase"):
+        name = case.get("name")
+        if name is None:
+            raise ReportError(f"{file}: <testcase> has no attribute name")
+        if not name:
+            raise ReportError(f"{file}: <testcase> has an empty name")
+        found[f"{case.get('classname', '')}#{name}"] += 1
+    return found
+
+
+def identities(files: list[str], errors: list[str] | None = None) -> Counter[str]:
+    """How often each test case identity, `<classname>#<name>`, occurs in the files: every
+    <testcase> at any depth, skipped, failed and errored ones too; a missing classname is empty, and
+    a missing or empty name is an input error. Each file is a path from the working directory, as
+    xml_files() names it, and messages name it so. Without `errors` the first file that cannot be
+    read raises its ReportError; with it, each such file adds its message there and the other files
+    are still read."""
+    found: Counter[str] = Counter()
+    for file in files:
+        try:
+            found += _identities(file)
+        except ReportError as exc:
+            if errors is None:
+                raise
+            errors.append(str(exc))
+    return found
 
 
 def span(suites: list[Suite]) -> tuple[dt.datetime, dt.datetime, int] | None:

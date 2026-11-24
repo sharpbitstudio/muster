@@ -3,6 +3,7 @@
 Every tree is built in a temporary folder.
 """
 
+import argparse
 import os
 import stat
 import sys
@@ -15,6 +16,7 @@ from muster.config import Config, ConfigError
 from muster.paths import (
     _is_junction,
     exists_exact,
+    file_argument,
     group_of,
     in_loc_set,
     is_link,
@@ -444,6 +446,14 @@ class ExistsExactTest(TreeCase):
 
 
 class HelperTest(unittest.TestCase):
+    def test_file_argument_refuses_an_empty_name_or_a_nul(self):
+        self.assertEqual(file_argument("build/reports/report.xml"), "build/reports/report.xml")
+        for text, message in (("", "the file name is empty"), (f"build{chr(0)}.xml", "the file name has a NUL")):
+            with self.subTest(text=text):
+                with self.assertRaises(argparse.ArgumentTypeError) as caught:
+                    file_argument(text)
+                self.assertEqual(str(caught.exception), message)
+
     def test_normalize(self):
         self.assertEqual([normalize(p) for p in ("", ".", "./src/", "src//app")], ["", "", "src", "src/app"])
 
