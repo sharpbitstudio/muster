@@ -1128,6 +1128,63 @@ class JunitFolderTest(AdapterCase):
         self.assertEqual(found, ["results/TEST-two.xml"])
         self.assertEqual(errors, ["results/locked: cannot read: Permission denied"])
 
+    def test_walk_errors_come_in_path_order(self):
+        self.make("results/TEST-two.xml", "results/alpha/TEST-one.xml", "results/zeta/TEST-three.xml")
+        denied, scandir = {os.path.join("results", name) for name in ("alpha", "zeta")}, os.scandir
+
+        class Listing:
+            """The entries of a folder in a given order, read as os.walk() reads os.scandir()."""
+
+            def __init__(self, entries):
+                self.entries = iter(entries)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __next__(self):
+                return next(self.entries)
+
+        def walked(reverse: bool) -> list[str]:
+            def listing(top="."):
+                if os.path.normpath(os.fspath(top)) in denied:
+                    raise PermissionError(13, "Permission denied", top)
+                with scandir(top) as entries:
+                    return Listing(sorted(entries, key=lambda entry: entry.name, reverse=reverse))
+
+            errors: list[str] = []
+            with mock.patch("os.scandir", side_effect=listing):
+                self.assertEqual(junit.xml_files("results", errors), ["results/TEST-two.xml"])
+            return errors
+
+        expected = ["results/alpha: cannot read: Permission denied", "results/zeta: cannot read: Permission denied"]
+        self.assertEqual((walked(False), walked(True)), (expected, expected))
+
+    def test_file_that_cannot_be_looked_at(self):
+        self.make("results/TEST-two.xml", "results/locked.xml", "results/notes.txt")
+        denied, inspect = os.path.join("results", "locked.xml"), os.stat
+
+        def looking(path, *args, **kwargs):
+            if os.path.normpath(os.fspath(path)) == denied:
+                raise PermissionError(13, "Permission denied", path)
+            return inspect(path, *args, **kwargs)
+
+        errors: list[str] = []
+        with mock.patch("os.stat", side_effect=looking):
+            found = junit.xml_files("results", errors)
+        self.assertEqual(found, ["results/TEST-two.xml"])
+        self.assertEqual(errors, ["results/locked.xml: cannot read: Permission denied"])
+
+    @unittest.skipUnless(sys.platform == "win32", "only Windows has drives")
+    def test_bare_drive_gets_no_separator(self):
+        self.make("results/TEST-two.xml")
+        drive = os.path.splitdrive(os.getcwd())[0]
+        found = junit.xml_files(drive, [])
+        self.assertEqual(found, [drive + "results/TEST-two.xml"])
+        self.assertTrue(os.path.isfile(found[0]))
+
     def test_identities_count_every_test_case(self):
         token = "org.example.app.auth.TokenTest"
         self.write(
@@ -1136,10 +1193,13 @@ class JunitFolderTest(AdapterCase):
             f'<testcase name="bare()"/><testcase classname="{token}" name="checks()"><skipped/></testcase>'
             "</testsuite></testsuites>",
         )
-        failed = f'<testcase classname="{token}" name="fails()"><failure/></testcase>'
+        failed = f'<testcase classname="{token}" name="fails()"><failure><skipped/></failure></testcase>'
         self.write("results/TEST-two.xml", f"<testsuite>{failed}</testsuite>")
-        found = junit.identities(["results/TEST-one.xml", "results/TEST-two.xml"])
+        files = ["results/TEST-one.xml", "results/TEST-two.xml"]
+        found = junit.identities(files)
         self.assertEqual(found, Counter({f"{token}#checks()": 2, "#bare()": 1, f"{token}#fails()": 1}))
+        cases = {(token, "checks()", False): 1, (token, "checks()", True): 1, ("", "bare()", False): 1}
+        self.assertEqual(junit.testcases(files), Counter(cases | {(token, "fails()", False): 1}))  # a direct child
 
     def test_every_broken_identity_file_is_collected(self):
         cases = {

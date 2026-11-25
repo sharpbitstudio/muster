@@ -271,6 +271,11 @@ class SourceDeclaresTest(unittest.TestCase):
             with self.subTest(cls=suffix, member=member):
                 self.assertEqual(source_declares(self.SOURCE, POSTING_TEST + suffix, member), expected)
 
+    def test_package_is_everything_before_the_last_dot(self):
+        for cls, member in (("org.example.app$qa.PostingTest", "settles"), ("app$qa.PostingTest$Daily", "closes")):
+            with self.subTest(cls=cls):
+                self.assertEqual(source_declares(self.SOURCE, cls, member), "present")
+
     def test_keyword_before_a_call_is_no_return_type(self):
         for keyword in ("return", "else", "yield"):
             with self.subTest(keyword=keyword):
@@ -284,10 +289,13 @@ class SourceDeclaresTest(unittest.TestCase):
         self.assertEqual(source_declares(text, cls, member), "present")
 
     def test_source_that_cannot_be_followed_is_unresolved(self):
+        body = "    @Test\n    void settles() {{\n        {}\n    }}\n"
         cases = [
             ("unterminated block comment", "", java_source("    /* open\n    @Test\n    void settles() {}\n")),
             ("unterminated string", "", java_source('    String label = "open;\n    @Test\n    void settles() {}\n')),
             ("unbalanced braces", "", java_source("    @Test\n    void settles() {\n")),
+            ("unbalanced parentheses in a body", "", java_source(body.format("consume(;"))),
+            ("crossed brackets in a body", "", java_source(body.format("total = ([)];"))),
             ("class header twice", "$Daily", java_source("    class Daily {}\n    @Nested\n    class Daily {}\n")),
             ("class header not found", "$Monthly", self.SOURCE),
         ]

@@ -549,6 +549,17 @@ class ScannedOutputClashTest(CliCase):
         code, _, err = self.run_main("--repo", str(self.repo), "loc", "--base=", *nul, "--json-out", "out.json")
         self.assertEqual((code, self.read_json(self.work / "out.json")["exit_code"]), (2, 2), err)
 
+    def test_every_value_of_an_input_option_is_an_input(self):
+        kept = self.work / "kept.xml"
+        kept.write_bytes(b"kept\n")
+        for command in ("coverage-diff", "mutation-diff"):
+            with self.subTest(command=command):
+                argv = [command, "--before=kept.xml", "--before=", "--after=after.xml", "--json-out=kept.xml"]
+                code, _, err = self.run_main("--repo", str(self.repo), *argv)
+                self.assertEqual(code, 2, err)
+                self.assertIn("error: --json-out kept.xml is --before kept.xml\n", err)
+                self.assertEqual(kept.read_bytes(), b"kept\n")
+
     def test_nul_in_repo_still_refuses_two_outputs_that_are_one_file(self):
         argv = ["--repo", str(self.repo) + chr(0), "loc", "--base=", "--json-out", "same.out"]
         code, _, err = self.run_main(*argv, "--summary-file", "same.out")

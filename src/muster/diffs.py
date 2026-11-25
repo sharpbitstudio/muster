@@ -18,10 +18,12 @@ without a verdict (NOT COMPARABLE). A mutant detected before and not after is lo
 unless every lost mutant is a configured known variation whose killing test is present in the after
 run: an entry of [[mutation.known_variation]] names a mutant by the simple names of its class and
 mutator, its method and its line, and it is a tolerance only for the one mutant of the two runs it
-names. With --junit-after the killing test of a lost mutant is looked up in the JUnit identities
-of the after run; when a display name or a parameterized invocation hides the method name, the
-Java source of its class under [source].tests decides, read only when exactly one test folder
-holds it in exactly that case. The command checks no policy and judges no zone.
+names. With --junit-after the killing test of a lost mutant is looked up among the JUnit test
+cases of the after run that were not skipped; a skipped test case of its class leaves it unresolved
+unless a plain name shows the method. When a display name or a parameterized invocation hides the
+method name, the Java source of its class under [source].tests decides, read only when exactly one
+test folder holds it in exactly that case. An ambiguous entry of [[mutation.known_variation]] is
+shown also when nothing is lost. The command checks no policy and judges no zone.
 
 The repository (--repo, the root of the profile) is the tree after the change: the zones, the
 source roots, the classification set and the test sources come from it, so it must be the tree
@@ -43,6 +45,7 @@ import posixpath
 import re
 import stat
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,8 +163,14 @@ def mutation_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _folder_key(folder: str) -> str:
-    """A folder named on the command line, as two names of the same folder share it."""
-    return os.path.normcase(os.path.abspath(folder))
+    """A folder named on the command line, as two names of the same folder share it: resolved, so
+    that a link followed by `..` is the folder it leads to, else by its absolute name. It never
+    raises."""
+    try:
+        resolved = os.path.realpath(folder)
+    except OSError:  # a path that cannot be resolved (a busy named pipe on Windows, say)
+        resolved = os.path.abspath(folder)
+    return os.path.normcase(resolved)
 
 
 def _walk(folder: str) -> tuple[list[str], list[str]]:
@@ -224,12 +233,12 @@ def _file_problem(name: str, missing: str) -> str | None:
     return None if stat.S_ISREG(mode) else f"{name}: not a file"
 
 
-def _identities(args: argparse.Namespace, folder: str, errors: list[str]) -> Counter[str]:
-    """The test identities under a JUnit folder; every problem of the walk and of the files goes to
-    `errors`, in that order."""
+def _junit(args: argparse.Namespace, folder: str, errors: list[str], read: Callable[..., Counter]) -> Counter:
+    """What `read` (junit.identities or junit.testcases) finds in the files under a JUnit folder;
+    every problem of the walk and of the files goes to `errors`, in that order."""
     files, problems = _walked(args, folder)
     errors.extend(problems)
-    return junit.identities(files, errors)
+    return read(files, errors)
 
 
 def _errored(rep: Report, title: str, heading: str, errors: list[str]) -> None:
@@ -292,7 +301,7 @@ def coverage_diff(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
         read: dict[str, Counter[str]] = {}  # the same folder named twice is read once
         for folder in (args.junit_before, args.junit_after):
             if _folder_key(folder) not in read:
-                read[_folder_key(folder)] = _identities(args, folder, errors)
+                read[_folder_key(folder)] = _junit(args, folder, errors, junit.identities)
         identities = read[_folder_key(args.junit_before)], read[_folder_key(args.junit_after)]
     if errors:
         _errored(rep, "Coverage diff", "## Coverage diff", errors)
@@ -560,61 +569,58 @@ def _no_path(cls: str) -> bool:
 
 
 class _Killers:
-    """The status of a killing test in the after run, by the JUnit identities of its class, else by
-    the Java source of the class in the test folders: `present`, `deleted` or `unresolved`."""
+    """The status of a killing test in the after run, by the JUnit test cases of its class that were
+    not skipped, else by the Java source of the class in the test folders: `present`, `deleted` or
+    `unresolved`."""
 
-    def __init__(self, cfg: Config, sets: SourceSets, identities: Counter[str]) -> None:
+    def __init__(self, cfg: Config, sets: SourceSets, cases: Counter[tuple[str, str, bool]]) -> None:
         self.root = cfg.root
-        self.by_class: dict[str, list[str]] = {}
-        for identity in identities:
-            cls, _, name = identity.partition("#")
-            self.by_class.setdefault(cls, []).append(name)
+        self.by_class: dict[str, list[str]] = {}  # the names of the test cases that were not skipped
+        self.skipped: set[str] = set()  # the classes with a skipped test case
+        for cls, name, skipped in cases:
+            if skipped:
+                self.skipped.add(cls)
+            else:
+                self.by_class.setdefault(cls, []).append(name)
         self.folders = list(dict.fromkeys(normalize(folder) for folder in cfg.get("source.tests", [])))
-        # the extensions of each walked test file, by its path without the extension
-        self.extensions: dict[str, set[str]] = {}
-        for path in sets.walked_tests:
-            stem, dot, ext = path.rpartition(".")
-            if dot and "/" not in ext:
-                self.extensions.setdefault(stem, set()).add(ext)
+        self.walked = frozenset(sets.walked_tests)
         self.texts: dict[str, str | None] = {}
 
     def status(self, entry: str) -> str:
-        """`present`: a test case `method(...)` of the class has the name; `deleted`: the class has
-        no test case, or every name is a plain method signature and none is the method (a test
-        template or factory too); otherwise a display name or an invocation hides the method name,
-        and the source decides. An entry that is no unique id is `unresolved`."""
+        """An entry that is no unique id is `unresolved`. Else, by the test cases of the class that
+        were not skipped: none, and none skipped either, is `deleted`; a test case `method(...)` of
+        the method is `present`; a skipped test case of the class is `unresolved`; every name a
+        plain method signature and none the method (a test template or factory too) is `deleted`;
+        otherwise a display name or an invocation hides the method name, and the source decides."""
         parsed = parse_killing_test(entry)
         if parsed is None:
             return "unresolved"
         cls, member, kind = parsed
-        names = self.by_class.get(cls)
-        if not names:
+        names = self.by_class.get(cls, [])
+        if not names and cls not in self.skipped:
             return "deleted"
         plain = [PLAIN_TEST_NAME.fullmatch(name) for name in names]
         if kind == "method" and any(match and match.group(1) == member for match in plain):
             return "present"
+        if cls in self.skipped:
+            return "unresolved"
         if all(plain):
             return "deleted"
         return self._in_source(cls, member)
 
     def _in_source(self, cls: str, member: str) -> str:
         """The source of the top-level class, `<folder>/<package as folders>/<class>.java` in one
-        of the test folders, walked and in exactly that case: none is `deleted`, unless a file of
-        the class with another extension is there; two, a source that cannot be read, a class name
-        that names no file and no test folder at all are `unresolved`; one is read."""
+        of the test folders, walked and in exactly that case, where the package is everything
+        before the last dot of the class name: one is read; none (the class ran, so the lookup
+        failed), two, a source that cannot be read, a class name that names no file and no test
+        folder at all are `unresolved`."""
         if _no_path(cls) or not self.folders:
             return "unresolved"
-        stem = cls.partition("$")[0].replace(".", "/")
-        found, other = [], False
-        for folder in self.folders:
-            path = posixpath.join(folder, stem) if folder else stem
-            extensions = self.extensions.get(path, set())
-            if "java" in extensions:
-                found.append(path + ".java")
-            other = other or bool(extensions - {"java"})
-        if not found:
-            return "unresolved" if other else "deleted"
-        if len(found) > 1:
+        package, _, chain = cls.rpartition(".")
+        stem = posixpath.join(package.replace(".", "/"), chain.partition("$")[0])
+        candidates = [posixpath.join(folder, stem) + ".java" for folder in self.folders]
+        found = [path for path in candidates if path in self.walked]
+        if len(found) != 1:
             return "unresolved"
         text = self._text(found[0])
         return "unresolved" if text is None else source_declares(text, cls, member)
@@ -680,11 +686,11 @@ def mutation_diff(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     errors: list[str] = []
     before = _read_pit(args.before, resolver, errors)
     after = _read_pit(args.after, resolver, errors)
-    identities = None if args.junit_after is None else _identities(args, args.junit_after, errors)
+    cases = None if args.junit_after is None else _junit(args, args.junit_after, errors, junit.testcases)
     if errors:
         _errored(rep, "Mutation diff", "## Mutation diff", errors)
         return
-    killers = None if identities is None else _Killers(cfg, sets, identities)
+    killers = None if cases is None else _Killers(cfg, sets, cases)
     _mutation_verdict(args, cfg, rep, before, after, killers)
 
 
@@ -805,6 +811,8 @@ def _mutation_verdict(
         rep.md.append("")
     if lost:
         _lost_markdown(rep, lost, deleted, entries, ambiguous, killers)
+    elif ambiguous:
+        _ambiguous_markdown(rep, ambiguous)
     if gained:
         rep.md.append(f"### Gained mutants ({len(gained)}; detected after, not before)")
         rep.md.append("")
@@ -846,6 +854,20 @@ def _mutation_verdict(
     }
 
 
+def _ambiguous_markdown(rep: Report, ambiguous: list[dict]) -> None:
+    """The entries of [[mutation.known_variation]] that name more than one mutant."""
+    names = [
+        code_span(f"{entry['class']}.{entry['method']} L{entry['line']} {entry['mutator']}")
+        + f" ({entry['matches']} mutants)"
+        for entry in ambiguous
+    ]
+    rep.md.append(
+        "No tolerance for an entry of `[[mutation.known_variation]]` that names more than one mutant: "
+        + ", ".join(names)
+    )
+    rep.md.append("")
+
+
 def _lost_markdown(
     rep: Report,
     lost: list[_Lost],
@@ -868,16 +890,7 @@ def _lost_markdown(
         )
         rep.md.append("")
     if ambiguous:
-        names = [
-            code_span(f"{entry['class']}.{entry['method']} L{entry['line']} {entry['mutator']}")
-            + f" ({entry['matches']} mutants)"
-            for entry in ambiguous
-        ]
-        rep.md.append(
-            "No tolerance for an entry of `[[mutation.known_variation]]` that names more than one mutant: "
-            + ", ".join(names)
-        )
-        rep.md.append("")
+        _ambiguous_markdown(rep, ambiguous)
     items = []
     for item in lost:
         tests = ", ".join(code_span(killing_test_text(test)) for test in item.before.killing_tests) or "none"
@@ -902,9 +915,11 @@ def _lost_markdown(
         rep.md.append("")
     if any(item.killer == "unresolved" for item in lost):
         rep.md.append(
-            "`unresolved`: the test class still runs, but a display name or a parameterized invocation"
-            " hides the method name in the JUnit XML (no test sources to check, its class body not found"
-            " in them, a source of its class in two test folders, in another language or that cannot be"
-            " read, a class name that names no file, or not a JUnit Platform unique id)."
+            "`unresolved`: the killing test could be neither confirmed nor ruled out. A display name or a"
+            " parameterized invocation hides the method name in the JUnit XML and the source does not tell"
+            " (no test sources, no source of its class found, its class body not found, a source of its"
+            " class in two test folders or that cannot be read, a class name that names no file, unbalanced"
+            " source, a test the class may inherit), a test case of its class was skipped, or the entry is"
+            " not a JUnit Platform unique id."
         )
         rep.md.append("")
