@@ -1,5 +1,6 @@
-"""Tests of muster.lang: the generic line counter, the Java counter, the language of a file, the
-languages of a profile and the count of a file read from disk.
+"""Tests of muster.lang: the generic line counter, the Java counter, the reading of a JUnit Platform
+unique id and of a Java test source, the language of a file, the languages of a profile and the
+count of a file read from disk.
 
 Every sample is synthetic. Non-ASCII and control characters are built at run time with chr().
 """
@@ -12,9 +13,11 @@ from pathlib import Path
 from unittest import mock
 
 from muster.lang import BUILT_IN, JAVA, Language, count_file, generic_loc, language_of, languages
-from muster.lang.java import java_loc
+from muster.lang.java import is_test_declaration, java_loc, parse_killing_test, source_declares
 
 C_LIKE = ("//", ("/*", "*/"))
+PACKAGE = "org.example.app.billing.internal.ledger"
+POSTING_TEST = PACKAGE + ".PostingTest"
 
 
 def c_like(*lines: str) -> int:
@@ -141,6 +144,156 @@ class JavaCounterTest(unittest.TestCase):
         text = 'String open = "/*";\nint size;\nString close = "*/";\n'
         self.assertEqual(java.count(text), 3)
         self.assertEqual(Language("other", (".other",), "//", ("/*", "*/")).count(text), 2)
+
+
+def unique_id(cls: str, *segments: str) -> str:
+    """A killing test entry as PIT writes it: the class and a dot, then the JUnit Platform unique id
+    of a test of that class, whose segments after the class segment are `segments`."""
+    return cls + ".[engine:junit-jupiter]/[class:" + cls + "]/" + "/".join(segments)
+
+
+def java_source(body: str) -> str:
+    """The source of the top-level class POSTING_TEST with the class body `body`."""
+    return "package " + PACKAGE + ";\n\nclass PostingTest {\n" + body + "}\n"
+
+
+class UniqueIdTest(unittest.TestCase):
+    def test_class_member_and_kind(self):
+        cases = [
+            (unique_id(POSTING_TEST, "[method:settles(java.lang.String[], int)]"), (POSTING_TEST, "settles", "method")),
+            (
+                unique_id(POSTING_TEST, "[nested-class:Daily]", "[nested-class:Closing]", "[method:reconciles()]"),
+                (POSTING_TEST + "$Daily$Closing", "reconciles", "method"),
+            ),
+            (
+                unique_id(POSTING_TEST, "[test-template:converts(int)]", "[test-template-invocation:#2]"),
+                (POSTING_TEST, "converts", "test-template"),
+            ),
+            (POSTING_TEST + ".settles(" + POSTING_TEST + ")", None),  # a JUnit 4 entry
+            ("", None),
+        ]
+        for entry, expected in cases:
+            with self.subTest(entry=entry):
+                self.assertEqual(parse_killing_test(entry), expected)
+
+
+class SourceDeclaresTest(unittest.TestCase):
+    SOURCE = java_source(
+        "\n".join(
+            [
+                "    private static final char QUOTE = '\"';",
+                '    private static final String NOTE = "@Test void quoted() {}";',
+                '    private static final String BLOCK = """',
+                "        @Test",
+                "        void blocked() {}",
+                '        """;',
+                "    private final int[] limits = {7, 30};",
+                "",
+                "    // The field and the constructor carry @Test, so that only their shape keeps them out.",
+                "    @Test",
+                "    private int count;",
+                "",
+                "    @Test",
+                "    PostingTest() {}",
+                "",
+                "    // @Test",
+                "    // void lineHidden() {}",
+                "",
+                "    /*",
+                "     * @Test",
+                "     * void blockHidden() {}",
+                "     */",
+                "",
+                "    @Test",
+                "    void settles() {",
+                "        audited(true, 2);",
+                "    }",
+                "",
+                "    int audited(boolean open, int days) {",
+                "        if (open) {",
+                "            count++;",
+                "        } else reopened();",
+                "        if (days > 0) {",
+                "            return refunded();",
+                "        }",
+                "        return switch (days) {",
+                "            default -> {",
+                "                yield yielded();",
+                "            }",
+                "        };",
+                "    }",
+                "",
+                '    @DisplayName("Carries (and rounds) the balance")',
+                "    @Timeout(value = 2, unit = TimeUnit.SECONDS)",
+                "    public final @Test void carried() throws IOException, InterruptedException {}",
+                "",
+                "    @org.junit.jupiter.params.ParameterizedTest",
+                "    @ValueSource(ints = {7, 30})",
+                "    protected <T extends Number> void parsed(int days) {}",
+                "",
+                "    @Nested",
+                "    class Daily {",
+                "        @Test",
+                "        void closes() {}",
+                "",
+                "        @Nested",
+                "        class Closing {",
+                '            @org.junit.jupiter.api.RepeatedTest(value = 3, name = "run {currentRepetition}")',
+                "            void reconciles() {}",
+                "        }",
+                "    }",
+                "",
+            ]
+        )
+    )
+
+    def test_only_a_test_of_the_killers_own_class_counts(self):
+        cases = [
+            ("", "settles", "present"),
+            ("$Daily", "closes", "present"),
+            ("$Daily$Closing", "reconciles", "present"),
+            ("", "closes", "deleted"),  # a nested test for a top-level killer
+            ("$Daily", "settles", "deleted"),  # a top-level test for a nested killer
+            ("", "audited", "deleted"),  # no test annotation
+            ("", "reopened", "deleted"),  # only called, after else, return or yield
+            ("", "refunded", "deleted"),
+            ("", "yielded", "deleted"),
+            ("", "lineHidden", "deleted"),
+            ("", "blockHidden", "deleted"),
+            ("", "quoted", "deleted"),  # in a string
+            ("", "blocked", "deleted"),  # in a text block
+            ("", "carried", "present"),  # annotations and modifiers mixed
+            ("", "parsed", "present"),
+            ("", "PostingTest", "deleted"),  # the constructor
+            ("", "count", "deleted"),  # the field
+        ]
+        for suffix, member, expected in cases:
+            with self.subTest(cls=suffix, member=member):
+                self.assertEqual(source_declares(self.SOURCE, POSTING_TEST + suffix, member), expected)
+
+    def test_keyword_before_a_call_is_no_return_type(self):
+        for keyword in ("return", "else", "yield"):
+            with self.subTest(keyword=keyword):
+                self.assertFalse(is_test_declaration("\n    @Test\n    " + keyword + " refunded()", "refunded"))
+        self.assertTrue(is_test_declaration("\n    @Test\n    Object refunded()", "refunded"))
+
+    def test_overloads_are_one_declaration(self):
+        # Only the method name is compared: the killer names the overload without a test annotation.
+        text = java_source("    @Test\n    void split(int parts) {}\n\n    void split(String label) {}\n")
+        cls, member, _ = parse_killing_test(unique_id(POSTING_TEST, "[method:split(java.lang.String)]"))
+        self.assertEqual(source_declares(text, cls, member), "present")
+
+    def test_source_that_cannot_be_followed_is_unresolved(self):
+        cases = [
+            ("unterminated block comment", "", java_source("    /* open\n    @Test\n    void settles() {}\n")),
+            ("unterminated string", "", java_source('    String label = "open;\n    @Test\n    void settles() {}\n')),
+            ("unbalanced braces", "", java_source("    @Test\n    void settles() {\n")),
+            ("class header twice", "$Daily", java_source("    class Daily {}\n    @Nested\n    class Daily {}\n")),
+            ("class header not found", "$Monthly", self.SOURCE),
+        ]
+        for label, suffix, text in cases:
+            with self.subTest(label):
+                self.assertEqual(source_declares(text, POSTING_TEST + suffix, "settles"), "unresolved")
 
 
 class LanguageOfTest(unittest.TestCase):
