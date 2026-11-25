@@ -385,7 +385,8 @@ def _check_duration(data: dict) -> None:
 def _check_mutation(data: dict) -> None:
     """The effective mutation target, a default included, is not below the threshold (the two may be
     equal), and the keys of mutation.tool_versions are usable: each one not empty, without a control
-    character and listed once, and read from a file that the table names."""
+    character and listed once, and read from a file that the table names; then the known variation
+    entries."""
     mutation = data.get("mutation", {})
     threshold = mutation.get("threshold", DEFAULT_MUTATION_THRESHOLD)
     target = mutation.get("target", DEFAULT_MUTATION_TARGET)
@@ -410,6 +411,28 @@ def _check_mutation(data: dict) -> None:
         seen[key] = i
     if seen and "file" not in versions:
         raise ConfigError("mutation.tool_versions.file: missing; the versions of the keys are read from it")
+    _check_known_variation(mutation.get("known_variation", []))
+
+
+def _check_known_variation(entries: list[dict]) -> None:
+    """Every [[mutation.known_variation]] entry names one mutant: a class, a method and a mutator
+    that are not empty and have no control character, the class and the mutator by their simple
+    names, without a dot; and no entry is listed twice."""
+    seen: dict[tuple, int] = {}
+    for i, entry in enumerate(entries):
+        key = f"mutation.known_variation[{i}]"
+        for name in ("class", "method", "mutator"):
+            value, shown = entry[name], json.dumps(entry[name])
+            if value == "":
+                raise ConfigError(f"{key}.{name}: must not be empty")
+            if _has_control(value):
+                raise ConfigError(f"{key}.{name}: has a control character, got {shown}")
+            if name != "method" and "." in value:
+                raise ConfigError(f"{key}.{name}: has a dot, got {shown}; use the simple name")
+        mutant = (entry["class"], entry["method"], entry["line"], entry["mutator"])
+        if mutant in seen:
+            raise ConfigError(f"{key}: the same mutant as mutation.known_variation[{seen[mutant]}]")
+        seen[mutant] = i
 
 
 def _extension_problem(value: str) -> str | None:
@@ -586,6 +609,13 @@ class Config:
     @property
     def mutation_targets(self) -> str | None:
         return self.get("mutation.targets")
+
+    @property
+    def known_variation(self) -> frozenset[tuple[str, str, int, str]]:
+        """The (class, method, line, mutator) of each [[mutation.known_variation]] entry, the class
+        and the mutator by their simple names."""
+        entries = self.get("mutation.known_variation", [])
+        return frozenset((e["class"], e["method"], e["line"], e["mutator"]) for e in entries)
 
     @property
     def own_test(self) -> str | None:

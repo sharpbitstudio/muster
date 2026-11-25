@@ -125,6 +125,14 @@ ANALYSES: dict[str, Analysis] = {
         protected=policy.protected,
         option_inputs=diffs.option_inputs,
     ),
+    "mutation-diff": Analysis(
+        diffs.mutation_diff,
+        diffs.MUTATION_HELP,
+        diffs.mutation_arguments,
+        named_files,
+        protected=policy.protected,
+        option_inputs=diffs.option_inputs,
+    ),
 }
 # The names --strict-only takes: the sections of [check] sections, and the diff commands, which
 # are no section of the profile.
