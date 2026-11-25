@@ -648,6 +648,25 @@ class PitLoadTest(AdapterCase):
         self.assertEqual(len(report.mutants), 2)
         self.assertEqual(report.mutants[0], report.mutants[1])
 
+    def test_killing_tests_are_split_on_the_bar(self):
+        first = "org.example.app.auth.TokenTest.[method:renews()]"
+        second = "org.example.app.auth.TokenTest.[method:expires()]"
+        cases = ((f" {first} | |{second}| ", [first, second]), (" | ", []), (first, [first]))
+        mutations = (mutation(killingTest=killing, lineNumber=str(nr)) for nr, (killing, _) in enumerate(cases, 1))
+        report = self.load(*mutations)
+        self.assertEqual([mutant.killing_tests for mutant in report.mutants], [expected for _, expected in cases])
+
+    def test_report_without_mutations_only_on_request(self):
+        path = self.write("build/reports/pit/mutations.xml", '<mutations partial="true">\n</mutations>\n')
+        resolver = self.resolver([MAIN], self.classified)
+        self.assertEqual(pit.load(path, resolver, allow_empty=True), pit.MutationReport([], []))
+        with self.assertRaises(ReportError):
+            pit.load(path, resolver)
+        self.write("build/reports/pit/mutations.xml", "<report/>\n")
+        with self.assertRaises(ReportError) as caught:
+            pit.load(path, resolver, allow_empty=True)
+        self.assertIn("not a PIT report, the root element is <report>", str(caught.exception))
+
     def test_name_under_no_root_is_unresolved(self):
         report = self.load(
             mutation(mutatedClass="org.example.app.queue.Dispatcher", sourceFile="Dispatcher.java"),

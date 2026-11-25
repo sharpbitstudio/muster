@@ -324,6 +324,12 @@ class PolicyGateTest(MutationCase):
 
 
 class CountTest(MutationCase):
+    def test_the_same_mutant_twice_counts_twice(self):
+        # mutation-diff refuses such a report as an input error (tests/test_mutation_diff.py).
+        self.measure(mutants(ENGINE) * 2 + mutants(TOKEN))
+        run = self.passed()
+        self.assertEqual((run.data["totals"]["total"], run.data["files"][ENGINE]["total"]), (3, 2))
+
     def test_counts_follow_detected_and_leave_no_coverage_out(self):
         items = mutants(ENGINE, "KILLED", 2)
         for status in ("TIMED_OUT", "RUN_ERROR", "MEMORY_ERROR", "NON_VIABLE"):

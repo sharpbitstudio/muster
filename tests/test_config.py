@@ -494,6 +494,57 @@ class ToolVersionsTest(ValidateCase):
                 validate(self.versions(table))
 
 
+class KnownVariationTest(ValidateCase):
+    """Each [[mutation.known_variation]] entry names one mutant: a class, a method and a mutator that
+    are not empty and have no control character, the class and the mutator by their simple names;
+    no entry is listed twice."""
+
+    KEY = "mutation.known_variation"
+
+    def entries(self, *changes: dict) -> dict:
+        return {"mutation": {"known_variation": [dict(ENTRIES["known_variation"], **change) for change in changes]}}
+
+    def test_refusals(self):
+        key = self.KEY
+        for changes, message in (
+            ([{"class": ""}], f"{key}[0].class: must not be empty"),
+            ([{"method": ""}], f"{key}[0].method: must not be empty"),
+            ([{}, {"mutator": ""}], f"{key}[1].mutator: must not be empty"),
+            ([{"class": "Order" + chr(10) + "Rules"}], f'{key}[0].class: has a control character, got "Order\\nRules"'),
+            ([{"method": "total" + chr(0x85)}], f'{key}[0].method: has a control character, got "total\\u0085"'),
+            ([{"mutator": "Math" + chr(0x2028)}], f'{key}[0].mutator: has a control character, got "Math\\u2028"'),
+            (
+                [{"class": "org.example.app.OrderRules"}],
+                f'{key}[0].class: has a dot, got "org.example.app.OrderRules"; use the simple name',
+            ),
+            (
+                [{"mutator": "experimental.MathMutator"}],
+                f'{key}[0].mutator: has a dot, got "experimental.MathMutator"; use the simple name',
+            ),
+            ([{}, {"line": 2}, {}], f"{key}[2]: the same mutant as {key}[0]"),
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.error(self.entries(*changes)), message)
+
+    def test_accepted_and_read(self):
+        data = self.entries(
+            {"class": "OrderRules$Totals", "method": "lambda$total$0"},
+            {"method": "<init>", "line": 0},
+            {"line": 2},
+            {},
+        )
+        cfg = Config(Path("/work/repo"), Path("/work/repo/muster.toml"), data)
+        validate(data)
+        expected = {
+            ("OrderRules$Totals", "lambda$total$0", 1, "MathMutator"),
+            ("OrderRules", "<init>", 0, "MathMutator"),
+            ("OrderRules", "total", 2, "MathMutator"),
+            ("OrderRules", "total", 1, "MathMutator"),
+        }
+        self.assertEqual(cfg.known_variation, expected)
+        self.assertEqual(Config(Path("/work/repo"), Path("/work/repo/muster.toml"), {}).known_variation, set())
+
+
 class SchemaVersionTest(ValidateCase):
     def test_version_one(self):
         validate({"schema": 1})

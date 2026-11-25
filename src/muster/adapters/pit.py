@@ -6,7 +6,8 @@ so a nested class `Outer$Inner` belongs to the file of `Outer`. A name found und
 unresolved, one found under a single root is that file, inside or outside the classification set,
 and one found under two or more roots is a ConfigError, as are two names found as the same file.
 `detected` is read from its attribute, never derived from the status; a record whose two disagree
-is an input error. The same mutant twice in a report is two mutants.
+is an input error. The same mutant twice in a report is two mutants. The killing tests of a
+mutant are the parts of its <killingTest> text between the | signs.
 """
 
 from __future__ import annotations
@@ -50,7 +51,9 @@ class Mutant:
     status_raw: str  # the status attribute as given; "?" when it is missing or empty
     status: str  # "killed", "survived", "no-coverage" or "other"
     detected: bool
-    killing_tests: list[str]  # the <killingTest> text; [] when it is absent or empty
+    # the tests of the <killingTest> text, split on | and stripped, without empty parts; [] when it
+    # is absent or empty
+    killing_tests: list[str]
     description: str
     # "class", "method", "descriptor", "indexes", "mutator_full" and "report_name", the
     # `package/file` name the source is resolved by
@@ -171,23 +174,26 @@ def _mutant(mutation: ET.Element, where: str) -> Mutant:
         status_raw=status_raw,
         status=status,
         detected=detected,
-        killing_tests=[killing] if killing else [],
+        killing_tests=[test.strip() for test in killing.split("|") if test.strip()],
         description=_text(mutation, "description", where),
         meta=meta,
     )
 
 
-def load(path: Path, resolver: SourceResolver, *, name: str | None = None) -> MutationReport:
+def load(
+    path: Path, resolver: SourceResolver, *, name: str | None = None, allow_empty: bool = False
+) -> MutationReport:
     """Every mutant of the report, after the whole document is checked, with its source file
-    resolved. A report name found under two or more source roots, and two report names found as one
-    file (source roots that nest), are a ConfigError naming every path. Messages name the file
-    `name`, by default the path, and a mutation by its position in the report, from 1."""
+    resolved. A report without any <mutation> is an input error, unless `allow_empty`. A report
+    name found under two or more source roots, and two report names found as one file (source roots
+    that nest), are a ConfigError naming every path. Messages name the file `name`, by default the
+    path, and a mutation by its position in the report, from 1."""
     name = label(path) if name is None else name
     root = read_xml(path, name)
     if root.tag != "mutations":
         raise ReportError(f"{name}: not a PIT report, the root element is <{root.tag}>")
     mutations = root.findall("mutation")
-    if not mutations:
+    if not mutations and not allow_empty:
         raise ReportError(f"{name} has no mutations")
     mutants = [_mutant(mutation, f"{name}: mutation {nr}") for nr, mutation in enumerate(mutations, 1)]
     files: dict[str, str | None] = {}  # report name -> repository-relative path, None when unresolved
