@@ -132,10 +132,12 @@ def unique_id(cls: str, member: str, *nested: str, kind: str = "method") -> str:
 
 
 def junit_report(*cases) -> str:
-    """A JUnit XML file of one suite; per case (classname, name)."""
+    """A JUnit XML file of one suite; per case (classname, name), skipped with a third item True."""
     rows = "".join(
-        f'<testcase name={quoteattr(case)} classname={quoteattr(classname)} time="0.01"></testcase>'
-        for classname, case in cases
+        f'<testcase name={quoteattr(case)} classname={quoteattr(classname)} time="0.01">'
+        + ("<skipped/>" if skipped and skipped[0] else "")
+        + "</testcase>"
+        for classname, case, *skipped in cases
     )
     suite = f'<testsuite name="{ENGINE_TEST}" tests="{len(cases)}" hostname="localhost"'
     suite += ' timestamp="2026-11-10T08:00:00">'
@@ -420,13 +422,14 @@ class KnownVariationTest(DiffCase):
     def test_known_variation_needs_a_present_killer(self):
         cases = (
             ("not checked", self.KILLER, None),
-            ("unresolved", f"{PARSER_TEST}.decodes({PARSER_TEST})", PARSER_TEST),
-            ("no killing test recorded", "", PARSER_TEST),
-            ("deleted", self.KILLER, ENGINE_TEST),
+            ("unresolved", f"{PARSER_TEST}.decodes({PARSER_TEST})", (PARSER_TEST, "decodes()")),
+            ("unresolved", self.KILLER, (PARSER_TEST, "decodes()", True)),  # skipped
+            ("no killing test recorded", "", (PARSER_TEST, "decodes()")),
+            ("deleted", self.KILLER, (ENGINE_TEST, "decodes()")),
         )
-        for killer, killing, junit_class in cases:
-            with self.subTest(killer=killer):
-                junit = [] if junit_class is None else self.junit((junit_class, "decodes()"))
+        for killer, killing, case in cases:
+            with self.subTest(killer=killer, case=case):
+                junit = [] if case is None else self.junit(case)
                 run = self.judged([self.parser(killing=killing)], [self.parser("SURVIVED")], "warn", *junit)
                 self.assertEqual((run.killer, run.data["lost"][0]["known_variation"]), (killer, False))
                 self.assertNotIn("**known variation**", run.summary)
@@ -480,6 +483,16 @@ class KnownVariationTest(DiffCase):
                 self.assertIn(f"\n{AMBIGUOUS}`KeyParser.decode L{12} MathMutator` (2 mutants)\n", run.summary)
                 self.assertNotIn("**known variation**", run.summary)
 
+    def test_entry_that_names_two_mutants_is_shown_when_nothing_is_lost(self):
+        report = [self.parser(indexes=(1,)), self.parser(indexes=(2,))]
+        run = self.judged(report, report, "pass")
+        entry = {"class": "KeyParser", "method": "decode", "line": 12, "mutator": "MathMutator", "matches": 2}
+        self.assertEqual(run.data["known_variation_ambiguous"], [entry])
+        line = f"\n{AMBIGUOUS}`KeyParser.decode L{12} MathMutator` (2 mutants)\n"
+        self.assertIn(line, run.summary)
+        self.assertLess(run.summary.index("| after |"), run.summary.index(line))
+        self.assertNotIn("### Lost mutants", run.summary)
+
     def test_known_variation_with_a_killer_found_in_the_source(self):
         junit = self.junit((PARSER_TEST, "Decodes a padded key"))
         for body, killer, outcome in (
@@ -515,12 +528,25 @@ class KillerTest(DiffCase):
                 "present",
             ),
             ("not a unique id", f"{ENGINE_TEST}.settles({ENGINE_TEST})", [(ENGINE_TEST, "settles()")], "unresolved"),
+            ("only skipped test cases", self.SETTLES, [(ENGINE_TEST, "settles()", True)], "unresolved"),
+            (
+                "plain names beside a skipped one",
+                self.SETTLES,
+                [(ENGINE_TEST, "refunds()"), (ENGINE_TEST, "postpones()", True)],
+                "unresolved",
+            ),
+            (
+                "a plain name beside its skipped one",
+                self.SETTLES,
+                [(ENGINE_TEST, "settles()"), (ENGINE_TEST, "settles()", True)],
+                "present",
+            ),
         )
         for case, killing, junit, expected in cases:
             with self.subTest(case=case):
                 run = self.lost(killing, *self.junit(*junit))
                 self.assertEqual(run.killer, expected)
-                hidden = "`unresolved`: the test class still runs"
+                hidden = "`unresolved`: the killing test could be neither confirmed nor ruled out."
                 self.assertEqual(hidden in run.summary, expected == "unresolved")
 
     def test_statuses_of_several_killers_fold(self):
@@ -576,6 +602,8 @@ class KillerTest(DiffCase):
             ("parameterized method declared", self.CONVERTS, [(ENGINE_TEST, "[1] unit = EUR")], "present"),
             ("only called", unique_id(ENGINE_TEST, "refunded()"), shown, "deleted"),
             ("a method without a test annotation", unique_id(ENGINE_TEST, "helper()"), shown, "deleted"),
+            # The whole classname is the class: a # in it is no separator.
+            ("a # in the classname", self.SETTLES, [(f"{ENGINE_TEST}#other", "Settles a refund")], "deleted"),
             # Kept on purpose: one display name sends every killer of the class to the source.
             (
                 "plain names and one display name",
@@ -592,21 +620,45 @@ class KillerTest(DiffCase):
                 self.assertIn(f"\n{SOURCES_LINE}\n", run.summary)
 
     def test_hidden_name_without_a_java_source(self):
+        # The class ran, so a source that is not found is a failed lookup, never a deleted test.
         junit = self.junit((ENGINE_TEST, "Settles a refund"))
         (self.repo / ENGINE_TEST_FILE).unlink()
         self.put_source(f"{LEDGER}.OtherTest", "    @Test\n    void settles() {}\n")
-        self.assertEqual(self.lost(self.SETTLES, *junit).killer, "deleted")
+        self.assertEqual(self.lost(self.SETTLES, *junit).killer, "unresolved")
         self.write(ENGINE_TEST_FILE.removesuffix(".java") + ".kt", "class EngineTest {\n}\n")
         run = self.lost(self.SETTLES, *junit)
         self.assertEqual(run.killer, "unresolved")
-        self.assertIn("in another language", run.summary)
+        self.assertIn("no source of its class found", run.summary)
+
+    def test_class_that_may_inherit_the_test(self):
+        junit = self.junit((ENGINE_TEST, "Settles a refund"))
+        headers = (
+            ("class EngineTest extends LedgerContract {", "unresolved"),
+            ("final class EngineTest implements LedgerChecks, AutoCloseable {", "unresolved"),
+            ("class EngineTest /* extends LedgerContract */ {", "deleted"),
+            ("class EngineTest {", "deleted"),
+        )
+        for header, expected in headers:
+            with self.subTest(header=header):
+                source = java_class(ENGINE_TEST, "    @Test\n    void refunds() {}\n")
+                self.write(ENGINE_TEST_FILE, source.replace("class EngineTest {", header))
+                self.assertEqual(self.lost(self.SETTLES, *junit).killer, expected)
+
+    def test_dollar_sign_in_the_package(self):
+        cls = "org.example.app$qa.EngineTest"
+        nested = "    @Nested\n    class Daily {\n        @Test\n        void closes() {}\n    }\n"
+        self.put_source(cls, "    @Test\n    void settles() {}\n" + nested)
+        junit = self.junit((cls, "Settles a refund"), (f"{cls}$Daily", "Closes the day"))
+        for killing in (unique_id(cls, "settles()"), unique_id(cls, "closes()", "Daily")):
+            with self.subTest(killing=killing):
+                self.assertEqual(self.lost(killing, *junit).killer, "present")
 
     def test_source_that_cannot_be_followed_is_unresolved(self):
         self.put_source(ENGINE_TEST, "    @Nested\n    class Daily {}\n    @Nested\n    class Daily {}\n")
         junit = self.junit((f"{ENGINE_TEST}$Daily", "Closes the day"))
         run = self.lost(self.CLOSES, *junit)
         self.assertEqual(run.killer, "unresolved")
-        self.assertIn("its class body not found in them", run.summary)
+        self.assertIn("its class body not found", run.summary)
         self.put_source(ENGINE_TEST, "    @Nested\n    class Daily {\n        @Test\n        void closes() {}\n    }\n")
         self.assertEqual(self.lost(self.CLOSES, *junit).killer, "present")
         read = Path.read_bytes

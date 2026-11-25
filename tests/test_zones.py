@@ -522,6 +522,8 @@ class GrammarHelperTest(unittest.TestCase):
         self.assertEqual(sorted(zones, key=zone_sort_key), ["Z1", "Z2", "Z10", "standard", "unknown"])
         other_digit = "Z" + chr(0x0662)  # an Arabic-Indic two, which int() would read as 2
         self.assertEqual(sorted(["Z3", other_digit, "Z1"], key=zone_sort_key), ["Z1", "Z3", other_digit])
+        long_name = "Z" + "9" * 5000  # more digits than int() reads by default
+        self.assertEqual(sorted([long_name, "Z10", "Z2"], key=zone_sort_key), ["Z2", "Z10", long_name])
 
 
 class TargetTest(unittest.TestCase):

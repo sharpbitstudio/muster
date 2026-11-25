@@ -217,16 +217,23 @@ def _is_value(arg: str) -> bool:
     return not arg.startswith("-") or arg == "-" or bool(_NEGATIVE_NUMBER.match(arg)) or " " in arg
 
 
-def _scan_option(words: list[str], option: str) -> str | None:
-    """The value of the last `option VALUE` or `option=VALUE` in words, as argparse would take it."""
-    value = None
+def _scan_values(words: list[str], option: str) -> list[str | None]:
+    """The value of each `option VALUE` or `option=VALUE` in words, in order, as argparse would read
+    each one; None for an occurrence without a value."""
+    values: list[str | None] = []
     for i, arg in enumerate(words):
         if arg == option:
             following = words[i + 1] if i + 1 < len(words) else None
-            value = following if following is not None and _is_value(following) else None
+            values.append(following if following is not None and _is_value(following) else None)
         elif arg.startswith(option + "="):
-            value = arg.split("=", 1)[1]
-    return value
+            values.append(arg.split("=", 1)[1])
+    return values
+
+
+def _scan_option(words: list[str], option: str) -> str | None:
+    """The value of the last `option VALUE` or `option=VALUE` in words, as argparse would take it."""
+    values = _scan_values(words, option)
+    return values[-1] if values else None
 
 
 def _command_index(words: list[str]) -> int | None:
@@ -490,18 +497,19 @@ def _refuse_profile_clashes(
 
 
 def _scanned_inputs(words: list[str]) -> Inputs:
-    """The input files of the options as read from argv: those that --before, --after and
-    --diff-file name, and the JUnit files under the folders of --junit-before and --junit-after, as
-    far as they can be found. It never raises."""
+    """The input files of the options as read from argv: those that each --before, --after and
+    --diff-file names, every one of them and not only the last that argparse takes, and the JUnit
+    files under the folder of each --junit-before and --junit-after, as far as they can be found.
+    It never raises."""
     inputs: Inputs = []
     for option in ("--before", "--after", "--diff-file"):
-        value = _scan_option(words, option)
-        if value and "\0" not in value:
-            inputs.append((f"{option} {value}", Path(value)))
+        for value in _scan_values(words, option):
+            if value and "\0" not in value:
+                inputs.append((f"{option} {value}", Path(value)))
     for option in ("--junit-before", "--junit-after"):
-        value = _scan_option(words, option)
-        if value and "\0" not in value:
-            inputs += diffs.folder_inputs(value)
+        for value in _scan_values(words, option):
+            if value and "\0" not in value:
+                inputs += diffs.folder_inputs(value)
     return inputs
 
 

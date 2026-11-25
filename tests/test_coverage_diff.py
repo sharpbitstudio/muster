@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -229,9 +230,9 @@ class ConstantsTest(unittest.TestCase):
     def test_policy_text_names_the_branch_tolerance(self):
         text = (REPO_ROOT / "POLICY.md").read_bytes().decode("ascii")
         point = text.split("## 8. ", 1)[1].split("\n## ", 1)[0]
-        sentence = r"A critical file does not lose a covered line, or more than ([0-9]+) covered branch counted"
+        sentence = r"A critical file does not lose a covered line, or more than ([0-9]+) covered branch in total"
         self.assertEqual(re.findall(sentence, point), [str(diffs.BRANCH_TOLERANCE)])
-        self.assertIn("counted per line, without an explanation in review;", point)
+        self.assertIn("in total (the losses of its lines summed), without an explanation in review;", point)
 
     def test_limits_of_the_lists(self):
         limits = (diffs.BRANCH_TOLERANCE, diffs.TEST_IDS_CAP, diffs.FILES_CAP, diffs.ITEMS_CAP, diffs.SHOWN_NAMES)
@@ -408,6 +409,14 @@ class ComparabilityTest(DiffCase):
                 items = "".join(f"- `{path}`: {why}\n" for path, why in reasons)
                 heading = f"### Not comparable ({len(reasons)}; main source changed between the runs)"
                 self.assertIn(f"{heading}\n\n{items}\n", run.summary)
+
+    def test_two_names_of_one_file_under_nested_roots(self):
+        nested = PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/java", "src/main/java/org"]')
+        self.write("muster.toml", nested)
+        after = {name(ENGINE).removeprefix("org/"): line_data((1,), (2,))}
+        run = self.judged({name(ENGINE): line_data((1, 2))}, after, "warn")
+        self.assertEqual(run.data["not_comparable"], [])
+        self.assertEqual([(file["path"], file["warn"]) for file in run.data["files"]], [(ENGINE, True)])
 
     def test_report_without_any_sourcefile(self):
         one = {name(ENGINE): line_data((1,))}
@@ -703,6 +712,28 @@ class JunitFolderTest(DiffCase):
         (self.work / "results/TEST-two.xml").unlink()
         run = self.identities("results", "./results/")
         self.assertEqual(run.data["junit"], {"before": 1, "after": 1, "removed": [], "added": []})
+
+
+    @unittest.skipIf(sys.platform == "win32", "Windows reads a .. by name, before any link")
+    def test_link_before_a_parent_folder_is_the_folder_it_leads_to(self):
+        self.put("results/TEST-one.xml", junit_report((SUITE, "settles()")))
+        self.put("elsewhere/results/TEST-two.xml", junit_report((SUITE, "refunds()")))
+        (self.work / "elsewhere" / "child").mkdir()
+        try:
+            os.symlink(self.work / "elsewhere" / "child", self.work / "alias", target_is_directory=True)
+        except OSError:
+            self.skipTest("cannot create a link here")
+        run = self.identities("alias/../results", "results")
+        junit_data = {"before": 1, "after": 1, "removed": [f"{SUITE}#refunds()"], "added": [f"{SUITE}#settles()"]}
+        self.assertEqual(run.data["junit"], junit_data)
+        options = ["--before", "before.xml", "--after", "after.xml", "--junit-before", "alias/../results"]
+        for target in ("results/TEST-one.xml", "alias/../results/TEST-two.xml"):
+            with self.subTest(target=target):
+                before = (self.work / target).read_bytes()
+                code, _, err = self.main("coverage-diff", *options, "--junit-after", "results", "--json-out", target)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"error: --json-out {target} is the JUnit file {target}\n", err)
+                self.assertEqual((self.work / target).read_bytes(), before)
 
 
 class MarkdownTest(DiffCase):

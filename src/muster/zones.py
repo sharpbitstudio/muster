@@ -135,10 +135,11 @@ def zone_number(digits: str) -> int | None:
 
 
 def zone_sort_key(zone: str) -> tuple[int, int, str]:
-    """The sort key of a zone name: a critical zone `Z<n>` sorts by its number, and every other name
-    (standard) sorts after all of them, by name."""
+    """The sort key of a zone name: a critical zone `Z<n>` sorts by its number, as digits without a
+    leading zero (by their count, then by their text, so a name of any length sorts), and every other
+    name (standard) sorts after all of them, by name."""
     if ZONE_NAME.fullmatch(zone):
-        return (0, int(zone[1:]), "")
+        return (0, len(zone), zone)
     return (1, 0, zone)
 
 

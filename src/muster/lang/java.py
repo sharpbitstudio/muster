@@ -12,6 +12,8 @@ The source is scanned, not parsed, and the scan has known limits:
 - it reads Java sources only;
 - overloads are not told apart: only the method name is compared, so a name with one annotated
   overload is declared;
+- inheritance is not followed: a test that the class does not declare itself, in a class whose
+  header has `extends` or `implements` (a type bound too), is unresolved, never deleted;
 - JAVA_METHOD_HEADER can take polynomial time on a very long member header without parentheses
   (the test sources come from the repository under check).
 """
@@ -207,24 +209,37 @@ def source_declares(text: str, cls: str, member: str) -> str:
     """Whether the Java source `text` declares `member` as a test of the class `cls` (`pkg.Outer$Inner`,
     as a unique id names it): `present`, `deleted` or `unresolved`.
 
-    The class chain is followed from the top-level class through each nested name; a step that finds
-    no class header or more than one, an unterminated comment or literal, or unbalanced parentheses or
-    braces is `unresolved`. Only a member directly in the body of the class itself counts, so a test of
-    an enclosing or a nested class does not; a method of that name without a test annotation, or one
-    that is only called, is `deleted`.
+    The package is everything before the last dot of `cls`, and the class chain the rest, split on
+    `$`. An unterminated comment or literal, or parentheses, brackets or braces anywhere in the text
+    that are unbalanced or crossed, is `unresolved`. The chain is followed from the top-level class
+    through each nested name; a step that finds no class header or more than one is `unresolved`.
+    Only a member directly in the body of the class itself counts, so a test of an enclosing or a
+    nested class does not; a method of that name without a test annotation, or one that is only
+    called, is `deleted`, unless the header of the class has `extends` or `implements`: the class
+    may inherit the test, and that is `unresolved`.
     """
     stripped = strip_java(text)
     if stripped is None:
         return "unresolved"
-    top, *nested = cls.split("$")
-    start, end = 0, len(stripped)
-    for name in [top.rpartition(".")[2], *nested]:
+    opened: list[str] = []
+    for bracket in re.findall(r"[()\[\]{}]", stripped):
+        if bracket in "([{":
+            opened.append(bracket)
+        elif not opened or opened.pop() + bracket not in ("()", "[]", "{}"):
+            return "unresolved"
+    if opened:
+        return "unresolved"
+    header, start, end = "", 0, len(stripped)
+    for name in cls.rpartition(".")[2].split("$"):
         members = java_members(stripped, start, end) or []
-        opens = [i for header, mark, i in members if mark == "{" and is_class_header(header, name)]
+        opens = [(chunk, i) for chunk, mark, i in members if mark == "{" and is_class_header(chunk, name)]
         if len(opens) != 1:
             return "unresolved"
-        start, end = opens[0] + 1, matching_brace(stripped, opens[0])
+        header, brace = opens[0]
+        start, end = brace + 1, matching_brace(stripped, brace)
     members = java_members(stripped, start, end)
     if members is None:
         return "unresolved"
-    return "present" if any(is_test_declaration(header, member) for header, _, _ in members) else "deleted"
+    if any(is_test_declaration(chunk, member) for chunk, _, _ in members):
+        return "present"
+    return "unresolved" if re.search(r"(?<![\w$])(?:extends|implements)(?![\w$])", header) else "deleted"
