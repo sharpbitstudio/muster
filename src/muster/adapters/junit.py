@@ -116,19 +116,21 @@ def xml_files(folder: str, errors: list[str]) -> list[str]:
     `<folder>/<relative path>` (on Windows a bare drive such as `D:` gets no `/`), a path that opens
     it from the working directory too. A linked folder (a symbolic link or a junction) below it is
     not followed; a folder that cannot be read, and an entry ending in .xml that cannot be looked
-    at, add their message to `errors`, in path order, and the walk goes on."""
+    at, add their message to `errors` once the walk is done, folders and files together sorted by
+    the relative path, and the walk goes on."""
     separators = tuple({os.sep, os.altsep or os.sep})
     drive, tail = os.path.splitdrive(folder)
     bare_drive = drive.endswith(":") and not tail
     prefix = folder if folder.endswith(separators) or bare_drive else folder + "/"
     found: list[str] = []
+    problems: list[tuple[str, str]] = []  # (relative path, message)
 
     def unreadable(exc: OSError) -> None:
         try:
             rel = Path(exc.filename).relative_to(folder).as_posix()
         except (TypeError, ValueError):  # no file name, or one outside the folder
             rel = "."
-        errors.append(f"{folder if rel == '.' else prefix + rel}: cannot read: {exc.strerror or exc}")
+        problems.append((rel, f"{folder if rel == '.' else prefix + rel}: cannot read: {exc.strerror or exc}"))
 
     for dirpath, dirnames, filenames in os.walk(folder, onerror=unreadable, followlinks=False):
         dirnames[:] = sorted(name for name in dirnames if not is_link(os.path.join(dirpath, name)))
@@ -140,10 +142,11 @@ def xml_files(folder: str, errors: list[str]) -> list[str]:
             try:
                 mode = os.stat(os.path.join(dirpath, name)).st_mode
             except OSError as exc:
-                errors.append(f"{prefix + rel}: cannot read: {exc.strerror or exc}")
+                problems.append((rel, f"{prefix + rel}: cannot read: {exc.strerror or exc}"))
                 continue
             if stat.S_ISREG(mode):
                 found.append(rel)
+    errors.extend(message for _, message in sorted(problems, key=lambda problem: problem[0]))
     return [prefix + rel for rel in sorted(found)]
 
 

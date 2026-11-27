@@ -456,6 +456,9 @@ class ZoneTest(DiffCase):
         self.assertEqual(zones, expected)
         for path, note in ((draft, f"{LOST}; under no source root"), (PACKAGE_INFO, LOST)):
             self.assertIn(row(f"`{path}`", "unknown", "2 -> 1 (-1)", "0 -> 0 (+0)", runs(2), "", note), run.summary)
+        within = ({draft: line_data((1,), branches={1: (0, 2)})}, {draft: line_data((1,), branches={1: (1, 1)})})
+        run = self.judged(*within, "pass")
+        self.assertIn(f"\nInformation: 1 {WITHIN}: `{draft}` (under no source root)\n", run.summary)
 
     def test_unresolved_name_with_the_text_of_a_path(self):
         # The second report name is the text of the repository path of the first one.
@@ -622,6 +625,24 @@ class InputErrorTest(DiffCase):
         self.assertEqual(run.verdict, "coverage-diff: ERROR (no JaCoCo XML at before.xml)")
         self.assertEqual(run.summary, ERROR_BLOCK + "".join(f"- `{error}`\n" for error in errors) + "\n")
 
+    def test_report_and_folder_that_cannot_be_looked_at(self):
+        report = jacoco_report({name(ENGINE): line_data((1,))})
+        self.put("before.xml", report)
+        self.put("after.xml", report)
+        for folder in ("junit-before", "junit-after"):
+            self.put(f"{folder}/TEST-one.xml", junit_report((SUITE, "settles()")))
+        denied, inspect = {"before.xml", "junit-before"}, os.stat
+
+        def looking(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)) and os.path.normpath(os.fspath(path)) in denied:
+                raise PermissionError(13, "Permission denied", path)
+            return inspect(path, *args, **kwargs)
+
+        with mock.patch("os.stat", side_effect=looking):
+            run = self.run_diff("--junit-before", "junit-before", "--junit-after", "junit-after")
+        expected = ["before.xml: cannot read: Permission denied", "junit-before: cannot read: Permission denied"]
+        self.assertEqual((run.section["errors"], run.code), (expected, 0))
+
     def test_config_error_wins_over_input_errors(self):
         profile = PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/java", "gen/main/java"]')
         profile = profile.replace('exclude = ["**/package-info.java"]', 'exclude = ["**/package-info.java", "gen/**"]')
@@ -713,6 +734,20 @@ class JunitFolderTest(DiffCase):
         run = self.identities("results", "./results/")
         self.assertEqual(run.data["junit"], {"before": 1, "after": 1, "removed": [], "added": []})
 
+    def test_name_that_cannot_be_looked_at_hides_no_folder(self):
+        # On POSIX missing/../results names nothing, as missing does not exist; results is still
+        # walked, read and protected, in either order of the options.
+        self.put("results/TEST-one.xml", junit_report((SUITE, "settles()")))
+        target = "results/TEST-one.xml"
+        content = (self.work / target).read_bytes()
+        argv = ["coverage-diff", "--before", "before.xml", "--after", "after.xml"]
+        for first, second in (("missing/../results", "results"), ("results", "missing/../results")):
+            with self.subTest(first=first):
+                options = ["--junit-before", first, "--junit-after", second, "--json-out", target]
+                code, _, err = self.main(*argv, *options)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"error: --json-out {target} is the JUnit file ", err)
+                self.assertEqual((self.work / target).read_bytes(), content)
 
     @unittest.skipIf(sys.platform == "win32", "Windows reads a .. by name, before any link")
     def test_link_before_a_parent_folder_is_the_folder_it_leads_to(self):
@@ -817,6 +852,24 @@ class OutputTest(DiffCase):
                         self.assertEqual(code, 2, err)
                         self.assertIn(f"error: {option} {target} is {label}\n", err)
                         self.assertEqual(file.read_bytes(), before)
+
+    def test_junit_file_is_looked_up_not_compared_one_by_one(self):
+        # A JUnit folder can hold thousands of files: an output is looked up among them by its
+        # resolved path, as among the protected files, and never compared with each one.
+        self.put("junit-after/deeper/TEST-two.xml", junit_report((SUITE, "settles()")))
+        target = "junit-after/deeper/TEST-two.xml"
+        content = (self.work / target).read_bytes()
+        argv = ["coverage-diff", "--before", "before.xml", "--after", "after.xml"]
+        argv += ["--junit-before", "junit-before", "--junit-after", "junit-after", "--json-out", target]
+        for case, extra in (("a run", []), ("argparse fails", ["--strict-only", "bogus"])):
+            with self.subTest(case=case), mock.patch.object(cli, "_same_file", wraps=cli._same_file) as same:
+                code, _, err = self.main(*argv, *extra)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"error: --json-out {target} is the JUnit file {target}\n", err)
+                self.assertEqual((self.work / target).read_bytes(), content)
+                compared = [Path(call.args[1]).name for call in same.call_args_list]
+                self.assertIn("before.xml", compared)
+                self.assertEqual([name for name in compared if name.startswith("TEST-")], [])
 
     def test_default_summary(self):
         self.write("muster.toml", PROFILE + '\n[output]\ndir = "build/muster"\n')
