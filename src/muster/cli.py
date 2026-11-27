@@ -292,15 +292,35 @@ def _merge_base(root: Path, ref: str) -> str | None:
         return None
 
 
+# The extended-length prefix of a Windows path: two backslashes, a question mark and a backslash.
+_EXTENDED = "\\" * 2 + "?\\"
+
+
+def _key(resolved: str) -> str:
+    """A resolved path as every comparison of the outputs keys it: case-folded on Windows, and there
+    without the extended-length prefix (_EXTENDED), which os.path.realpath() keeps when it was given,
+    so that a file named with and without it has one key. The prefix with UNC becomes the two
+    backslashes of a UNC path, and the prefix before a drive letter and a colon goes; any other path
+    stays as it is. Dropping the prefix only ever makes two keys equal."""
+    key = os.path.normcase(resolved)
+    if os.name == "nt" and key.startswith(_EXTENDED):
+        rest = key[len(_EXTENDED) :]
+        if rest.startswith("unc\\"):
+            return "\\" * 2 + rest[4:]
+        if re.match(r"[a-z]:", rest):
+            return rest
+    return key
+
+
 def _same_file(first: Path, second: Path) -> bool:
-    """Whether two paths name one file: the same file on disk, else the same resolved path (ignoring
-    case on Windows)."""
+    """Whether two paths name one file: the same file on disk, else the same resolved path, by its
+    _key() (ignoring case and the extended-length prefix on Windows)."""
     try:
         if first.exists() and second.exists():
             return os.path.samefile(first, second)
     except OSError:
         pass
-    return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+    return _key(os.path.realpath(first)) == _key(os.path.realpath(second))
 
 
 def _same_file_if_resolved(first: Path, second: Path) -> bool:
@@ -313,18 +333,19 @@ def _same_file_if_resolved(first: Path, second: Path) -> bool:
 
 
 def _index(files: Inputs) -> dict[str, str]:
-    """The resolved path (case-folded on Windows) of each file -> its label; a file that is a link is
-    also keyed by the file it leads to. Each folder is resolved once, so that a large set of files
-    costs one link check per file and a full resolution only per folder and per link."""
+    """The resolved path of each file, by its _key() (ignoring case and the extended-length prefix on
+    Windows) -> its label; a file that is a link is also keyed by the file it leads to. Each folder
+    is resolved once, so that a large set of files costs one link check per file and a full
+    resolution only per folder and per link."""
     folders: dict[Path, str] = {}
     index: dict[str, str] = {}
     for label, path in files:
         folder = folders.get(path.parent)
         if folder is None:
             folder = folders[path.parent] = os.path.realpath(path.parent)
-        index.setdefault(os.path.normcase(os.path.join(folder, path.name)), label)
+        index.setdefault(_key(os.path.join(folder, path.name)), label)
         if os.path.islink(path):
-            index.setdefault(os.path.normcase(os.path.realpath(path)), label)
+            index.setdefault(_key(os.path.realpath(path)), label)
     return index
 
 
@@ -380,7 +401,7 @@ def _refuse_clashes(
                 if not best_effort:
                     raise
                 keys = ()
-            other = next((protected[key] for key in map(os.path.normcase, keys) if key in protected), None)
+            other = next((protected[key] for key in map(_key, keys) if key in protected), None)
             clash = None if other is None else f"is {other}"
         if clash is None:
             clash = next((f"is the same file as {other}" for other, file in named[:i] if same(path, file)), None)
@@ -390,22 +411,22 @@ def _refuse_clashes(
 
 
 def _real(path: Path) -> str:
-    return os.path.normcase(os.path.realpath(path))
+    return _key(os.path.realpath(path))
 
 
 def _output_keys(path: Path) -> tuple[str, str]:
     """An output as _refuse_under_folders() compares it: resolved, and with only its folder resolved."""
-    return _real(path), os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name))
+    return _real(path), _key(os.path.join(os.path.realpath(path.parent), path.name))
 
 
 def _refuse_under_folders(inv: Invocation, named: Inputs, cfg: Config, *, best_effort: bool = False) -> None:
     """Refuse an output under a folder of source.roots or source.tests, on every run alike: exit 2,
-    and nothing is removed or written. The paths are compared resolved (ignoring case on Windows),
-    so a link that leads into such a folder counts, and so does a path inside one whose last part is
-    a link. On a profile that failed its check only the entries that listed_folders() keeps count.
-    Each output is resolved and compared in turn, so an earlier clash is refused before a later
-    output can fail to resolve. With `best_effort`, a folder or an output that cannot be resolved
-    is left out."""
+    and nothing is removed or written. The paths are compared resolved, by their _key() (ignoring
+    case and the extended-length prefix on Windows), so a link that leads into such a folder counts,
+    and so does a path inside one whose last part is a link. On a profile that failed its check only
+    the entries that listed_folders() keeps count. Each output is resolved and compared in turn, so
+    an earlier clash is refused before a later output can fail to resolve. With `best_effort`, a
+    folder or an output that cannot be resolved is left out."""
     folders = [("source", folder) for folder in listed_folders(cfg, "source.roots")]
     folders += [("test", folder) for folder in listed_folders(cfg, "source.tests")]
     resolved = []

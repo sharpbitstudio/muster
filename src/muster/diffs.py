@@ -924,6 +924,7 @@ def _lost_markdown(
             " (no test sources, no source of its class found, its class body not found, a source of its"
             " class in two test folders or that cannot be read, a class name that names no file, unbalanced"
             " source, a test the class may inherit, a method of that name with an annotation the scan does"
-            " not know), a test case of its class was skipped, or the entry is not a JUnit Platform unique id."
+            " not know), a test case of its class was skipped, the source declares the test `@Disabled`, or"
+            " the entry is not a JUnit Platform unique id."
         )
         rep.md.append("")

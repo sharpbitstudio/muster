@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -327,6 +328,7 @@ class VerdictTest(DiffCase):
             ("pass", same, same, ["--fail-on-error"], (None, False, "pass", 0)),
             ("known variation", *known, junit, (None, False, "pass", 0)),
             ("known variation", *known, [*junit, "--strict"], (None, False, "pass", 0)),
+            ("known variation", *known, [*junit, "--fail-on-error"], (None, False, "pass", 0)),
             ("warn", same, lost, [], ("warning", True, "warn", 0)),
             ("warn", same, lost, ["--strict"], ("error", True, "fail", 1)),
             ("warn", same, lost, ["--fail-on-error"], ("warning", True, "warn", 0)),
@@ -382,12 +384,18 @@ class VerdictTest(DiffCase):
         self.assertIn(gained, run.summary)
 
     def test_unknown_status_counts_by_detected(self):
+        # KeyParser has one mutant, detected under another status after: no counter changes, no row.
         before = [mutant(status="TIMED_OUT", line=1), mutant(status="UNHEARD_OF", line=2, detected=True)]
         after = [mutant(status="UNHEARD_OF", line=1, detected=False), mutant(line=2)]
+        before.append(mutant(PARSER_CLASS, line=3))
+        after.append(mutant(PARSER_CLASS, "TIMED_OUT", 3))
         run = self.judged(before, after, "warn")
         self.assertEqual([item["status"] for item in run.data["lost"]], [["TIMED_OUT", "UNHEARD_OF"]])
         self.assertEqual(run.data["gained"], [])
-        self.assertEqual((run.data["totals"]["before"]["detected"], run.data["totals"]["after"]["covered"]), (2, 2))
+        self.assertEqual((run.data["totals"]["before"]["detected"], run.data["totals"]["after"]["covered"]), (3, 3))
+        self.assertEqual((list(run.data["files"]), run.data["unresolved"]), ([ENGINE], {}))
+        self.assertIn("### Changed files (1)\n", run.summary)
+        self.assertNotIn(PARSER, run.summary)
 
 
 class KnownVariationTest(DiffCase):
@@ -510,15 +518,18 @@ class KnownVariationTest(DiffCase):
         self.assertIn(f"\n{AMBIGUOUS}{shown} (+1 more)\n", run.summary)
 
     def test_known_variation_with_a_killer_found_in_the_source(self):
+        # The JUnit XML shows the class by a display name only, and has no skipped test case.
         junit = self.junit((PARSER_TEST, "Decodes a padded key"))
         for body, killer, outcome in (
             ("    @Test\n    void decodes() {}\n", "present", "known-variation"),
             ("    @Test\n    void other() {\n        decodes();\n    }\n", "deleted", "warn"),
+            ("    @Disabled @Test\n    void decodes() {}\n", "unresolved", "warn"),
         ):
             with self.subTest(killer=killer):
                 self.put_source(PARSER_TEST, body)
-                run = self.judged([self.parser()], [self.parser("SURVIVED")], outcome, *junit)
-                self.assertEqual((run.killer, run.data["lost"][0]["known_variation"]), (killer, killer == "present"))
+                run = self.diff([self.parser()], [self.parser("SURVIVED")], *junit, "--strict")
+                state = (run.data["outcome"], run.code, run.killer, run.data["lost"][0]["known_variation"])
+                self.assertEqual(state, (outcome, int(outcome == "warn"), killer, killer == "present"))
 
 
 class KillerTest(DiffCase):
@@ -751,6 +762,26 @@ class KillerTest(DiffCase):
                     run = self.lost(unique_id(cls, "settles()"), *junit)
                 self.assertEqual((run.killer, opened), ("unresolved", []))
 
+    def test_source_in_another_case_is_never_read(self):
+        # The walk keeps the case on disk, so the answer is the same on a file system that ignores case.
+        junit = self.junit((ENGINE_TEST, "Settles a refund"))
+        source = java_class(ENGINE_TEST, "    @Test\n    void settles() {}\n")
+        read = Path.read_bytes
+        opened = []
+
+        def reading(path: Path) -> bytes:
+            if path.suffix == ".java":
+                opened.append(path)
+            return read(path)
+
+        for stem in ("ledger/enginetest", "Ledger/EngineTest"):
+            with self.subTest(stem=stem):
+                shutil.rmtree(self.repo / TEST_FOLDER)
+                self.write(f"{TEST_FOLDER}/org/example/app/billing/internal/{stem}.java", source)
+                with mock.patch.object(Path, "read_bytes", autospec=True, side_effect=reading):
+                    run = self.lost(self.SETTLES, *junit)
+                self.assertEqual((run.killer, opened), ("unresolved", []))
+
 
 class ComparabilityTest(DiffCase):
     def test_mutant_sets_differ(self):
@@ -908,6 +939,14 @@ class InputErrorTest(DiffCase):
         error = {"kind": "config", "message": "muster.toml: missing key source.roots"}
         self.assertEqual((code, env["error"]), (2, error))
 
+    def test_configured_report_and_snapshot_are_never_read(self):
+        before, after = [mutant(killing=unique_id(ENGINE_TEST, "settles()"))], [mutant(status="SURVIVED")]
+        valid = self.judged(before, after, "warn")
+        (self.repo / REPORT).unlink()
+        self.write("muster.toml", PROFILE + '\n[policy]\nsnapshot = "build/muster/snapshot.json"\n')
+        missing = self.judged(before, after, "warn")
+        self.assertEqual((missing.out, missing.env, missing.summary), (valid.out, valid.env, valid.summary))
+
 
 class OptionTest(DiffCase):
     def test_before_and_after_are_required(self):
@@ -1028,6 +1067,25 @@ class OutputTest(DiffCase):
                         self.assertEqual(code, 2, err)
                         self.assertIn(f"error: {option} {target} is {label}\n", err)
                         self.assertEqual(file.read_bytes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "the extended-length prefix is a Windows path")
+    def test_file_named_with_and_without_the_extended_length_prefix(self):
+        prefix = "\\" * 2 + "?" + "\\"  # built at run time, as a literal one is a local path
+        folder = str(self.work / "junit-after")
+        report, source = self.work / "junit-after" / "TEST-one.xml", self.repo / ENGINE
+        both = ["--before", "before.xml", "--after", "after.xml"]
+        cases = []  # (options, the output, what it is, the file)
+        for given in (both, both[2:]):  # without --before, argparse fails
+            for named, output in ((folder, prefix + str(report)), (prefix + folder, str(report))):
+                cases.append((given + ["--junit-after", named], output, f"the JUnit file {named}/TEST-one.xml", report))
+        cases.append((both, prefix + str(source), "under the source folder src/main/java", source))
+        for options, output, label, file in cases:
+            with self.subTest(options=options, output=output):
+                content = file.read_bytes()
+                code, _, err = self.main("mutation-diff", *options, "--json-out", output)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"error: --json-out {output} is {label}\n", err)
+                self.assertEqual(file.read_bytes(), content)
 
     def test_default_summary(self):
         self.write("muster.toml", PROFILE + '\n[output]\ndir = "build/muster"\n')
