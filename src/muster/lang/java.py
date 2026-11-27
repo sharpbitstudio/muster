@@ -12,6 +12,9 @@ The source is scanned, not parsed, and the scan has known limits:
 - it reads Java sources only;
 - overloads are not told apart: only the method name is compared, so a name with one annotated
   overload is declared;
+- test annotations are known by name only (TEST_ANNOTATIONS): a method that carries annotations,
+  none of them a known one (an annotation of its own that carries `@Test`, say), is unresolved,
+  never deleted;
 - inheritance is not followed: a test that the class does not declare itself, in a class whose
   header has `extends` or `implements` (a type bound too), is unresolved, never deleted;
 - JAVA_METHOD_HEADER can take polynomial time on a very long member header without parentheses
@@ -210,15 +213,17 @@ def source_declares(text: str, cls: str, member: str) -> str:
     as a unique id names it): `present`, `deleted` or `unresolved`.
 
     The package is everything before the last dot of `cls`, and the class chain the rest, split on
-    `$`. An unterminated comment or literal, or parentheses, brackets or braces anywhere in the text
-    that are unbalanced or crossed, is `unresolved`. The chain is followed from the top-level class
-    through each nested name; a step that finds no class header or more than one is `unresolved`.
-    Only a member directly in the body of the class itself counts, so a test of an enclosing or a
-    nested class does not; a method of that name without a test annotation, or one that is only
-    called, is `deleted`, unless the header of the class has `extends` or `implements`: the class
-    may inherit the test, and that is `unresolved`.
+    `$`. CR LF and a bare CR end a line, as LF does. An unterminated comment or literal, or
+    parentheses, brackets or braces anywhere in the text that are unbalanced or crossed, is
+    `unresolved`. The chain is followed from the top-level class through each nested name; a step
+    that finds no class header or more than one is `unresolved`. Only a member directly in the body
+    of the class itself counts, so a test of an enclosing or a nested class does not. A method of
+    that name that carries annotations, none of them a known test annotation, is `unresolved`: one
+    may be an annotation of its own that makes it a test. A method of that name without any
+    annotation, or one that is only called, is `deleted`, unless the header of the class has
+    `extends` or `implements`: the class may inherit the test, and that is `unresolved`.
     """
-    stripped = strip_java(text)
+    stripped = strip_java(text.replace("\r\n", "\n").replace("\r", "\n"))
     if stripped is None:
         return "unresolved"
     opened: list[str] = []
@@ -242,4 +247,19 @@ def source_declares(text: str, cls: str, member: str) -> str:
         return "unresolved"
     if any(is_test_declaration(chunk, member) for chunk, _, _ in members):
         return "present"
+
+    def annotated(chunk: str) -> bool:
+        """Whether an annotation is among the annotations and modifiers that open a header."""
+        rest = chunk.lstrip()
+        while not JAVA_ANNOTATION.match(rest):
+            modifier = JAVA_MODIFIER.match(rest)
+            if modifier is None:
+                return False
+            rest = rest[modifier.end() :].lstrip()
+        return True
+
+    # With a test annotation put in front, is_test_declaration() tells whether a header declares
+    # the method at all; none of its own annotations is a known one, or it would be present.
+    if any(annotated(chunk) and is_test_declaration("@Test " + chunk, member) for chunk, _, _ in members):
+        return "unresolved"
     return "unresolved" if re.search(r"(?<![\w$])(?:extends|implements)(?![\w$])", header) else "deleted"

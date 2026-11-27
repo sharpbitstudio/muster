@@ -1129,11 +1129,21 @@ class JunitFolderTest(AdapterCase):
         self.assertEqual(errors, ["results/locked: cannot read: Permission denied"])
 
     def test_walk_errors_come_in_path_order(self):
-        self.make("results/TEST-two.xml", "results/alpha/TEST-one.xml", "results/zeta/TEST-three.xml")
+        # Folders and files together: the file zulu.xml is looked at before the walk enters alpha.
+        self.make(
+            "results/TEST-two.xml", "results/alpha/TEST-one.xml", "results/zeta/TEST-three.xml", "results/zulu.xml"
+        )
         denied, scandir = {os.path.join("results", name) for name in ("alpha", "zeta")}, os.scandir
+        locked, inspect = os.path.join("results", "zulu.xml"), os.stat
+
+        def looking(path, *args, **kwargs):
+            if os.path.normpath(os.fspath(path)) == locked:
+                raise PermissionError(13, "Permission denied", path)
+            return inspect(path, *args, **kwargs)
 
         class Listing:
-            """The entries of a folder in a given order, read as os.walk() reads os.scandir()."""
+            """The entries of a folder in a given order, read in any way os.walk() reads os.scandir():
+            by next(), by iteration or as a context manager."""
 
             def __init__(self, entries):
                 self.entries = iter(entries)
@@ -1142,10 +1152,17 @@ class JunitFolderTest(AdapterCase):
                 return self
 
             def __exit__(self, *exc):
+                self.close()
                 return False
+
+            def __iter__(self):
+                return self
 
             def __next__(self):
                 return next(self.entries)
+
+            def close(self):
+                self.entries = iter(())
 
         def walked(reverse: bool) -> list[str]:
             def listing(top="."):
@@ -1155,11 +1172,11 @@ class JunitFolderTest(AdapterCase):
                     return Listing(sorted(entries, key=lambda entry: entry.name, reverse=reverse))
 
             errors: list[str] = []
-            with mock.patch("os.scandir", side_effect=listing):
+            with mock.patch("os.scandir", side_effect=listing), mock.patch("os.stat", side_effect=looking):
                 self.assertEqual(junit.xml_files("results", errors), ["results/TEST-two.xml"])
             return errors
 
-        expected = ["results/alpha: cannot read: Permission denied", "results/zeta: cannot read: Permission denied"]
+        expected = [f"results/{name}: cannot read: Permission denied" for name in ("alpha", "zeta", "zulu.xml")]
         self.assertEqual((walked(False), walked(True)), (expected, expected))
 
     def test_file_that_cannot_be_looked_at(self):

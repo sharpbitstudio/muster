@@ -328,6 +328,17 @@ def _index(files: Inputs) -> dict[str, str]:
     return index
 
 
+def _option_inputs(analysis: Analysis, args: argparse.Namespace) -> tuple[Inputs, dict[str, str]]:
+    """The input files of the options, apart: those an output is compared with one by one, and the
+    JUnit files under the folders of the JUnit options (labelled diffs.JUNIT_FILE), which can be
+    thousands, as an _index(), as the protected files are."""
+    pairwise: Inputs = []
+    walked: Inputs = []
+    for label, path in analysis.option_inputs(args):
+        (walked if label.startswith(diffs.JUNIT_FILE + " ") else pairwise).append((label, path))
+    return pairwise, _index(walked)
+
+
 @dataclass
 class Invocation:
     """What one run has learned so far; the envelope is built from it on every exit. `json_out` and
@@ -356,13 +367,19 @@ def _refuse_clashes(
 ) -> None:
     """Refuse an output that is an input, a protected file or another output: exit 2, and nothing is
     removed or written, the envelope and the summary included. With `best_effort`, two paths of
-    which one cannot be resolved are no clash."""
+    which one cannot be resolved are no clash, and an output that cannot be resolved is no
+    protected file."""
     same = _same_file_if_resolved if best_effort else _same_file
     for i, (label, path) in enumerate(named):
         clash = next((f"is {other}" for other, file in inputs if same(path, file)), None)
         if clash is None and protected:
             # The file a link leads to, and the link itself: _index() keys a protected link by both.
-            keys = (os.path.realpath(path), os.path.join(os.path.realpath(path.parent), path.name))
+            try:
+                keys = (os.path.realpath(path), os.path.join(os.path.realpath(path.parent), path.name))
+            except OSError:
+                if not best_effort:
+                    raise
+                keys = ()
             other = next((protected[key] for key in map(os.path.normcase, keys) if key in protected), None)
             clash = None if other is None else f"is {other}"
         if clash is None:
@@ -465,17 +482,25 @@ def _option_summary(args: argparse.Namespace) -> Summary | None:
 
 
 def _refuse_profile_clashes(
-    inv: Invocation, named: Inputs, repo: str | None, value: str, *, default: bool, inputs: Inputs = ()
+    inv: Invocation,
+    named: Inputs,
+    repo: str | None,
+    value: str,
+    *,
+    default: bool,
+    inputs: Inputs = (),
+    walked: dict[str, str] | None = None,
 ) -> None:
     """For a profile that no command reads: refuse an output that is another output, one of the
-    `inputs` of the command line, the config file `value` of the repository `repo` (--repo and
-    --config, which may be anything), with `default` also the default config file, or, as far as
-    the profile parses without its check, a file it names or a file under one of its source or test
-    folders: exit 2, and nothing is removed or written. The profile is read only when it is a
-    regular file, so a named pipe never blocks the run; one that cannot be read or is not TOML adds
-    nothing. A path that cannot be resolved is no clash. Only a UsageError is raised: a NUL in
-    `repo`, or a folder `repo` that cannot be resolved, names no repository, so the outputs are
-    checked only against each other and against `inputs`; a NUL in `value` names no file.
+    `inputs` of the command line, a JUnit file of the command line in `walked` (an _index()), the
+    config file `value` of the repository `repo` (--repo and --config, which may be anything), with
+    `default` also the default config file, or, as far as the profile parses without its check, a
+    file it names or a file under one of its source or test folders: exit 2, and nothing is removed
+    or written. The profile is read only when it is a regular file, so a named pipe never blocks the
+    run; one that cannot be read or is not TOML adds nothing. A path that cannot be resolved is no
+    clash. Only a UsageError is raised: a NUL in `repo`, or a folder `repo` that cannot be resolved,
+    names no repository, so the outputs are checked only against each other, against `inputs` and
+    against `walked`; a NUL in `value` names no file.
 
     It does not refuse what only a command would find: a JUnit file of tests.results (a glob). Nor
     does the fallback in src/__main__.py, for an older Python or a broken install, run it: that one
@@ -485,32 +510,38 @@ def _refuse_profile_clashes(
     except UsageError:  # the folder cannot be resolved
         root = None
     if root is None:
-        _refuse_clashes(inv, named, list(inputs), best_effort=True)
+        _refuse_clashes(inv, named, list(inputs), walked, best_effort=True)
         return
     given = [*inputs] + ([] if "\0" in value else [("the config file", config_path(root, value))])
     if default:
         given.append(("the default config file", config_path(root, DEFAULT_CONFIG)))
     unchecked = load_unchecked(root, value) if os.path.isfile(config_path(root, value)) else None
-    _refuse_clashes(inv, named, given + (named_files(unchecked) if unchecked is not None else []), best_effort=True)
+    profile_files = named_files(unchecked) if unchecked is not None else []
+    _refuse_clashes(inv, named, given + profile_files, walked, best_effort=True)
     if unchecked is not None:
         _refuse_under_folders(inv, named, unchecked, best_effort=True)
 
 
-def _scanned_inputs(words: list[str]) -> Inputs:
+def _scanned_inputs(words: list[str]) -> tuple[Inputs, dict[str, str]]:
     """The input files of the options as read from argv: those that each --before, --after and
-    --diff-file names, every one of them and not only the last that argparse takes, and the JUnit
-    files under the folder of each --junit-before and --junit-after, as far as they can be found.
-    It never raises."""
+    --diff-file names, every one of them and not only the last that argparse takes, and, as an
+    _index(), the JUnit files under the folder of each --junit-before and --junit-after, as far as
+    they can be found (when a folder of theirs cannot be resolved, they join the first list). It
+    never raises."""
     inputs: Inputs = []
     for option in ("--before", "--after", "--diff-file"):
         for value in _scan_values(words, option):
             if value and "\0" not in value:
                 inputs.append((f"{option} {value}", Path(value)))
+    walked: Inputs = []
     for option in ("--junit-before", "--junit-after"):
         for value in _scan_values(words, option):
             if value and "\0" not in value:
-                inputs += diffs.folder_inputs(value)
-    return inputs
+                walked += diffs.folder_inputs(value)
+    try:
+        return inputs, _index(walked)
+    except OSError:  # a folder that cannot be resolved (a busy named pipe on Windows, say)
+        return inputs + walked, {}
 
 
 def _arm_scanned(inv: Invocation) -> None:
@@ -534,7 +565,8 @@ def _arm_scanned(inv: Invocation) -> None:
         before = _global_words(words)
         value = _scan_option(before, "--config") or DEFAULT_CONFIG
         repo = _scan_option(before, "--repo")
-        _refuse_profile_clashes(inv, named, repo, value, default=True, inputs=_scanned_inputs(words))
+        inputs, walked = _scanned_inputs(words)
+        _refuse_profile_clashes(inv, named, repo, value, default=True, inputs=inputs, walked=walked)
     _arm(inv, json_out, summary)
 
 
@@ -585,27 +617,28 @@ def run_analysis(
 ) -> int:
     """Run an analysis command; _commits() has set args.repo_root."""
     root = args.repo_root
-    given = [("the config file", config_path(root, args.config)), *analysis.option_inputs(args)]
-    _refuse_clashes(inv, _named(json_out, summary), given)
+    options, walked = _option_inputs(analysis, args)
+    given = [("the config file", config_path(root, args.config)), *options]
+    _refuse_clashes(inv, _named(json_out, summary), given, walked)
     _arm(inv, json_out, summary)
     try:
         cfg = load(root, args.config)
     except ConfigError:
         unchecked = load_unchecked(root, args.config)
         if unchecked is not None:  # no command runs on it, so no file it names is an output
-            _refuse_clashes(inv, _named(json_out, summary), given + named_files(unchecked))
+            _refuse_clashes(inv, _named(json_out, summary), given + named_files(unchecked), walked)
             _refuse_under_folders(inv, _named(json_out, summary), unchecked)
         raise
     if summary is None and cfg.output_dir is not None:
         name = f"{cfg.output_dir}/{args.command}.md"
         summary = f"the summary {name}", cfg.root / name, False, name
     named = _named(json_out, summary)
-    inputs = [("the config file", cfg.path), *analysis.option_inputs(args), *analysis.inputs(cfg)]
-    _refuse_clashes(inv, named, inputs)
+    inputs = [("the config file", cfg.path), *options, *analysis.inputs(cfg)]
+    _refuse_clashes(inv, named, inputs, walked)
     outputs, error = analysis.outputs(args, cfg)
     every = named + [(label, path) for label, path, _, _ in outputs]
     _refuse_under_folders(inv, every, cfg)  # before protected() reads the tree
-    protected = _index(analysis.protected(args, cfg))
+    protected = {**_index(analysis.protected(args, cfg)), **walked}  # a JUnit file of the options by its label
     _refuse_clashes(inv, named, inputs, protected)
     _arm(inv, json_out, summary)
     _refuse_clashes(inv, every, inputs, protected)

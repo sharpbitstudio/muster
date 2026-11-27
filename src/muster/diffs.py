@@ -9,7 +9,7 @@ zone or one without a zone (outside the classification set, or under no source r
 it loses a covered line or more than BRANCH_TOLERANCE covered branches, the loss of each line
 summed, so that a branch gained on one line never offsets one lost on another; every other loss is
 information. With both JUnit folders the test identities of the two runs are listed as evidence,
-never as a verdict.
+never as a verdict; two names of one folder on disk (os.path.samefile) are walked and read once.
 
 mutation-diff compares two PIT reports mutant by mutant, by the identity of the mutant as a whole
 (class, method, descriptor, line, mutator and indexes); the same mutant twice in a report is an
@@ -69,6 +69,9 @@ FILES_CAP = 100  # files in each list of the summary
 ITEMS_CAP = 40  # line runs in a cell of the changed files, and mutants in each list of mutation-diff
 SHOWN_NAMES = 10  # names in an annotation; the data keeps every one
 NO_ROOT = "under no source root"
+# The label of a JUnit file under a folder of the options; the command line compares the outputs
+# with these files as it does with the protected files, not one by one.
+JUNIT_FILE = "the JUnit file"
 
 # A source file of a report: its repository-relative path, or its report name under no source root,
 # and whether it is under no source root. The two kinds never share a key, even with the same text.
@@ -162,15 +165,13 @@ def mutation_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _folder_key(folder: str) -> str:
-    """A folder named on the command line, as two names of the same folder share it: resolved, so
-    that a link followed by `..` is the folder it leads to, else by its absolute name. It never
-    raises."""
+def _same_folder(first: str, second: str) -> bool:
+    """Whether two folders named on the command line are one folder on disk; one that cannot be
+    looked at is no other folder. It never raises."""
     try:
-        resolved = os.path.realpath(folder)
-    except OSError:  # a path that cannot be resolved (a busy named pipe on Windows, say)
-        resolved = os.path.abspath(folder)
-    return os.path.normcase(resolved)
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _walk(folder: str) -> tuple[list[str], list[str]]:
@@ -193,30 +194,33 @@ def _walk(folder: str) -> tuple[list[str], list[str]]:
 
 
 def _walked(args: argparse.Namespace, folder: str) -> tuple[list[str], list[str]]:
-    """_walk() once per folder and run: option_inputs() keeps it in args for the command."""
+    """_walk() once per folder and run: option_inputs() keeps it in args for the command, by the
+    folder as typed. A folder that is one on disk with a folder walked before (os.path.samefile)
+    shares that walk, the very same result; any other name is walked on its own, so a name that
+    cannot be looked at never hides another."""
     walks = getattr(args, "junit_folders", None)
     if walks is None:
         walks = args.junit_folders = {}
-    key = _folder_key(folder)
-    if key not in walks:
-        walks[key] = _walk(folder)
-    return walks[key]
+    if folder not in walks:
+        same = next((walk for other, walk in walks.items() if _same_folder(other, folder)), None)
+        walks[folder] = same if same is not None else _walk(folder)
+    return walks[folder]
 
 
 def folder_inputs(folder: str) -> list[tuple[str, Path]]:
     """The JUnit files under a folder named on the command line, as inputs no output may be. It
     never raises."""
-    return [(f"the JUnit file {file}", Path(file)) for file in _walk(folder)[0]]
+    return [(f"{JUNIT_FILE} {file}", Path(file)) for file in _walk(folder)[0]]
 
 
 def option_inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
     """The input files the command line names: --before, --after and every JUnit file under the
-    folders of the JUnit options. It never raises; the command line checks them with the profile,
-    before the profile is read."""
+    folders of the JUnit options, labelled `JUNIT_FILE <file>`. It never raises; the command line
+    checks them with the profile, before the profile is read."""
     inputs = [(f"--before {args.before}", Path(args.before)), (f"--after {args.after}", Path(args.after))]
     for folder in (getattr(args, "junit_before", None), getattr(args, "junit_after", None)):
         if folder is not None:
-            inputs += [(f"the JUnit file {file}", Path(file)) for file in _walked(args, folder)[0]]
+            inputs += [(f"{JUNIT_FILE} {file}", Path(file)) for file in _walked(args, folder)[0]]
     return inputs
 
 
@@ -298,11 +302,10 @@ def coverage_diff(args: argparse.Namespace, cfg: Config, rep: Report) -> None:
     after = _read_jacoco(args.after, resolver, classified, errors)
     identities = None
     if args.junit_before is not None:
-        read: dict[str, Counter[str]] = {}  # the same folder named twice is read once
-        for folder in (args.junit_before, args.junit_after):
-            if _folder_key(folder) not in read:
-                read[_folder_key(folder)] = _junit(args, folder, errors, junit.identities)
-        identities = read[_folder_key(args.junit_before)], read[_folder_key(args.junit_after)]
+        ids_before = _junit(args, args.junit_before, errors, junit.identities)
+        same = _walked(args, args.junit_before) is _walked(args, args.junit_after)  # one folder is read once
+        ids_after = ids_before if same else _junit(args, args.junit_after, errors, junit.identities)
+        identities = ids_before, ids_after
     if errors:
         _errored(rep, "Coverage diff", "## Coverage diff", errors)
         return
@@ -855,7 +858,8 @@ def _mutation_verdict(
 
 
 def _ambiguous_markdown(rep: Report, ambiguous: list[dict]) -> None:
-    """The entries of [[mutation.known_variation]] that name more than one mutant."""
+    """The entries of [[mutation.known_variation]] that name more than one mutant: at most
+    ITEMS_CAP, then how many more there are."""
     names = [
         code_span(f"{entry['class']}.{entry['method']} L{entry['line']} {entry['mutator']}")
         + f" ({entry['matches']} mutants)"
@@ -863,7 +867,7 @@ def _ambiguous_markdown(rep: Report, ambiguous: list[dict]) -> None:
     ]
     rep.md.append(
         "No tolerance for an entry of `[[mutation.known_variation]]` that names more than one mutant: "
-        + ", ".join(names)
+        + shown_names(names, ITEMS_CAP)
     )
     rep.md.append("")
 
@@ -919,7 +923,7 @@ def _lost_markdown(
             " parameterized invocation hides the method name in the JUnit XML and the source does not tell"
             " (no test sources, no source of its class found, its class body not found, a source of its"
             " class in two test folders or that cannot be read, a class name that names no file, unbalanced"
-            " source, a test the class may inherit), a test case of its class was skipped, or the entry is"
-            " not a JUnit Platform unique id."
+            " source, a test the class may inherit, a method of that name with an annotation the scan does"
+            " not know), a test case of its class was skipped, or the entry is not a JUnit Platform unique id."
         )
         rep.md.append("")

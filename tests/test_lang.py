@@ -169,6 +169,10 @@ class UniqueIdTest(unittest.TestCase):
                 unique_id(POSTING_TEST, "[test-template:converts(int)]", "[test-template-invocation:#2]"),
                 (POSTING_TEST, "converts", "test-template"),
             ),
+            (
+                unique_id(POSTING_TEST, "[test-factory:cases()]", "[dynamic-test:#1]"),
+                (POSTING_TEST, "cases", "test-factory"),
+            ),
             (POSTING_TEST + ".settles(" + POSTING_TEST + ")", None),  # a JUnit 4 entry
             ("", None),
         ]
@@ -281,6 +285,26 @@ class SourceDeclaresTest(unittest.TestCase):
             with self.subTest(keyword=keyword):
                 self.assertFalse(is_test_declaration("\n    @Test\n    " + keyword + " refunded()", "refunded"))
         self.assertTrue(is_test_declaration("\n    @Test\n    Object refunded()", "refunded"))
+
+    def test_method_with_annotations_the_scan_does_not_know(self):
+        # One of them may be an annotation of its own that carries @Test: not ruled out.
+        cases = [
+            ('    @FastTest\n    @DisplayName("Settles a refund")\n    void settles() {}\n', "unresolved"),
+            ("    public @FastTest void settles() {}\n", "unresolved"),
+            ("    @Override\n    public void settles() {}\n", "unresolved"),
+            ("    void settles() {}\n", "deleted"),
+            ("    @FastTest\n    void refunds() {}\n", "deleted"),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(source_declares(java_source(body), POSTING_TEST, "settles"), expected)
+
+    def test_bare_carriage_return_ends_a_line_comment(self):
+        cr = chr(13)
+        for end in (cr, cr + "\n"):
+            with self.subTest(end=end):
+                text = java_source(f"    // settles a refund{end}    @Test{end}    void settles() {{}}\n")
+                self.assertEqual(source_declares(text, POSTING_TEST, "settles"), "present")
 
     def test_overloads_are_one_declaration(self):
         # Only the method name is compared: the killer names the overload without a test annotation.

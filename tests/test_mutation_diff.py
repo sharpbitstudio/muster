@@ -464,16 +464,22 @@ class KnownVariationTest(DiffCase):
         junit = self.junit((PARSER_TEST, "decodes()"))
         legacy = "org.example.app.legacy.KeyParser"
         cases = (
-            ("two classes of one simple name", [{}, {"cls": legacy}], [{}, {"cls": legacy}]),
-            ("two indexes on one line", [{"indexes": (1,)}, {"indexes": (2,)}], [{"indexes": (1,)}, {"indexes": (2,)}]),
-            ("one of them unchanged", [{}, {"cls": legacy}], [{}, {"cls": legacy, "status": "KILLED"}]),
+            ("two classes of one simple name", [{}, {"cls": legacy}], [{}, {"cls": legacy}], "warn"),
+            (
+                "two indexes on one line",
+                [{"indexes": (1,)}, {"indexes": (2,)}],
+                [{"indexes": (1,)}, {"indexes": (2,)}],
+                "warn",
+            ),
+            ("one of them unchanged", [{}, {"cls": legacy}], [{}, {"cls": legacy, "status": "KILLED"}], "warn"),
+            ("one of them only after", [{}], [{}, {"indexes": (6,)}], "not-comparable"),
         )
-        for case, before, after in cases:
+        for case, before, after, outcome in cases:
             with self.subTest(case=case):
                 run = self.judged(
                     [self.parser(**fields) for fields in before],
                     [self.parser(**({"status": "SURVIVED"} | fields)) for fields in after],
-                    "warn",
+                    outcome,
                     *junit,
                 )
                 entry = {"class": "KeyParser", "method": "decode", "line": 12, "mutator": "MathMutator", "matches": 2}
@@ -493,6 +499,16 @@ class KnownVariationTest(DiffCase):
         self.assertLess(run.summary.index("| after |"), run.summary.index(line))
         self.assertNotIn("### Lost mutants", run.summary)
 
+    def test_ambiguous_entries_shown_are_capped(self):
+        lines = range(1, diffs.ITEMS_CAP + 2)
+        entry = '\n[[mutation.known_variation]]\nclass = "KeyParser"\nmethod = "decode"\nmutator = "MathMutator"\n'
+        self.write("muster.toml", PROFILE + "".join(f"{entry}line = {nr}\n" for nr in lines))
+        report = [self.parser(line=nr, indexes=(index,)) for nr in lines for index in (1, 2)]
+        run = self.judged(report, report, "pass")
+        self.assertEqual([entry["line"] for entry in run.data["known_variation_ambiguous"]], list(lines))
+        shown = ", ".join(f"`KeyParser.decode L{nr} MathMutator` (2 mutants)" for nr in lines[:-1])
+        self.assertIn(f"\n{AMBIGUOUS}{shown} (+1 more)\n", run.summary)
+
     def test_known_variation_with_a_killer_found_in_the_source(self):
         junit = self.junit((PARSER_TEST, "Decodes a padded key"))
         for body, killer, outcome in (
@@ -509,6 +525,7 @@ class KillerTest(DiffCase):
     SETTLES = unique_id(ENGINE_TEST, "settles()")
     CLOSES = unique_id(ENGINE_TEST, "closes()", "Daily")
     CONVERTS = unique_id(ENGINE_TEST, "converts(java.lang.String)", kind="test-template")
+    FACTORY = unique_id(ENGINE_TEST, "cases()", kind="test-factory")
 
     def test_status_by_the_junit_names(self):
         cases = (
@@ -520,6 +537,7 @@ class KillerTest(DiffCase):
             ("template gone, plain names", self.CONVERTS, [(ENGINE_TEST, "refunds()")], "deleted"),
             # Kept on purpose: a template or factory is never present by a plain name, even its own.
             ("template of a plain name", self.CONVERTS, [(ENGINE_TEST, "converts(java.lang.String)")], "deleted"),
+            ("factory of a plain name", self.FACTORY, [(ENGINE_TEST, "cases()")], "deleted"),
             # Kept on purpose: an exact plain name is present, whatever display names the class has.
             (
                 "plain name beside a display name",
@@ -548,6 +566,9 @@ class KillerTest(DiffCase):
                 self.assertEqual(run.killer, expected)
                 hidden = "`unresolved`: the killing test could be neither confirmed nor ruled out."
                 self.assertEqual(hidden in run.summary, expected == "unresolved")
+        run = self.lost(self.FACTORY, *self.junit((ENGINE_TEST, "cases()")))
+        shown = f"; killed before by `{ENGINE_TEST}#cases (test-factory)` - killing test after: **deleted**\n"
+        self.assertIn(shown, run.summary)
 
     def test_statuses_of_several_killers_fold(self):
         gone = unique_id(ENGINE_TEST, "refunds()")
@@ -643,6 +664,17 @@ class KillerTest(DiffCase):
                 source = java_class(ENGINE_TEST, "    @Test\n    void refunds() {}\n")
                 self.write(ENGINE_TEST_FILE, source.replace("class EngineTest {", header))
                 self.assertEqual(self.lost(self.SETTLES, *junit).killer, expected)
+        # A test the class declares itself is present, whatever it may inherit.
+        source = java_class(ENGINE_TEST, "    @Test\n    void settles() {}\n")
+        self.write(ENGINE_TEST_FILE, source.replace("class EngineTest {", headers[0][0]))
+        self.assertEqual(self.lost(self.SETTLES, *junit).killer, "present")
+
+    def test_method_with_an_annotation_the_scan_does_not_know(self):
+        junit = self.junit((ENGINE_TEST, "Settles a refund"))
+        self.put_source(ENGINE_TEST, "    @FastTest\n    void settles() {}\n")
+        run = self.lost(self.SETTLES, *junit)
+        self.assertEqual(run.killer, "unresolved")
+        self.assertIn("a method of that name with an annotation the scan does not know", run.summary)
 
     def test_dollar_sign_in_the_package(self):
         cls = "org.example.app$qa.EngineTest"
@@ -836,6 +868,22 @@ class InputErrorTest(DiffCase):
         self.assertEqual(run.summary, ERROR_BLOCK + "".join(f"- `{error}`\n" for error in errors) + "\n")
         run = self.run_diff("--junit-after", "gone")
         self.assertEqual(run.section["errors"][-1], "no JUnit XML folder at gone")
+
+    def test_report_and_folder_that_cannot_be_looked_at(self):
+        self.put("before.xml", pit_report(mutant()))
+        self.put("after.xml", pit_report(mutant()))
+        self.put("junit-after/TEST-one.xml", junit_report((ENGINE_TEST, "settles()")))
+        denied, inspect = {"before.xml", "junit-after"}, os.stat
+
+        def looking(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)) and os.path.normpath(os.fspath(path)) in denied:
+                raise PermissionError(13, "Permission denied", path)
+            return inspect(path, *args, **kwargs)
+
+        with mock.patch("os.stat", side_effect=looking):
+            run = self.run_diff("--junit-after", "junit-after")
+        expected = ["before.xml: cannot read: Permission denied", "junit-after: cannot read: Permission denied"]
+        self.assertEqual((run.section["errors"], run.code), (expected, 0))
 
     def test_config_error_wins_over_input_errors(self):
         profile = PROFILE.replace('roots = ["src/main/java"]', 'roots = ["src/main/java", "gen/main/java"]')
