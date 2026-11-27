@@ -610,6 +610,33 @@ class ScannedOutputClashTest(CliCase):
                     self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], expected)
                     (self.work / "out.json").unlink()
 
+    def test_junit_folder_or_output_that_cannot_be_resolved(self):
+        # An output that cannot be resolved is no JUnit file; when the JUnit folder cannot be
+        # resolved, its files are compared with each output one by one.
+        found = self.work / "results" / "TEST-one.xml"
+        found.parent.mkdir()
+        found.write_bytes(b"<testsuite/>\n")
+        realpath = os.path.realpath
+        for unresolved, output in ((self.work / "out.json", "out.json"), (found.parent, "results/TEST-one.xml")):
+
+            def raising(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(unresolved)):
+                    raise OSError(231, "All pipe instances are busy")
+                return realpath(path, *args, **kwargs)
+
+            with self.subTest(path=unresolved):
+                argv = ["--repo", str(self.repo), "loc", "--base=", "--junit-after", "results", "--json-out", output]
+                with mock.patch("os.path.realpath", side_effect=raising) as patched:
+                    code, _, err = self.run_main(*argv)
+                self.assertTrue(patched.called)
+                self.assertEqual(code, 2, err)
+                if output == "out.json":
+                    self.assertEqual(self.read_json(self.work / "out.json")["exit_code"], 2)
+                    (self.work / "out.json").unlink()
+                else:
+                    self.assertIn(f"error: --json-out {output} is the JUnit file {output}\n", err)
+                    self.assertEqual(found.read_bytes(), b"<testsuite/>\n")
+
     # The best-effort paths (version, an argument error) and a run of a command.
     REPO_COMMANDS = ((["version"], 0), (["loc", "--base="], 2), (["loc"], 2))
 

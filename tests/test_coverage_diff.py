@@ -434,10 +434,15 @@ class ComparabilityTest(DiffCase):
         self.assertTrue(run.verdict.endswith("; line n/a -> n/a, branch n/a -> n/a"), run.verdict)
 
     def test_critical_loss_is_the_last_part_of_not_comparable(self):
-        before = {name(ENGINE): line_data((1, 2)), name(PARSER): line_data((1,))}
+        # The totals count every file of each report, KeyParser of the before report only too.
+        before = {name(ENGINE): line_data((1, 2)), name(PARSER): line_data((), (1,))}
         run = self.judged(before, {name(ENGINE): line_data((1,), (2,))}, "not-comparable")
         detail = "1 file(s) not comparable (main source changed); 1 critical file(s) lost coverage"
-        self.assertTrue(run.verdict.startswith(f"coverage-diff: NOT COMPARABLE ({detail}); line "), run.verdict)
+        trend = "line 66.7% -> 50.0%, branch n/a -> n/a"
+        self.assertEqual(run.verdict, f"coverage-diff: NOT COMPARABLE ({detail}); {trend}")
+        # (missed, covered) per counter
+        totals = {"before": {"line": [1, 2], "branch": [0, 0]}, "after": {"line": [1, 1], "branch": [0, 0]}}
+        self.assertEqual(run.data["totals"], totals)
         message = f"before and after are not comparable: {detail}"
         self.assertEqual(run.annotations, [f"::warning title=Coverage diff::{message}"])
         self.assertEqual((run.data["warned"], [file["path"] for file in run.data["files"]]), ([ENGINE], [ENGINE]))
@@ -658,6 +663,14 @@ class InputErrorTest(DiffCase):
         self.assertEqual((run.code, run.env["error"]), (2, {"kind": "config", "message": message}))
         self.assertEqual(run.env["sections"], [])
 
+    def test_configured_report_and_snapshot_are_never_read(self):
+        before, after = {name(ENGINE): line_data((1, 2))}, {name(ENGINE): line_data((1,), (2,))}
+        valid = self.judged(before, after, "warn")
+        (self.repo / REPORT).unlink()
+        self.write("muster.toml", PROFILE + '\n[policy]\nsnapshot = "build/muster/snapshot.json"\n')
+        missing = self.judged(before, after, "warn")
+        self.assertEqual((missing.out, missing.env, missing.summary), (valid.out, valid.env, valid.summary))
+
 
 class JunitFolderTest(DiffCase):
     def setUp(self):
@@ -706,14 +719,14 @@ class JunitFolderTest(DiffCase):
         self.put("plain.txt", "a file\n")
         self.put("quiet/notes.txt", "no report\n")
         self.put("quiet/upper.XML", junit_report((SUITE, "settles()")))
-        self.put("foreign/testng-results.xml", "<testng-results/>")
+        self.put("foreign/foreign-report.xml", "<foreign-report/>")
         self.put("unnamed/TEST-one.xml", junit_report((SUITE, "settles()")).replace(' name="settles()"', ""))
         self.put("blank/TEST-one.xml", junit_report((SUITE, "")))
         cases = (
             ("gone", "no JUnit XML folder at gone"),
             ("plain.txt", "no JUnit XML folder at plain.txt"),
             ("quiet", "no JUnit XML under quiet"),
-            ("foreign", "foreign/testng-results.xml: not a JUnit report, the root element is <testng-results>"),
+            ("foreign", "foreign/foreign-report.xml: not a JUnit report, the root element is <foreign-report>"),
             ("unnamed", "unnamed/TEST-one.xml: <testcase> has no attribute name"),
             ("blank", "blank/TEST-one.xml: <testcase> has an empty name"),
         )

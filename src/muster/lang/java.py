@@ -17,6 +17,9 @@ The source is scanned, not parsed, and the scan has known limits:
   never deleted;
 - inheritance is not followed: a test that the class does not declare itself, in a class whose
   header has `extends` or `implements` (a type bound too), is unresolved, never deleted;
+- a test that carries `@Disabled` among its own annotations (the simple name or a qualified one)
+  is unresolved, never present; only the annotations of the method are read, so a disabled class
+  or a condition such as `@DisabledOnOs` is not seen;
 - JAVA_METHOD_HEADER can take polynomial time on a very long member header without parentheses
   (the test sources come from the repository under check).
 """
@@ -217,11 +220,14 @@ def source_declares(text: str, cls: str, member: str) -> str:
     parentheses, brackets or braces anywhere in the text that are unbalanced or crossed, is
     `unresolved`. The chain is followed from the top-level class through each nested name; a step
     that finds no class header or more than one is `unresolved`. Only a member directly in the body
-    of the class itself counts, so a test of an enclosing or a nested class does not. A method of
-    that name that carries annotations, none of them a known test annotation, is `unresolved`: one
-    may be an annotation of its own that makes it a test. A method of that name without any
-    annotation, or one that is only called, is `deleted`, unless the header of the class has
-    `extends` or `implements`: the class may inherit the test, and that is `unresolved`.
+    of the class itself counts, so a test of an enclosing or a nested class does not. A test of that
+    name that also carries `@Disabled` (or a qualified name whose last part is `Disabled`, with or
+    without arguments) among the annotations and modifiers that open its header is `unresolved`,
+    never `present`: a disabled test does not run. A method of that name that carries annotations,
+    none of them a known test annotation, is `unresolved`: one may be an annotation of its own that
+    makes it a test. A method of that name without any annotation, or one that is only called, is
+    `deleted`, unless the header of the class has `extends` or `implements`: the class may inherit
+    the test, and that is `unresolved`.
     """
     stripped = strip_java(text.replace("\r\n", "\n").replace("\r", "\n"))
     if stripped is None:
@@ -245,21 +251,38 @@ def source_declares(text: str, cls: str, member: str) -> str:
     members = java_members(stripped, start, end)
     if members is None:
         return "unresolved"
-    if any(is_test_declaration(chunk, member) for chunk, _, _ in members):
-        return "present"
 
-    def annotated(chunk: str) -> bool:
-        """Whether an annotation is among the annotations and modifiers that open a header."""
-        rest = chunk.lstrip()
-        while not JAVA_ANNOTATION.match(rest):
-            modifier = JAVA_MODIFIER.match(rest)
-            if modifier is None:
-                return False
-            rest = rest[modifier.end() :].lstrip()
-        return True
+    def annotations(chunk: str) -> list[str]:
+        """The names of the annotations among the annotations and modifiers that open a header,
+        without white space, their arguments skipped."""
+        names, rest = [], chunk.lstrip()
+        while True:
+            annotation = JAVA_ANNOTATION.match(rest)
+            if annotation is not None:
+                names.append(re.sub(r"\s+", "", annotation.group(1)))
+                rest = rest[annotation.end() :]
+                if rest.startswith("("):
+                    depth = 0
+                    for i, ch in enumerate(rest):
+                        depth += {"(": 1, ")": -1}.get(ch, 0)
+                        if depth == 0:
+                            break
+                    rest = rest[i + 1 :]
+            else:
+                modifier = JAVA_MODIFIER.match(rest)
+                if modifier is None:
+                    return names
+                rest = rest[modifier.end() :]
+            rest = rest.lstrip()
+
+    tests = [chunk for chunk, _, _ in members if is_test_declaration(chunk, member)]
+    if tests:
+        # A disabled test is never present: `@Disabled`, by its simple or a qualified name.
+        disabled = any(name.rpartition(".")[2] == "Disabled" for chunk in tests for name in annotations(chunk))
+        return "unresolved" if disabled else "present"
 
     # With a test annotation put in front, is_test_declaration() tells whether a header declares
     # the method at all; none of its own annotations is a known one, or it would be present.
-    if any(annotated(chunk) and is_test_declaration("@Test " + chunk, member) for chunk, _, _ in members):
+    if any(annotations(chunk) and is_test_declaration("@Test " + chunk, member) for chunk, _, _ in members):
         return "unresolved"
     return "unresolved" if re.search(r"(?<![\w$])(?:extends|implements)(?![\w$])", header) else "deleted"

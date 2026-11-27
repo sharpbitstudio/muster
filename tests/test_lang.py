@@ -299,6 +299,17 @@ class SourceDeclaresTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(source_declares(java_source(body), POSTING_TEST, "settles"), expected)
 
+    def test_disabled_test_is_never_present(self):
+        cases = [
+            ("    @Disabled @Test void settles() {}\n", "unresolved"),
+            ('    @Test @Disabled("flaky") void settles() {}\n', "unresolved"),
+            ("    @org.junit.jupiter.api.Disabled @Test void settles() {}\n", "unresolved"),
+            ("    @DisabledOnOs(OS.WINDOWS) @Test void settles() {}\n", "present"),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(source_declares(java_source(body), POSTING_TEST, "settles"), expected)
+
     def test_bare_carriage_return_ends_a_line_comment(self):
         cr = chr(13)
         for end in (cr, cr + "\n"):
